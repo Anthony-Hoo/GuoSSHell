@@ -35,6 +35,33 @@ class MouseInputEvent extends TerminalInputEvent {
   const MouseInputEvent(this.button, this.buttonState, this.position);
 }
 
+/// 终端视口几何（度量权威在 Flutter，PLAN §8）。像素是整个终端的尺寸。
+@immutable
+class TerminalGeometry {
+  final int cols;
+  final int rows;
+  final int pixelWidth;
+  final int pixelHeight;
+
+  const TerminalGeometry({
+    required this.cols,
+    required this.rows,
+    required this.pixelWidth,
+    required this.pixelHeight,
+  });
+
+  @override
+  bool operator ==(Object other) =>
+      other is TerminalGeometry &&
+      other.cols == cols &&
+      other.rows == rows &&
+      other.pixelWidth == pixelWidth &&
+      other.pixelHeight == pixelHeight;
+
+  @override
+  int get hashCode => Object.hash(cols, rows, pixelWidth, pixelHeight);
+}
+
 /// 一条池化行：BufferLine 对象 + 它当初被填充时的 run 快照。
 /// 快照逐字段比对相等 → 复用对象、不动 version → 行 Picture 缓存命中。
 class _PooledLine {
@@ -65,8 +92,8 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   /// 键盘/IME/粘贴的出口。返回值表示事件是否被接受。
   bool Function(TerminalInputEvent event)? onInput;
 
-  /// 视口尺寸变化（列/行/pixel），由 fork 的 render 在布局期回调。
-  void Function(int cols, int rows, int pixelWidth, int pixelHeight)? onResize;
+  /// 视口几何变化，由 fork 的 render 在布局期回调（只在变化时）。
+  void Function(TerminalGeometry geometry)? onResize;
 
   /// 行的身份容器。fork 的 CellAnchor 挂在 BufferLine 对象上，锚点的
   /// 行号 = owner.index，而 index 只有经 IndexAwareCircularBuffer 收养
@@ -114,8 +141,11 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   int _cursorX = 0;
   int _cursorY = 0;
   bool _cursorVisible = false;
-  int _sentCols = 0;
-  int _sentRows = 0;
+  TerminalGeometry? _measured;
+
+  /// 最近一次布局量得的几何；尚未布局过为 null。
+  /// 重连时视图尺寸往往没变、fork 不会再回调 [resize]，连接请求要靠它带上几何。
+  TerminalGeometry? get measuredGeometry => _measured;
 
   // ── 帧摄入 ──
 
@@ -418,15 +448,18 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
 
   @override
   void resize(int newWidth, int newHeight, [int? pixelWidth, int? pixelHeight]) {
-    // fork 的 render 在布局期调用；只在几何真正变化时转发 Rust，
-    // 否则每个布局帧都会触发一次 window-change。
-    if (newWidth == _sentCols && newHeight == _sentRows) return;
-    _sentCols = newWidth;
-    _sentRows = newHeight;
-    final callback = onResize;
-    if (callback != null) {
-      callback(newWidth, newHeight, pixelWidth ?? 0, pixelHeight ?? 0);
-    }
+    // fork 的 render 传来的是**单格**像素；SSH 的 pty-req / window-change
+    // 要整个终端的像素尺寸，在这里换算。
+    final geometry = TerminalGeometry(
+      cols: newWidth,
+      rows: newHeight,
+      pixelWidth: newWidth * (pixelWidth ?? 0),
+      pixelHeight: newHeight * (pixelHeight ?? 0),
+    );
+    // 布局期每帧都会调用；只在几何真正变化时转发，否则每帧一次 window-change。
+    if (geometry == _measured) return;
+    _measured = geometry;
+    onResize?.call(geometry);
   }
 
   // ── 修饰键挂住/锁定（Termux 式，键位条与软键盘输入共享状态）──
@@ -475,8 +508,13 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
     bool alt = false,
     bool ctrl = false,
   }) {
-    final name = _keyName(key);
+    final name = keyName(key);
     if (name == null) return false;
+    // 可打印字符（字母/数字/空格）不带硬件 Ctrl/Alt 时交回文本通道：
+    // fork 的软键盘路径先把单字符映射成键再试 keyInput，而 'A' 与 'a'
+    // 映射到同一个 keyA——这里拿不到大小写。返回 false 后 fork 改走
+    // textInput(原字符)，大小写原样保留，挂住的 Ctrl/Alt 也在那里消费。
+    if (name.startsWith(_characterPrefix) && !ctrl && !alt) return false;
     return _emit(
       KeyInputEvent(
         name,
@@ -531,9 +569,13 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
     return callback(event);
   }
 
-  /// TerminalKey → 边界键名。终端里真正会流经这里的键有限：
-  /// 打字走 textInput（IME/软键盘提交），这里只处理功能键与方向键。
-  static String? _keyName(TerminalKey key) {
+  static const String _characterPrefix = 'character:';
+
+  /// TerminalKey → 边界键名（见 session.rs 的 parse_key_code）。
+  /// 字母/数字只在带 Ctrl/Alt 时以键的形式出现（见 [keyInput]），所以
+  /// 这里的字母一律小写——大小写不影响 Ctrl/Alt 组合的编码。
+  @visibleForTesting
+  static String? keyName(TerminalKey key) {
     final named = _namedKeyNames[key];
     if (named != null) return named;
     final fKey = _fKeyNames[key];
@@ -541,15 +583,17 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
     // 字母段在枚举里连续（keyA..keyZ），直接按序号换算。
     if (key.index >= TerminalKey.keyA.index &&
         key.index <= TerminalKey.keyZ.index) {
-      return 'character:${String.fromCharCode(0x61 + key.index - TerminalKey.keyA.index)}';
+      return '$_characterPrefix${String.fromCharCode(0x61 + key.index - TerminalKey.keyA.index)}';
     }
-    // 数字段是倒序的（digit9 在 digit0 前面，HID 用法码顺序）。
-    if (key.index >= TerminalKey.digit9.index &&
-        key.index <= TerminalKey.digit0.index) {
-      return 'character:${String.fromCharCode(0x30 + TerminalKey.digit0.index - key.index)}';
+    // 数字段按 HID 用法码顺序：digit1..digit9 连续，digit0 排在最后。
+    if (key.index >= TerminalKey.digit1.index &&
+        key.index <= TerminalKey.digit9.index) {
+      return '$_characterPrefix${String.fromCharCode(0x31 + key.index - TerminalKey.digit1.index)}';
     }
+    if (key == TerminalKey.digit0) return '${_characterPrefix}0';
     return null;
   }
+
 
   static const Map<TerminalKey, String> _namedKeyNames = {
     TerminalKey.enter: 'enter',
@@ -570,17 +614,17 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   };
 
   static const Map<TerminalKey, String> _fKeyNames = {
-    TerminalKey.f1: 'f:1',
-    TerminalKey.f2: 'f:2',
-    TerminalKey.f3: 'f:3',
-    TerminalKey.f4: 'f:4',
-    TerminalKey.f5: 'f:5',
-    TerminalKey.f6: 'f:6',
-    TerminalKey.f7: 'f:7',
-    TerminalKey.f8: 'f:8',
-    TerminalKey.f9: 'f:9',
-    TerminalKey.f10: 'f:10',
-    TerminalKey.f11: 'f:11',
-    TerminalKey.f12: 'f:12',
+    TerminalKey.f1: 'f1',
+    TerminalKey.f2: 'f2',
+    TerminalKey.f3: 'f3',
+    TerminalKey.f4: 'f4',
+    TerminalKey.f5: 'f5',
+    TerminalKey.f6: 'f6',
+    TerminalKey.f7: 'f7',
+    TerminalKey.f8: 'f8',
+    TerminalKey.f9: 'f9',
+    TerminalKey.f10: 'f10',
+    TerminalKey.f11: 'f11',
+    TerminalKey.f12: 'f12',
   };
 }

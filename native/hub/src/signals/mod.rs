@@ -51,7 +51,7 @@ pub struct DisconnectRequest {}
 /// 键与文本二选一：`text` 非空 = IME 提交/粘贴的文本（`CommittedText`）；
 /// 否则 `key` 携带键名——`"character:x"`（单字符）或命名键
 /// （enter/escape/tab/backspace/delete/insert/home/end/page_up/page_down/
-/// arrow_up/arrow_down/arrow_left/arrow_right/`f:N`）。
+/// arrow_up/arrow_down/arrow_left/arrow_right/`f1`…`f24`）。
 /// 键编码（ETX/Kitty/CSI-u…）是 Rust 侧 `encode_input` 的事，Dart 只转发。
 #[derive(Deserialize, DartSignal)]
 pub struct InputRequest {

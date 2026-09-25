@@ -6,9 +6,12 @@
 //! 单任务拥有 transport（它的方法都要 `&mut self`），用 `select!` 同时听
 //! 远端事件与 Dart 命令——这是上游 actor 的形状，M1 用裸 tokio 任务就够了。
 
+use std::time::Duration;
+
 use rinf::{DartSignal, RustSignal, RustSignalBinary, debug_print};
 use secrecy::SecretString;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::time::{Instant, sleep_until};
 
 use rshell_m0::rshell_core::{
     AuthenticationKind, CellPosition, ConnectionProfile, HostKeyDecision, InteractionRequest,
@@ -42,8 +45,8 @@ enum SessionCommand {
     Copy,
 }
 
-/// 常驻任务：接住 Dart 的三种请求，把 Resize/Disconnect 转交给当前会话。
-/// 每个会话一个独立任务；新连接顶掉旧连接（M1 是单会话 UI）。
+/// 常驻任务：接住 Dart 的请求，逐个转交给当前会话。
+/// 每个会话一个独立任务；新连接顶掉旧连接（单会话 UI）。
 pub async fn supervisor() {
     let connect_rx = ConnectRequest::get_dart_signal_receiver();
     let resize_rx = ResizeRequest::get_dart_signal_receiver();
@@ -53,35 +56,31 @@ pub async fn supervisor() {
     let selection_rx = SelectionRequest::get_dart_signal_receiver();
     let copy_rx = CopyRequest::get_dart_signal_receiver();
     let mut session_tx: Option<UnboundedSender<SessionCommand>> = None;
-    // 连接表单阶段 Dart 就会量格子并发 ResizeRequest（此刻还没有会话）。
-    // 记住最新几何，spawn 会话时带上——否则首个 PTY 尺寸只能用请求里的缺省值。
-    let mut latest_size: Option<TerminalSize> = None;
 
     loop {
         tokio::select! {
             pack = connect_rx.recv() => {
                 let Some(pack) = pack else { break };
-                debug_print!("[session] connect request: {}:{} (pending size {:?})",
+                debug_print!("[session] connect request: {}:{} ({}x{})",
                     pack.message.host, pack.message.port,
-                    latest_size.map(|size| (size.cols, size.rows)));
+                    pack.message.cols, pack.message.rows);
                 if let Some(old) = session_tx.take() {
                     let _ = old.send(SessionCommand::Disconnect);
                 }
                 let (tx, rx) = unbounded_channel();
                 session_tx = Some(tx);
-                tokio::spawn(run_session(pack.message, latest_size, rx));
+                tokio::spawn(run_session(pack.message, rx));
             }
             pack = resize_rx.recv() => {
                 let Some(pack) = pack else { break };
                 let request = pack.message;
-                let size = TerminalSize {
+                let size = clamped_size(TerminalSize {
                     cols: request.cols,
                     rows: request.rows,
                     pixel_width: request.pixel_width,
                     pixel_height: request.pixel_height,
                     dpi: request.dpi,
-                };
-                latest_size = Some(size);
+                });
                 if let Some(tx) = &session_tx {
                     let _ = tx.send(SessionCommand::Resize(size));
                 }
@@ -94,18 +93,18 @@ pub async fn supervisor() {
             }
             pack = input_rx.recv() => {
                 let Some(pack) = pack else { break };
-                if let Some(tx) = &session_tx {
-                    if let Some(input) = terminal_input_from_request(pack.message) {
-                        let _ = tx.send(SessionCommand::Input(input));
-                    }
+                if let Some(tx) = &session_tx
+                    && let Some(input) = terminal_input_from_request(pack.message)
+                {
+                    let _ = tx.send(SessionCommand::Input(input));
                 }
             }
             pack = mouse_rx.recv() => {
                 let Some(pack) = pack else { break };
-                if let Some(tx) = &session_tx {
-                    if let Some(event) = mouse_event_from_request(pack.message) {
-                        let _ = tx.send(SessionCommand::Mouse(event));
-                    }
+                if let Some(tx) = &session_tx
+                    && let Some(event) = mouse_event_from_request(pack.message)
+                {
+                    let _ = tx.send(SessionCommand::Mouse(event));
                 }
             }
             pack = selection_rx.recv() => {
@@ -124,11 +123,7 @@ pub async fn supervisor() {
     }
 }
 
-async fn run_session(
-    request: ConnectRequest,
-    pending_size: Option<TerminalSize>,
-    mut commands: UnboundedReceiver<SessionCommand>,
-) {
+async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceiver<SessionCommand>) {
     let target = format!("{}:{}", request.host, request.port);
     send_status(SessionState::Connecting, target.clone());
 
@@ -146,15 +141,16 @@ async fn run_session(
         Some(request.command.clone())
     };
 
-    // 密码在这里包成 SecretString（PLAN.md §2.2：secret 不可序列化，协议层手写转换）。
-    let auth =
-        match AuthPlan::from_secret(&profile, Some(SecretString::from(request.password.clone()))) {
-            Ok(auth) => auth,
-            Err(error) => {
-                send_status(SessionState::Failed, format!("AuthPlan: {error:?}"));
-                return;
-            }
-        };
+    // 密码的所有权直接移进 SecretString（drop 时清零），请求里不留明文副本
+    // （PLAN.md §2.2：secret 不可序列化，协议层手写转换）。
+    let password = SecretString::from(std::mem::take(&mut request.password));
+    let auth = match AuthPlan::from_secret(&profile, Some(password)) {
+        Ok(auth) => auth,
+        Err(error) => {
+            send_status(SessionState::Failed, format!("AuthPlan: {error:?}"));
+            return;
+        }
+    };
 
     let Some(known_hosts_path) = known_hosts_path() else {
         send_status(
@@ -163,29 +159,6 @@ async fn run_session(
         );
         return;
     };
-    // 诊断探针：连接失败且失败类别是 Platform 时，把主机密钥管线的
-    // 具体失败步骤附在 Failed 详情里（上游只给类别，细节被丢弃）。
-    // ⚠ 探针要拿 known_hosts 的**父目录**当 base_dir——传文件路径会让
-    // 探针文件落在「文件下面」，CreateParent 必然失败（曾因此误诊实机）。
-    let known_hosts_dir = std::path::Path::new(&known_hosts_path)
-        .parent()
-        .and_then(|parent| parent.to_str())
-        .unwrap_or(&known_hosts_path)
-        .to_owned();
-    let known_hosts_diagnosis =
-        rshell_m0::diagnose_host_key_pipeline(&known_hosts_dir, &request.host, request.port)
-            .await;
-    let handshake_diagnosis = format!(
-        "{} {}",
-        known_hosts_diagnosis,
-        rshell_m0::diagnose_real_handshake(
-            &request.host,
-            request.port,
-            &format!("{known_hosts_path}-diagnose"),
-        )
-        .await
-    );
-    debug_print!("[session] {handshake_diagnosis}");
     let verifier = KnownHostsVerifier::new(&known_hosts_path);
     let (broker, mut interactions) = interaction_channel();
 
@@ -205,9 +178,10 @@ async fn run_session(
         })
     };
 
-    let size = pending_size.unwrap_or(TerminalSize {
-        cols: request.cols.max(MIN_COLS),
-        rows: request.rows.max(MIN_ROWS),
+    // 首个 PTY 尺寸就是连接请求带来的几何（Dart 在布局完成后才发请求）。
+    let size = clamped_size(TerminalSize {
+        cols: request.cols,
+        rows: request.rows,
         pixel_width: request.pixel_width,
         pixel_height: request.pixel_height,
         dpi: request.dpi,
@@ -229,10 +203,7 @@ async fn run_session(
         .await
     {
         debug_print!("[session] connect failed: {error:?}");
-        send_status(
-                        SessionState::Failed,
-                        format!("connect: {error:?} · {handshake_diagnosis}"),
-                    );
+        send_status(SessionState::Failed, format!("connect: {error:?}"));
         responder.abort();
         return;
     }
@@ -254,21 +225,20 @@ async fn run_session(
         rows: size.rows,
     };
     let mut stats = PerfWindow::new();
+    let mut pacer = FramePacer::new();
     // 选区权威在引擎（M2a 方案 A）：连接的整个生命周期里持有当前选区，
     // 每次 render 都带上它——内容重排/滚动时高亮跟着引擎走，不是 Dart 侧
     // 自己维护一套坐标。
     let mut selection: Option<SelectionRange> = None;
 
     // 连接建立即送第一帧（欢迎横幅可能已经进了引擎）。
-    if let Ok(frame) = engine.render(viewport, selection) {
-        send_frame(&frame, &mut stats, 0);
+    if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
+        send_status(SessionState::Failed, detail);
     }
     send_selection_state(None);
-    if let Some(perf) = stats.maybe_report() {
-        perf.send_signal_to_dart();
-    }
 
     loop {
+        let frame_deadline = pacer.deadline();
         tokio::select! {
             event = transport.next_event() => match event {
                 Ok(TransportEvent::Output(bytes)) => {
@@ -279,21 +249,13 @@ async fn run_session(
                             if !delta.outbound.is_empty() {
                                 let _ = transport.write(&delta.outbound).await;
                             }
-                            if delta.dirty {
-                                let render_start = std::time::Instant::now();
-                                match engine.render(viewport, selection) {
-                                    Ok(frame) => {
-                                        let render_us = micros_since(render_start);
-                                        send_frame(&frame, &mut stats, render_us);
-                                        if let Some(perf) = stats.maybe_report() {
-                                            perf.send_signal_to_dart();
-                                        }
-                                    }
-                                    Err(error) => {
-                                        send_status(SessionState::Failed, format!("render: {error:?}"));
-                                        break;
-                                    }
-                                }
+                            if delta.dirty
+                                && pacer.mark_dirty(Instant::now())
+                                && let Err(detail) =
+                                    present(&mut engine, viewport, selection, &mut stats, &mut pacer)
+                            {
+                                send_status(SessionState::Failed, detail);
+                                break;
                             }
                         }
                         Err(error) => {
@@ -323,6 +285,13 @@ async fn run_session(
                     break;
                 }
             },
+            // 合帧：高输出期间攒下的内容到点一次性画出。
+            () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
+                if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
+                    send_status(SessionState::Failed, detail);
+                    break;
+                }
+            }
             command = commands.recv() => match command {
                 Some(SessionCommand::Resize(new_size)) => {
                     if let Err(error) = engine.resize(new_size) {
@@ -334,10 +303,9 @@ async fn run_session(
                         // window-change 失败不立刻判死；远端布局暂旧，后续 resize 可再试。
                         rinf::debug_print!("window-change failed: {error:?}");
                     }
-                    let render_start = std::time::Instant::now();
-                    if let Ok(frame) = engine.render(viewport, selection) {
-                        let render_us = micros_since(render_start);
-                        send_frame(&frame, &mut stats, render_us);
+                    if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
+                        send_status(SessionState::Failed, detail);
+                        break;
                     }
                 }
                 Some(SessionCommand::Input(input)) => {
@@ -380,16 +348,9 @@ async fn run_session(
                     // 选区变化：更新引擎持有的选区 → 重渲染发帧（高亮跟着
                     // 内容走）→ 把引擎的选区原样回显（Dart 用它对耳朵/气泡定位）。
                     selection = selection_range_from_request(request);
-                    let render_start = std::time::Instant::now();
-                    match engine.render(viewport, selection) {
-                        Ok(frame) => {
-                            let render_us = micros_since(render_start);
-                            send_frame(&frame, &mut stats, render_us);
-                        }
-                        Err(error) => {
-                            send_status(SessionState::Failed, format!("render: {error:?}"));
-                            break;
-                        }
+                    if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
+                        send_status(SessionState::Failed, detail);
+                        break;
                     }
                     send_selection_state(selection);
                 }
@@ -415,6 +376,81 @@ async fn run_session(
 
 fn send_status(state: SessionState, detail: String) {
     SessionStatus { state, detail }.send_signal_to_dart();
+}
+
+/// 远端 PTY 的尺寸下限：Flutter 在极端布局下可能量出 0 行/列。
+fn clamped_size(size: TerminalSize) -> TerminalSize {
+    TerminalSize {
+        cols: size.cols.max(MIN_COLS),
+        rows: size.rows.max(MIN_ROWS),
+        ..size
+    }
+}
+
+/// 渲染当前视口并发帧（附带 5 秒一次的性能汇总）。
+fn present<E: TerminalEngine>(
+    engine: &mut E,
+    viewport: Viewport,
+    selection: Option<SelectionRange>,
+    stats: &mut PerfWindow,
+    pacer: &mut FramePacer,
+) -> Result<(), String> {
+    let render_start = std::time::Instant::now();
+    let frame = engine
+        .render(viewport, selection)
+        .map_err(|error| format!("render: {error:?}"))?;
+    let render_us = micros_since(render_start);
+    send_frame(&frame, stats, render_us);
+    pacer.sent(Instant::now());
+    if let Some(perf) = stats.maybe_report() {
+        perf.send_signal_to_dart();
+    }
+    Ok(())
+}
+
+/// 帧节拍：空闲后的第一帧立即发（打字回显不等），之后按显示刷新率合帧
+/// （≤60 Hz）。高输出（`cat` 大文件）时每个输出块都渲染发帧会把 Dart
+/// 冲垮——rinf 的队列无界，积压只会越来越深。
+struct FramePacer {
+    last_sent: Option<Instant>,
+    pending: bool,
+}
+
+impl FramePacer {
+    const INTERVAL: Duration = Duration::from_millis(16);
+
+    fn new() -> Self {
+        Self {
+            last_sent: None,
+            pending: false,
+        }
+    }
+
+    /// 内容变了。返回 true = 现在就出帧；false = 已记为待发，到 [`Self::deadline`] 再出。
+    fn mark_dirty(&mut self, now: Instant) -> bool {
+        match self.last_sent {
+            Some(last) if now < last + Self::INTERVAL => {
+                self.pending = true;
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// 待发帧最早的出帧时刻；没有待发帧为 `None`。
+    fn deadline(&self) -> Option<Instant> {
+        if self.pending {
+            self.last_sent.map(|last| last + Self::INTERVAL)
+        } else {
+            None
+        }
+    }
+
+    /// 刚发出一帧（它已包含此前所有变化）。
+    fn sent(&mut self, now: Instant) {
+        self.last_sent = Some(now);
+        self.pending = false;
+    }
 }
 
 /// 把引擎当前持有的选区回显给 Dart。保留 anchor/focus 的原始角色不排序
@@ -686,9 +722,11 @@ fn known_hosts_path() -> Option<String> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
-    use super::{parse_key_code, terminal_input_from_request};
+    use super::{FramePacer, terminal_input_from_request};
     use crate::signals::InputRequest;
     use rshell_m0::rshell_core::{KeyCode, TerminalInput};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     fn input(key: &str, control: bool) -> Option<TerminalInput> {
         terminal_input_from_request(InputRequest {
@@ -718,6 +756,35 @@ mod tests {
         ));
         assert!(input("f25", false).is_none());
         assert!(input("not_a_key", false).is_none());
+    }
+
+    #[test]
+    fn function_keys_use_the_dart_wire_format() {
+        // Dart 侧（frame_terminal.dart 的 _fKeyNames）发 "f1".."f12"。
+        for index in 1..=12u8 {
+            let name = format!("f{index}");
+            assert!(matches!(
+                input(&name, false),
+                Some(TerminalInput::Key { code: KeyCode::F(parsed), .. }) if parsed == index
+            ));
+        }
+        assert!(input("f:1", false).is_none());
+    }
+
+    #[test]
+    fn pacer_sends_first_frame_immediately_then_coalesces() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new();
+        // 空闲后第一帧：立即出。
+        assert!(pacer.mark_dirty(start));
+        pacer.sent(start);
+        assert_eq!(pacer.deadline(), None);
+        // 节拍内的新内容：攒着，到点再出。
+        assert!(!pacer.mark_dirty(start + Duration::from_millis(5)));
+        assert_eq!(pacer.deadline(), Some(start + FramePacer::INTERVAL));
+        // 过了节拍：立即出。
+        let later = start + FramePacer::INTERVAL + Duration::from_millis(1);
+        assert!(pacer.mark_dirty(later));
     }
 
     #[test]

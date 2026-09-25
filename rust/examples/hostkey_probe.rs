@@ -11,7 +11,7 @@ use rshell_core::{
 };
 use rshell_session::{
     AuthPlan, DefaultTerminalEngine, KnownHostsVerifier, NativeSshTransport, SessionTransport,
-    TerminalEngine, TransportRequest, interaction_channel,
+    TransportRequest, interaction_channel,
 };
 
 /// 第一层：裸 russh 客户端握手（check_server_key 一律接受）。
@@ -100,7 +100,7 @@ async fn transport_probe(host: &str, port: u16) -> Result<String, String> {
 
     let term_profile: ResolvedTerminalProfile =
         TerminalSettingsV1::default().resolve(&TerminalOverrides::default());
-    let mut engine = DefaultTerminalEngine::new(
+    let engine = DefaultTerminalEngine::new(
         &term_profile,
         TerminalSize {
             cols: 80,

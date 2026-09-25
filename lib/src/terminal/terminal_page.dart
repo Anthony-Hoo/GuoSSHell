@@ -166,6 +166,8 @@ class _TerminalPageState extends State<TerminalPage> {
       _state = state;
       _detail = pack.message.detail;
     });
+    // 连接中视图几何可能又变了（键盘弹出、旋转）：连上即补发最新尺寸。
+    if (state == SessionState.connected) _flushResize();
   }
 
   void _onFrame(RustSignalPack<FrameUpdate> pack) {
@@ -334,61 +336,66 @@ class _TerminalPageState extends State<TerminalPage> {
     return true;
   }
 
-  /// fork 的 render 在布局期报几何 → Rust（度量的权威在 Flutter）。
-  /// 首次几何到达时若还有待发的连接请求，就带着真实几何发 ConnectRequest——
-  /// 否则远端 PTY 只能按缺省 2×2 建立，exec 输出会在换行历史里塞满垃圾。
-  ///
-  /// 软键盘/旋转动画期间 fork 会**逐帧**报新几何；每一步都转发的话，
-  /// 远端 shell 会为每一步重画一次提示符（实机实测：一次键盘弹出刷了
-  /// 8 行提示符）。去抖后只发最终尺寸。
-  void _onTerminalResize(int cols, int rows, int pixelWidth, int pixelHeight) {
-    final pending = _pendingConnect;
-    if (pending != null) {
-      _pendingConnect = null;
-      ConnectRequest(
-        host: pending.host,
-        port: pending.port,
-        username: pending.username,
-        password: pending.password,
-        command: pending.command,
-        cols: cols,
-        rows: rows,
-        pixelWidth: pixelWidth,
-        pixelHeight: pixelHeight,
-        dpi: (96 * MediaQuery.devicePixelRatioOf(context)).round(),
-      ).sendSignalToRust();
+  /// fork 的 render 在布局期报几何（只在变化时）→ Rust（度量的权威在 Flutter）。
+  /// 有待发的连接请求时带着真实几何发 ConnectRequest——否则远端 PTY 只能按
+  /// 缺省 2×2 建立，exec 输出会在换行历史里塞满垃圾。
+  void _onTerminalResize(TerminalGeometry geometry) {
+    if (_pendingConnect != null) {
+      _flushPendingConnect();
       return;
     }
-    if (_state != SessionState.connected) return;
-    if (cols == _sentCols && rows == _sentRows && pixelWidth == _sentPw && pixelHeight == _sentPh) {
-      return;
-    }
-    _pendingCols = cols;
-    _pendingRows = rows;
-    _pendingPw = pixelWidth;
-    _pendingPh = pixelHeight;
+    // 连接中的几何变化先不发：连上时由 _onStatus 补发（见 _flushResize）。
+    if (_state != SessionState.connected || geometry == _sentGeometry) return;
+    // 软键盘/旋转动画期间 fork 会**逐帧**报新几何；每一步都转发的话，
+    // 远端 shell 会为每一步重画一次提示符（实机实测：一次键盘弹出刷了
+    // 8 行提示符）。去抖后只发最终尺寸。
     _resizeTimer?.cancel();
     _resizeTimer = Timer(const Duration(milliseconds: 150), _flushResize);
   }
 
+  /// 把最新几何发给会话（与已发的相同则不发）。
   void _flushResize() {
+    _resizeTimer?.cancel();
     _resizeTimer = null;
     if (!mounted || _state != SessionState.connected) return;
-    _sentCols = _pendingCols;
-    _sentRows = _pendingRows;
-    _sentPw = _pendingPw;
-    _sentPh = _pendingPh;
+    final geometry = _terminal.measuredGeometry;
+    if (geometry == null || geometry == _sentGeometry) return;
+    _sentGeometry = geometry;
     ResizeRequest(
-      cols: _sentCols,
-      rows: _sentRows,
-      pixelWidth: _sentPw,
-      pixelHeight: _sentPh,
-      dpi: (96 * MediaQuery.devicePixelRatioOf(context)).round(),
+      cols: geometry.cols,
+      rows: geometry.rows,
+      pixelWidth: geometry.pixelWidth,
+      pixelHeight: geometry.pixelHeight,
+      dpi: _dpi,
     ).sendSignalToRust();
   }
 
-  int _sentCols = 0, _sentRows = 0, _sentPw = 0, _sentPh = 0;
-  int _pendingCols = 0, _pendingRows = 0, _pendingPw = 0, _pendingPh = 0;
+  /// 有待发的连接请求且已量到几何 → 发出 ConnectRequest。
+  /// 还没有几何（首次布局前）就等 fork 的 resize 回调再发。
+  void _flushPendingConnect() {
+    final pending = _pendingConnect;
+    final geometry = _terminal.measuredGeometry;
+    if (pending == null || geometry == null || !mounted) return;
+    _pendingConnect = null;
+    _sentGeometry = geometry;
+    ConnectRequest(
+      host: pending.host,
+      port: pending.port,
+      username: pending.username,
+      password: pending.password,
+      command: pending.command,
+      cols: geometry.cols,
+      rows: geometry.rows,
+      pixelWidth: geometry.pixelWidth,
+      pixelHeight: geometry.pixelHeight,
+      dpi: _dpi,
+    ).sendSignalToRust();
+  }
+
+  int get _dpi => (96 * MediaQuery.devicePixelRatioOf(context)).round();
+
+  /// 已随 ConnectRequest / ResizeRequest 发给当前会话的几何。
+  TerminalGeometry? _sentGeometry;
   Timer? _resizeTimer;
 
   /// 软键盘开关（键位条「⌨」键）：焦点在终端 = 键盘起，否则收起。
@@ -489,8 +496,7 @@ class _TerminalPageState extends State<TerminalPage> {
       _phase = _Phase.session;
       _state = SessionState.connecting;
       _detail = '$host:$port';
-      // 不立刻发请求：等会话视图完成首次布局、拿到真实几何再发
-      // （见 _onTerminalResize）。
+      // 不立刻发请求：等会话视图完成布局、拿到真实几何再发。
       _pendingConnect = _PendingConnect(
         host: host,
         port: port,
@@ -499,6 +505,9 @@ class _TerminalPageState extends State<TerminalPage> {
         command: command,
       );
     });
+    // 布局后几何变了 → fork 回调 _onTerminalResize 已经发出；没变（重连时
+    // 视图尺寸通常不变，fork 不再回调）→ 这里用已量到的几何发出。
+    SchedulerBinding.instance.addPostFrameCallback((_) => _flushPendingConnect());
   }
 
   _PendingConnect? _pendingConnect;

@@ -1,5 +1,7 @@
-//! OpenPGP 卡（M3b）：用卡上**认证槽**的密钥做 SSH 公钥认证——VERIFY PW1（P2=82）后
-//! INTERNAL AUTHENTICATE，Ed25519 直接签 SSH 要签的数据。私钥从不离开卡。
+//! OpenPGP 卡（M3b / M3c）：用卡上**认证槽**的密钥做 SSH 公钥认证——VERIFY PW1（P2=82）后
+//! INTERNAL AUTHENTICATE。Ed25519 直接签 SSH 要签的数据；RSA 送 DigestInfo（卡做 PKCS#1
+//! 填充，`rsa-sha2-256/512`，旧服务器 `ssh-rsa`）；ECDSA（NIST P-256/384/521）送摘要，卡回
+//! 定长 r‖s，拆开转成 SSH 的 mpint。私钥从不离开卡。
 //!
 //! APDU 层是 openpgp-card；卡从哪里来由 [`CardReader`] 决定：CryptoTokenKit（iOS /
 //! macOS 的读卡器与 NFC 卡槽）、测试与 debug 构建里的模拟卡。签名经上游的
@@ -17,10 +19,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use card_backend::CardBackend;
 use openpgp_card::Card;
 use openpgp_card::ocard::algorithm::{AlgorithmAttributes, Curve};
-use openpgp_card::ocard::crypto::{EccType, PublicKeyMaterial};
+use openpgp_card::ocard::crypto::{EccType, HashAlgo, PublicKeyMaterial, SigningAlgo};
 use openpgp_card::ocard::{KeyType, StatusBytes};
 use openpgp_card::state::{Open, Transaction};
-use rshell_m0::russh::keys::ssh_key::public::{Ed25519PublicKey, KeyData};
+use rshell_m0::russh::keys::ssh_key::public::{
+    EcdsaPublicKey, Ed25519PublicKey, KeyData, RsaPublicKey,
+};
+use rshell_m0::russh::keys::ssh_key::sha2::{Digest as _, Sha256, Sha384, Sha512};
+use rshell_m0::russh::keys::ssh_key::{EcdsaCurve, Mpint};
 use rshell_m0::russh::keys::{HashAlg, PublicKey};
 use secrecy::SecretString;
 
@@ -84,8 +90,10 @@ pub fn platform_reader() -> Arc<dyn CardReader> {
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     readers.push(Arc::new(ctk::CtkReader));
     #[cfg(debug_assertions)]
-    if std::env::var_os("GUOSH_VIRTUAL_CARD").is_some() {
-        readers.push(Arc::new(virtual_card::VirtualCard::for_debug()));
+    if let Some(kind) = std::env::var_os("GUOSH_VIRTUAL_CARD") {
+        readers.push(Arc::new(virtual_card::VirtualCard::for_debug(
+            &kind.to_string_lossy(),
+        )));
     }
     Arc::new(Readers(readers))
 }
@@ -97,7 +105,7 @@ pub enum CardFailure {
     NotFound,
     /// 卡上认证槽的密钥与登记时的不同。
     KeyMismatch,
-    /// 认证槽没有密钥，或算法暂不支持（M3b 只做 Ed25519）。
+    /// 认证槽没有密钥，或算法 SSH 不支持（brainpool、secp256k1 等）。
     Unsupported,
     PinWrong { tries_left: u8 },
     PinBlocked,
@@ -131,7 +139,7 @@ pub struct CardInfo {
     pub cardholder: String,
     /// 认证槽的算法（界面显示用）。
     pub algorithm: String,
-    /// 认证槽的公钥；`None` = 没有密钥，或算法暂不支持。
+    /// 认证槽的公钥；`None` = 没有密钥，或算法 SSH 不支持。
     pub public_key: Option<PublicKey>,
     /// PIN 还能试几次。
     pub pin_tries_left: u8,
@@ -238,22 +246,37 @@ impl CardContext {
         let mut card = self.open(ident)?;
         let info = read_info(&mut card)?;
         check_key(&info, expected)?;
-        if hash.is_some() {
-            return Err(CardFailure::Unsupported);
-        }
         let mut tx = card.transaction()?;
+        let scheme = Scheme::of(&tx.algorithm_attributes(KeyType::Authentication)?)
+            .ok_or(CardFailure::Unsupported)?;
         if let Err(error) = tx.verify_user_pin(pin) {
             return Err(pin_failure(&mut tx, error));
         }
         before_sign(info.touch);
-        let signature = tx.card().internal_authenticate(data.to_vec())?;
-        if signature.len() != 64 {
-            return Err(CardFailure::Io(format!(
-                "unexpected Ed25519 signature length {}",
-                signature.len()
-            )));
+        match scheme {
+            Scheme::Ed25519 => {
+                let signature = tx.card().internal_authenticate(data.to_vec())?;
+                if signature.len() != 64 {
+                    return Err(CardFailure::Io(format!(
+                        "unexpected Ed25519 signature length {}",
+                        signature.len()
+                    )));
+                }
+                Ok(ssh_signature("ssh-ed25519", &signature))
+            }
+            Scheme::Rsa => {
+                let (name, algorithm, digest) = rsa_digest(hash, data);
+                let signature = tx
+                    .card()
+                    .authenticate_for_hash(SigningAlgo::RSA(algorithm), &digest)?;
+                Ok(ssh_signature(name, &signature))
+            }
+            Scheme::Ecdsa(curve) => {
+                let digest = ecdsa_digest(curve, data);
+                let signature = tx.card().authenticate_for_hash(SigningAlgo::ECC, &digest)?;
+                ecdsa_signature(curve, &signature)
+            }
         }
-        Ok(ssh_signature("ssh-ed25519", &signature))
     }
 
     /// 找到卡号为 `ident` 的卡（已选中 OpenPGP 应用）。
@@ -296,12 +319,12 @@ fn read_info(card: &mut Card<Open>) -> Result<CardInfo, CardFailure> {
     let ident = tx.application_identifier()?.ident();
     let cardholder = tx.cardholder_name().unwrap_or_default();
     let algorithm = tx.algorithm_attributes(KeyType::Authentication)?;
-    let public_key = if is_ed25519(&algorithm) {
-        tx.public_key_material(KeyType::Authentication)
+    let public_key = match Scheme::of(&algorithm) {
+        Some(scheme) => tx
+            .public_key_material(KeyType::Authentication)
             .ok()
-            .and_then(|material| ed25519_public_key(&material, &ident))
-    } else {
-        None
+            .and_then(|material| ssh_public_key(&material, scheme, &ident)),
+        None => None,
     };
     let pin_tries_left = tx.pw_status_bytes()?.err_count_pw1();
     let touch = tx
@@ -337,43 +360,129 @@ fn pin_failure(tx: &mut Card<Transaction<'_>>, error: openpgp_card::Error) -> Ca
     }
 }
 
-fn is_ed25519(algorithm: &AlgorithmAttributes) -> bool {
-    matches!(algorithm, AlgorithmAttributes::Ecc(ecc)
-        if ecc.ecc_type() == EccType::EdDSA && *ecc.curve() == Curve::Ed25519)
+/// 认证槽的签名方式（SSH 支持的几种）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    Ed25519,
+    Rsa,
+    Ecdsa(EcdsaCurve),
+}
+
+impl Scheme {
+    fn of(algorithm: &AlgorithmAttributes) -> Option<Self> {
+        match algorithm {
+            AlgorithmAttributes::Rsa(_) => Some(Self::Rsa),
+            AlgorithmAttributes::Ecc(ecc) => match (ecc.ecc_type(), ecc.curve()) {
+                (EccType::EdDSA, Curve::Ed25519) => Some(Self::Ed25519),
+                (EccType::ECDSA, Curve::NistP256r1) => Some(Self::Ecdsa(EcdsaCurve::NistP256)),
+                (EccType::ECDSA, Curve::NistP384r1) => Some(Self::Ecdsa(EcdsaCurve::NistP384)),
+                (EccType::ECDSA, Curve::NistP521r1) => Some(Self::Ecdsa(EcdsaCurve::NistP521)),
+                _ => None,
+            },
+            AlgorithmAttributes::Unknown(_) => None,
+        }
+    }
 }
 
 fn algorithm_name(algorithm: &AlgorithmAttributes) -> String {
     match algorithm {
         AlgorithmAttributes::Rsa(rsa) => format!("RSA {}", rsa.len_n()),
-        AlgorithmAttributes::Ecc(ecc) => format!("{:?}", ecc.curve()),
+        AlgorithmAttributes::Ecc(ecc) => match ecc.curve() {
+            Curve::Ed25519 => "Ed25519".to_owned(),
+            Curve::NistP256r1 => "NIST P-256".to_owned(),
+            Curve::NistP384r1 => "NIST P-384".to_owned(),
+            Curve::NistP521r1 => "NIST P-521".to_owned(),
+            curve => format!("{curve:?}"),
+        },
         AlgorithmAttributes::Unknown(_) => "unknown".to_owned(),
     }
 }
 
-/// 卡给的 Ed25519 公钥（32 字节，个别卡带 0x40 前缀）→ OpenSSH 公钥，注释写卡号。
-fn ed25519_public_key(material: &PublicKeyMaterial, ident: &str) -> Option<PublicKey> {
-    let PublicKeyMaterial::E(ecc) = material else {
-        return None;
+/// 卡给的公钥 → OpenSSH 公钥，注释写卡号。Ed25519 是 32 字节的点（个别卡带 0x40 前缀），
+/// RSA 是模数与指数，ECDSA 是 SEC1 未压缩点。
+fn ssh_public_key(material: &PublicKeyMaterial, scheme: Scheme, ident: &str) -> Option<PublicKey> {
+    let key_data = match (scheme, material) {
+        (Scheme::Ed25519, PublicKeyMaterial::E(ecc)) => {
+            let point = match ecc.data() {
+                [0x40, rest @ ..] if rest.len() == 32 => rest,
+                point => point,
+            };
+            KeyData::Ed25519(Ed25519PublicKey(point.try_into().ok()?))
+        }
+        (Scheme::Rsa, PublicKeyMaterial::R(rsa)) => KeyData::Rsa(
+            RsaPublicKey::new(
+                Mpint::from_positive_bytes(rsa.v()),
+                Mpint::from_positive_bytes(rsa.n()),
+            )
+            .ok()?,
+        ),
+        (Scheme::Ecdsa(curve), PublicKeyMaterial::E(ecc)) => {
+            let key = EcdsaPublicKey::from_sec1_bytes(ecc.data()).ok()?;
+            if key.curve() != curve {
+                return None;
+            }
+            KeyData::Ecdsa(key)
+        }
+        _ => return None,
     };
-    let point = match ecc.data() {
-        [0x40, rest @ ..] if rest.len() == 32 => rest,
-        point => point,
-    };
-    let point: [u8; 32] = point.try_into().ok()?;
     Some(PublicKey::new(
-        KeyData::Ed25519(Ed25519PublicKey(point)),
+        key_data,
         format!("cardno:{}", ident.replace(':', "")),
     ))
+}
+
+/// RSA：按服务器接受的签名算法取摘要。没有 SHA-2 可用的旧服务器只认 `ssh-rsa`（SHA-1）。
+fn rsa_digest(hash: Option<HashAlg>, data: &[u8]) -> (&'static str, HashAlgo, Vec<u8>) {
+    match hash {
+        Some(HashAlg::Sha512) => ("rsa-sha2-512", HashAlgo::SHA512, Sha512::digest(data).to_vec()),
+        Some(_) => ("rsa-sha2-256", HashAlgo::SHA256, Sha256::digest(data).to_vec()),
+        None => {
+            use sha1::Digest as _;
+            ("ssh-rsa", HashAlgo::SHA1, sha1::Sha1::digest(data).to_vec())
+        }
+    }
+}
+
+/// ECDSA：摘要算法由曲线决定（RFC 5656）。
+fn ecdsa_digest(curve: EcdsaCurve, data: &[u8]) -> Vec<u8> {
+    match curve {
+        EcdsaCurve::NistP256 => Sha256::digest(data).to_vec(),
+        EcdsaCurve::NistP384 => Sha384::digest(data).to_vec(),
+        EcdsaCurve::NistP521 => Sha512::digest(data).to_vec(),
+    }
+}
+
+/// 卡回的 ECDSA 签名是定长的 r‖s（个别卡每半多一个前导 0）→ SSH 签名 blob：
+/// `string(算法名) || string(mpint(r) || mpint(s))`。
+fn ecdsa_signature(curve: EcdsaCurve, signature: &[u8]) -> Result<Vec<u8>, CardFailure> {
+    if signature.is_empty() || !signature.len().is_multiple_of(2) {
+        return Err(CardFailure::Io(format!(
+            "unexpected ECDSA signature length {}",
+            signature.len()
+        )));
+    }
+    let (r, s) = signature.split_at(signature.len() / 2);
+    let mut inner = Vec::with_capacity(signature.len() + 10);
+    for half in [r, s] {
+        let mpint = Mpint::from_positive_bytes(half);
+        push_string(&mut inner, mpint.as_bytes());
+    }
+    let name = format!("ecdsa-sha2-{}", curve.as_str());
+    Ok(ssh_signature(&name, &inner))
 }
 
 /// SSH 签名 blob：`string(算法名) || string(签名)`。
 fn ssh_signature(algorithm: &str, signature: &[u8]) -> Vec<u8> {
     let mut blob = Vec::with_capacity(8 + algorithm.len() + signature.len());
-    for part in [algorithm.as_bytes(), signature] {
-        blob.extend_from_slice(&u32::try_from(part.len()).unwrap_or(u32::MAX).to_be_bytes());
-        blob.extend_from_slice(part);
-    }
+    push_string(&mut blob, algorithm.as_bytes());
+    push_string(&mut blob, signature);
     blob
+}
+
+/// SSH 的 string：u32 长度 + 内容。
+fn push_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_be_bytes());
+    out.extend_from_slice(bytes);
 }
 
 #[cfg(test)]

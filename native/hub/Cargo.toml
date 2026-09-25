@@ -33,6 +33,11 @@ zeroize = "1"
 openpgp-card = "0.7.0"
 card-backend = "0.2.0"
 async-trait = "0.1"
+# 卡上 RSA 签名的摘要：旧服务器只认 ssh-rsa（SHA-1）；SHA-2 用 ssh-key 带的 sha2。
+sha1 = "0.11"
+# debug 构建与测试里的模拟卡用它们签 RSA / P-256（与 russh 用的是同一版本）。
+rsa = "0.10.0-rc.18"
+p256 = { version = "0.14", features = ["ecdsa"] }
 
 # 业务内核唯一入口：`rshell-m0`（根 workspace 成员，path 依赖）。
 # 它再导出 rshell-core / rshell-session，并把上游 git 依赖的 rev pin 在
@@ -51,6 +56,10 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSEnumerator", "NSError", "NSString"] }
 objc2-crypto-token-kit = { version = "0.3.2", default-features = false, features = ["std", "TKSmartCard", "TKSmartCardSlotNFCSession", "block2", "bitflags"] }
 block2 = "0.6"
+
+[dev-dependencies]
+# 暂停的时钟（连接时限的测试）。
+tokio = { version = "1.45.0", features = ["test-util"] }
 
 # Uncomment below to target the web.
 # tokio_with_wasm = { version = "0.8.5", features = ["rt", "macros", "time"] }

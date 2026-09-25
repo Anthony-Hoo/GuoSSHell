@@ -1244,11 +1244,14 @@ dependencies = [
  "objc2-crypto-token-kit",
  "objc2-foundation",
  "openpgp-card",
+ "p256",
  "rinf",
+ "rsa",
  "rshell-m0",
  "secrecy",
  "serde",
  "serde_json",
+ "sha1",
  "tokio",
  "uuid",
  "zeroize",
@@ -2140,7 +2143,7 @@ dependencies = [
 [[package]]
 name = "rshell-core"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=64233db1f9642ae146a3f06561c66567da5a8135#64233db1f9642ae146a3f06561c66567da5a8135"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=bb38b1fa4debec6fac86c91b5f84668b3a75c41a#bb38b1fa4debec6fac86c91b5f84668b3a75c41a"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2172,7 +2175,7 @@ dependencies = [
 [[package]]
 name = "rshell-platform"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=64233db1f9642ae146a3f06561c66567da5a8135#64233db1f9642ae146a3f06561c66567da5a8135"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=bb38b1fa4debec6fac86c91b5f84668b3a75c41a#bb38b1fa4debec6fac86c91b5f84668b3a75c41a"
 dependencies = [
  "directories",
  "thiserror 2.0.20",
@@ -2182,7 +2185,7 @@ dependencies = [
 [[package]]
 name = "rshell-session"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=64233db1f9642ae146a3f06561c66567da5a8135#64233db1f9642ae146a3f06561c66567da5a8135"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=bb38b1fa4debec6fac86c91b5f84668b3a75c41a#bb38b1fa4debec6fac86c91b5f84668b3a75c41a"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
@@ -2203,7 +2206,7 @@ dependencies = [
 [[package]]
 name = "rshell-storage"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=64233db1f9642ae146a3f06561c66567da5a8135#64233db1f9642ae146a3f06561c66567da5a8135"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=bb38b1fa4debec6fac86c91b5f84668b3a75c41a#bb38b1fa4debec6fac86c91b5f84668b3a75c41a"
 dependencies = [
  "async-trait",
  "keyring",

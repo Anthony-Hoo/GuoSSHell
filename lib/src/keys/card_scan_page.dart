@@ -141,7 +141,7 @@ class _CardScanPageState extends State<CardScanPage> {
                   trailing: card.added
                       ? const Text('已添加')
                       : card.publicKey.isEmpty
-                          ? const Text('暂不支持')
+                          ? const Text('不可用')
                           : FilledButton(
                               onPressed: _busy ? null : () => _add(card),
                               child: const Text('添加'),

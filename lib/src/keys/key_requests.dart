@@ -66,5 +66,5 @@ String keyErrorText(KeyError error) => switch (error) {
       KeyError.keychain => '钥匙串读写失败',
       KeyError.syncUnavailable => '无法写入 iCloud 钥匙串',
       KeyError.cardNotFound => '没有找到 OpenPGP 卡',
-      KeyError.cardUnsupported => '这张卡的认证密钥暂不支持（目前只支持 Ed25519）',
+      KeyError.cardUnsupported => '这张卡的认证槽没有密钥，或算法 SSH 用不了（支持 Ed25519、RSA 与 NIST P-256/384/521）',
     };

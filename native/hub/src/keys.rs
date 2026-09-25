@@ -850,7 +850,7 @@ mod tests {
         Item, MemoryKeyStore, PreferenceFile, add_card, decode, delete, forget_passphrase, import,
         key_ref, load, rename, save_passphrase, scan_cards, set_sync, summaries,
     };
-    use crate::card::virtual_card::{CARDHOLDER, IDENT, VirtualCard};
+    use crate::card::virtual_card::{CARDHOLDER, CardKey, IDENT, VirtualCard};
     use crate::app::AppContext;
     use crate::card::{CardContext, NoCards};
     use crate::signals::keys::KeyError;
@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn a_scanned_card_is_registered_once_and_loads_as_a_card_key() {
         let mut context = context(false);
-        let card = VirtualCard::new([7; 32], false);
+        let card = VirtualCard::new(CardKey::ed25519([7; 32]), false);
         context.cards = Arc::new(CardContext::new(Arc::new(card.clone())));
 
         assert_eq!(add_card(&context, IDENT, ""), Err(KeyError::CardNotFound));

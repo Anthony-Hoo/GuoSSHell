@@ -19,13 +19,15 @@ use tokio::task::spawn_blocking;
 use super::{CardContext, CardFailure, lock};
 use crate::signals::{ConnectHint, FailureKind, SessionState, SessionStatus};
 
-/// 签名过程中要会话代为问用户的事。
+/// 签名过程中要会话代为问用户的事，以及卡在等用户（按键、靠卡）的起止——
+/// 等用户的时间不算进连接时限。
 pub enum CardRequest {
     /// 问 PIN。回答是 PIN 与「记住到退出 App」；取消为 `None`。
     Pin {
         question: PinQuestion,
         reply: oneshot::Sender<Option<(SecretString, bool)>>,
     },
+    Waiting(bool),
 }
 
 pub struct PinQuestion {
@@ -108,6 +110,7 @@ impl CardSigner {
             if nfc {
                 send_hint(self.session_id, &self.target, ConnectHint::TapCard);
             }
+            let _ = self.requests.send(CardRequest::Waiting(true));
             let result = {
                 let cards = self.cards.clone();
                 let ident = self.ident.clone();
@@ -126,6 +129,7 @@ impl CardSigner {
                 .await
                 .map_err(|error| CardFailure::Io(error.to_string()))?
             };
+            let _ = self.requests.send(CardRequest::Waiting(false));
             send_hint(self.session_id, &self.target, ConnectHint::None);
             match result {
                 Ok(blob) => {

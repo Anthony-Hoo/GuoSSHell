@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rinf::{RustSignal, debug_print};
 use rshell_m0::rshell_core::{
@@ -23,6 +24,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
+use tokio::time::Instant;
 
 use crate::app::AppContext;
 use crate::card::{CardFailure, CardRequest, CardSigner, PinQuestion};
@@ -32,6 +34,12 @@ use crate::session::SessionCommand;
 use crate::signals::interaction::{InteractionPrompt, InteractionReply, PromptField, PromptKind};
 use crate::signals::keys::KeyError;
 use crate::signals::{ConnectRequest, FailureKind};
+
+/// 连接时等网络的总时长上限。等用户（主机密钥确认、问答、PIN、按卡）的时间不算在内——
+/// 那段由服务器把关（OpenSSH 的 LoginGraceTime），与 OpenSSH 客户端一致。
+const CONNECT_BUDGET: Duration = Duration::from_secs(60);
+/// 交给传输层的连接上限（含等用户的时间），只防一直没人回答。
+const CONNECT_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 pub struct Connected {
     pub transport: NativeSshTransport,
@@ -217,9 +225,12 @@ pub async fn establish(
     .map_err(|error| Abort::failed(FailureKind::Other, format!("auth plan: {error:?}")))?;
 
     // 主机密钥：新主机与变更的密钥都问用户（变更时带 changed，Dart 给出醒目警告）。
-    let verifier = KnownHostsVerifier::new(&context.known_hosts).with_changed_key_prompt();
-    let mut transport =
-        NativeSshTransport::new(profile.clone(), auth, verifier).map_err(|error| {
+    let verifier = KnownHostsVerifier::new(&context.known_hosts)
+        .with_changed_key_prompt()
+        .with_timeout(CONNECT_LIMIT);
+    let mut transport = NativeSshTransport::new(profile.clone(), auth, verifier)
+        .and_then(|transport| transport.with_connect_timeout(CONNECT_LIMIT))
+        .map_err(|error| {
             Abort::failed(
                 failure_kind(error.failure()),
                 format!("transport: {error:?}"),
@@ -235,9 +246,15 @@ pub async fn establish(
         let mut pending = HashMap::new();
         let mut pending_pins: HashMap<u32, oneshot::Sender<Option<(SecretString, bool)>>> =
             HashMap::new();
+        let mut budget = Budget::new(CONNECT_BUDGET);
+        let mut card_waiting = false;
         loop {
+            budget.pause(!pending.is_empty() || !pending_pins.is_empty() || card_waiting);
             tokio::select! {
                 result = &mut connect => break result,
+                () = budget.expired() => {
+                    return Err(Abort::failed(FailureKind::Timeout, "connect: timed out".to_owned()));
+                }
                 request = requests.recv() => {
                     if let Some((id, request)) = request {
                         forward_prompt(session_id, &profile, &broker, &mut prompts, &mut pending, id, request);
@@ -250,6 +267,7 @@ pub async fn establish(
                             .send_signal_to_dart();
                         pending_pins.insert(prompt_id, reply);
                     }
+                    Some(CardRequest::Waiting(waiting)) => card_waiting = waiting,
                     None => card_requests = None,
                 },
                 reply = channels.replies.recv() => {
@@ -281,6 +299,40 @@ pub async fn establish(
         store_password(context, profile.id, password).await;
     }
     Ok(Connected { transport, profile })
+}
+
+/// 连接的时限，只在等网络时走：有问题等用户回答时暂停。
+struct Budget {
+    deadline: Instant,
+    paused_at: Option<Instant>,
+}
+
+impl Budget {
+    fn new(limit: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + limit,
+            paused_at: None,
+        }
+    }
+
+    fn pause(&mut self, paused: bool) {
+        let now = Instant::now();
+        match (paused, self.paused_at) {
+            (true, None) => self.paused_at = Some(now),
+            (false, Some(since)) => {
+                self.deadline += now - since;
+                self.paused_at = None;
+            }
+            _ => {}
+        }
+    }
+
+    async fn expired(&self) {
+        match self.paused_at {
+            Some(_) => std::future::pending().await,
+            None => tokio::time::sleep_until(self.deadline).await,
+        }
+    }
 }
 
 /// 本会话内递增的问题编号。
@@ -670,7 +722,8 @@ pub fn failure_kind(failure: SessionFailure) -> FailureKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptKind, broker_response, is_empty_round};
+    use super::{Budget, PromptKind, broker_response, is_empty_round};
+    use std::time::Duration;
     use crate::signals::interaction::InteractionReply;
     use rshell_m0::rshell_core::{
         AuthPrompt, HostKeyDecision, InteractionId, InteractionResponse, KeyboardInteractivePrompt,
@@ -735,5 +788,25 @@ mod tests {
             broker_response(PromptKind::KeyboardInteractive, reply(false, &["x"])),
             InteractionResponse::Cancel
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_connect_budget_does_not_count_time_spent_waiting_for_the_user() {
+        let mut budget = Budget::new(Duration::from_secs(60));
+        tokio::time::advance(Duration::from_secs(50)).await;
+        budget.pause(true);
+        tokio::time::advance(Duration::from_secs(300)).await;
+        budget.pause(false);
+        // 还剩 10 秒网络时间。
+        assert!(
+            tokio::time::timeout(Duration::from_secs(9), budget.expired())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), budget.expired())
+                .await
+                .is_ok()
+        );
     }
 }

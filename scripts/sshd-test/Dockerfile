@@ -18,6 +18,10 @@ RUN useradd -m -s /bin/bash probe \
  && chmod 700 /home/probe/.ssh \
  && chown -R probe:probe /home/probe/.ssh
 
+# keyboard-interactive 验收：Debian 默认关着；打开后由 PAM 逐项提问（Password:）。
+RUN sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config \
+ && grep -qx 'KbdInteractiveAuthentication yes' /etc/ssh/sshd_config
+
 # M1 帧率自检脚本：连上后执行 `m1bar`。
 COPY m1bar.sh /usr/local/bin/m1bar
 RUN chmod 755 /usr/local/bin/m1bar

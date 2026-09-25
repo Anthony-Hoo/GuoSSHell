@@ -228,9 +228,9 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: a3d42d9a840215bba81994ddade59a6c6cdead9d
-      resolved-ref: a3d42d9a840215bba81994ddade59a6c6cdead9d
-      url: "https://github.com/Rachel030219/terminal_view.git"
+      ref: "1dec90a9eb2a70893b558e6e6cc400a80a52a5e6"
+      resolved-ref: "1dec90a9eb2a70893b558e6e6cc400a80a52a5e6"
+      url: "https://github.com/Anthony-Hoo/terminal_view.git"
     source: git
     version: "0.2.1"
   test_api:

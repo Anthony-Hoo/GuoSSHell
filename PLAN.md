@@ -462,15 +462,18 @@ Ed25519 公钥（复制到服务器、改名、删除登记，与钥匙串私钥
 需要时提示按卡上的按键；卡不在、密钥不符、PIN 锁定、没按键等失败各有提示。
 决定见 §6.1「M3b OpenPGP 卡决定」。
 
-### M3c — OpenPGP 其他算法（RSA / ECDSA）—— ⏸ 不急着做
+### M3c — OpenPGP 其他算法（RSA / ECDSA）—— ✅ 已完成（2026-09-26，模拟卡验收；真卡待硬件）
 
-优先级在 M3a / M3b 之后。参考实现 `openpgp-card-ssh-agent` 已覆盖三算法，
-增量只是转换层：
+在 M3b 的卡认证上加两种算法，只是转换层：
 
-- RSA：`authenticate_for_hash` 自动拼 DigestInfo（卡加 PKCS#1 填充）；服务端走
-  `rsa-sha2-256/512`（OpenSSH 8.8+ 默认禁 `ssh-rsa`）
-- ECDSA：卡返回定长 raw r‖s → 拆两半 → SSH mpint（约 30 行，参考其 `src/ssh.rs`）
-- 估工：每算法约半天到一天（含测试）。开启条件：M3b 绿 + 有 RSA/ECDSA 卡的实测需求
+- RSA：`authenticate_for_hash` 拼 DigestInfo（卡加 PKCS#1 填充）；签名算法跟着服务器走
+  `rsa-sha2-256/512`，不支持 SHA-2 的旧服务器用 `ssh-rsa`（SHA-1，与钥匙串私钥一致）
+- ECDSA（NIST P-256 / P-384 / P-521）：摘要算法由曲线定（RFC 5656），卡返回定长 r‖s →
+  拆两半 → SSH mpint（个别卡每半多一个前导 0，mpint 编码时去掉）
+- brainpool、secp256k1 等 SSH 不支持的曲线：读卡时标为不可用
+
+**交付**：OpenPGP 卡的 RSA 与 ECDSA 认证密钥可以登记、登录；模拟卡加了 RSA 2048 与 P-256
+（`GUOSH_VIRTUAL_CARD=rsa` / `p256`），测试里签名均用公钥验证。
 
 ### M3d — WebAuthn 安全密钥（sk-ecdsa）—— ⏸ 不急着做
 
@@ -622,6 +625,9 @@ shell）。数据目录由 Dart 用 path_provider 取 Application Support 交给
 交互（密码、主机密钥、keyboard-interactive）经 `InteractionPrompt` / `InteractionReply`
 一问一答；keyboard-interactive 中既无输入项也无说明的一轮直接回空答案。会话类信号都带
 `session_id`（Dart 分配），hub 按它分发；连接期间的输入与尺寸变化连上后按顺序补上。
+连接限时只算等网络的时间（60 秒），等用户回答（主机密钥、问答、PIN、按卡）时暂停——那段由服务器的
+LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接上限（补丁 P6）与主机密钥确认的等待
+都放宽到 30 分钟，只防一直没人回答。
 失败分类（认证、主机密钥、网络、超时、钥匙串…）过边界，文案在 Dart；目标在局域网且
 失败属网络或超时类时，Rust 给出系统设置 URL（iOS `app-settings:`），Dart 用 url_launcher 打开。
 字体：内置 MesloLGS NF（常规与粗体，斜体由引擎合成），可选系统 Menlo；缺字回退内置字体。
@@ -716,7 +722,7 @@ shell）。数据目录由 Dart 用 path_provider 取 Application Support 交给
 2. **M3 的凭证 UI 形态**：已定——每次连接都读钥匙串，不在内存缓存（§6.1 M3 决定）。
    Face ID 保护（钥匙串条目的访问控制）留到需要时再加。
 3. **上游 fork 的边界。** 已经 fork（UPSTREAM.md 的 P1 bracketed paste、P2 密码可不存、
-   P3 主机密钥变更提示、P4 内存私钥认证、P5 外部签名认证）。还有两个已知的可能再改上游的需求，都不急：
+   P3 主机密钥变更提示、P4 内存私钥认证、P5 外部签名认证、P6 连接单独限时）。还有两个已知的可能再改上游的需求，都不急：
    - **把 iOS 不可用的三个传输（`local` / `pty` / `system_ssh`）从编译图里摘掉**，
      而不是靠链接器裁符号。现在靠 `-Wl,-dead_strip` 能压到 0（§3.2），所以**不急**；
      但如果哪天想做 App Store 的静态审查友好度，或者要减 `.a` 的 65 MB，就得 fork 加 feature gate。
@@ -843,6 +849,12 @@ shell）。数据目录由 Dart 用 path_provider 取 Application Support 交给
 32. **对话框里输入框的 `TextEditingController` 不能在 `showDialog` 返回后立刻 dispose**：
     对话框还在退场动画里、输入框仍在用它（debug 下断言 `_dependents.isEmpty` 红屏）。
     控制器交给对话框自己的 State 创建和销毁。
+33. **上游 `NativeSshTransport` 的操作超时（默认 60 秒）覆盖整个 `connect`**，连用户看指纹、
+    答问答、输 PIN、按卡的时间也算在内，`KnownHostsVerifier` 等主机密钥确认也另有 60 秒；
+    慢一点就「连接超时」。见 §6.1 M3 决定（补丁 P6）。服务器那边还有 LoginGraceTime（常见
+    120 秒），在登录界面停太久会被服务器断开。
+34. **iPadOS 26 模拟器的窗口控件**：点到窗口左上角会展开红黄绿三个按钮、把 App 变成浮动窗口，
+    之后的点击坐标全都错位；点绿色按钮回到全屏。
 
 ---
 
@@ -1001,7 +1013,16 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
       输对后提示按键、容器按卡的 Ed25519 公钥放行；不带模拟卡启动时提示没有找到卡
 - [ ] 真机：CanoKey 经 USB-C 直插 iPhone 登录容器；iOS 26 设备经 NFC 读卡
       （followup「OpenPGP卡NFC读卡待真机」）；macOS 随 M5
-- [ ] M3c / M3d / M4 / M5
+
+**M3c —— OpenPGP 卡 RSA / ECDSA —— ✅ 已完成（2026-09-26，模拟卡验收）**
+
+- [x] 单测（模拟卡）：RSA 按服务器选 `rsa-sha2-256/512` 签名可验、旧服务器回落 `ssh-rsa`；
+      P-256 签名可验；r / s 的前导 0 与最高位补 0
+- [x] 模拟器：RSA 2048 与 P-256 模拟卡各自添加、授权到容器后登录成功；换了卡（密钥不同）时
+      提示卡上的密钥与登记的不同
+- [x] 连接限时：在 PIN 框停过 60 秒不再「连接超时」（rsHell 补丁 P6 + 等用户时暂停计时）
+- [ ] 真机：RSA / ECDSA 的 OpenPGP 卡实测（待硬件）
+- [ ] M3d / M4 / M5
 
 **关于提交**
 

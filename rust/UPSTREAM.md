@@ -9,15 +9,15 @@
 | 上游仓库 | https://github.com/hugefiver/rsHell |
 | 上游基线 commit | `b2ab8656079225dc2c920c24f5d9e0124f4f83e1` |
 | fork 仓库 | https://github.com/Anthony-Hoo/rsHell（`guosh` 分支） |
-| pin 住的 commit | `64233db1f9642ae146a3f06561c66567da5a8135`（基线 + 下文补丁） |
+| pin 住的 commit | `bb38b1fa4debec6fac86c91b5f84668b3a75c41a`（基线 + 下文补丁） |
 | 许可证 | MIT，Copyright (c) 2026 hugefiver（副本见 `LICENSES/rsHell-MIT.txt`） |
 
 依赖声明在 `Cargo.toml`：
 
 ```toml
-rshell-core = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "64233db1f9642ae146a3f06561c66567da5a8135" }
-rshell-session = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "64233db1f9642ae146a3f06561c66567da5a8135" }
-rshell-storage = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "64233db1f9642ae146a3f06561c66567da5a8135" }
+rshell-core = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "bb38b1fa4debec6fac86c91b5f84668b3a75c41a" }
+rshell-session = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "bb38b1fa4debec6fac86c91b5f84668b3a75c41a" }
+rshell-storage = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "bb38b1fa4debec6fac86c91b5f84668b3a75c41a" }
 ```
 
 升级上游 = 在 fork 里把 `guosh` 分支 rebase 到新基线（补丁都很小，冲突面可控），
@@ -116,3 +116,4 @@ MIT 要求「许可声明随软件或其重要部分一起分发」。App Store 
 | P3 | `50c0f9b` feat(session): optional prompt to replace a changed host key | `rshell-session/src/host_keys.rs`：`KnownHostsVerifier::with_changed_key_prompt()`；`host_keys/storage.rs`：`replace` 按 russh 的条目编号（不计注释行）去掉该 host:port 的旧条目再写新键；`tests/host_keys.rs` 加两个用例 | 密钥变更时要给出显式警告并允许用户确认后替换（PLAN §5 M3）。默认关闭：上游的「变更即失败、不提示」语义与测试不变；拒绝仍是 `HostKeyChanged` |
 | P4 | `c794280` feat(session): authenticate with a decoded private key held in memory | `rshell-session/src/auth.rs`：`AuthPlan::PrivateKey{host, key}` 与 `AuthPlan::from_private_key`（只接受 PublicKey 认证的配置，不读 `identity_file`）；`transport/native_ssh/auth.rs`：该变体直接做公钥认证，与读文件的路径共用 `authenticate_with_key`（RSA 按服务器支持选 SHA-2 签名）；`tests/auth.rs`、`tests/ssh_smoke.rs` 各加一个用例 | 私钥存在钥匙串、口令由 App 询问并解密，私钥只在内存里；上游只能从 `identity_file` 读磁盘文件 |
 | P5 | `64233db` feat(session): authenticate through an external signer | `rshell-session/src/auth.rs`：`ExternalSigner` trait（签名、返回 SSH 签名 blob）、`ExternalSignerError`、`AuthPlan::Signer{host, public_key, signer}` 与 `AuthPlan::from_signer`（只接受 PublicKey 认证的配置）；`transport/native_ssh/auth.rs`：该变体经 russh 的 `authenticate_publickey_with` 认证，适配器把签名 blob 作为 SSH string 接在待签数据之后，签名器失败按认证失败报；`tests/auth.rs` 加一个用例，`tests/ssh_smoke.rs` 加两个（外部签名器认证通过、签名器失败即认证失败） | 私钥在硬件卡（OpenPGP 卡）或平台认证器里，进程拿不到私钥，只能请它签名 |
+| P6 | `bb38b1f` feat(session): bound connecting separately from other operations | `rshell-session/src/transport/native_ssh.rs`：`NativeSshTransport::with_connect_timeout`，只作用于 `connect`（TCP、握手、主机密钥确认与认证，含等交互的时间），不设时仍用操作超时；`tests/native_ssh.rs` 加一个用例（问答等待超过操作超时、未超连接上限时照常连上） | 上游的操作超时把用户看指纹、输 PIN、按卡的时间也算进连接里，慢一点就「连接超时」。App 自己只给等网络的时间计时（等用户时暂停），交给传输层的连接上限放宽 |

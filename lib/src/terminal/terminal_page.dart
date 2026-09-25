@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -9,6 +10,7 @@ import 'package:terminal_view/terminal_view.dart'
     show
         CellOffset,
         defaultTerminalShortcuts,
+        MouseMode,
         PointerInputs,
         TerminalController,
         TerminalStyle,
@@ -70,6 +72,11 @@ class _TerminalPageState extends State<TerminalPage> {
       TerminalController(pointerInputs: const PointerInputs.all());
   /// 软键盘的开关靠它：焦点在终端上 = 键盘起，unfocus = 收起。
   final FocusNode _terminalFocus = FocusNode();
+  /// 滚回的滚动位置（fork 的 Scrollable 用它）；滚动时按位置向 Rust 要窗口。
+  final ScrollController _scroll = ScrollController();
+  /// 跟着屏幕（随输出滚动）；滚进滚回后为 false，[_window] 是已请求的窗口。
+  bool _followBottom = true;
+  ({int top, int rows})? _window;
   /// 选区菜单锚点定位用（终端渲染区的屏幕坐标）。
   final GlobalKey _terminalSurfaceKey = GlobalKey();
   /// Flutter 自带的选区菜单（iOS 上是系统风格气垫）。
@@ -91,12 +98,11 @@ class _TerminalPageState extends State<TerminalPage> {
   /// 会话已失败 / 结束：还开着的交互对话框据此自行关闭。
   final ValueNotifier<bool> _promptsDismissed = ValueNotifier(false);
 
-  /// 引擎最近一次选区回显（绝对行坐标）。视口一变就要拿它重新投影。
+  /// 引擎最近一次选区回显（绝对行坐标）。行号映射一变就要拿它重新投影。
   SelectionState? _selectionEcho;
-  /// 上次投影时的视口映射（首/末绝对行）。变了才重新投影——
+  /// 上次投影时的行号起点（最早一行的绝对行）。变了才重新投影——
   /// 拖动中的乐观更新不会被迟到的回显顶掉。
   int? _projectedFirstStable;
-  int? _projectedLastStable;
 
   SessionState? _state;
   FailureKind _failure = FailureKind.none;
@@ -121,6 +127,7 @@ class _TerminalPageState extends State<TerminalPage> {
     _terminalController
       ..addListener(_onSelectionChanged)
       ..onSelectionIntent = _onSelectionIntent;
+    _scroll.addListener(_onScroll);
     _startSession();
   }
 
@@ -142,6 +149,7 @@ class _TerminalPageState extends State<TerminalPage> {
     _resizeTimer?.cancel();
     _terminalController.dispose();
     _terminalFocus.dispose();
+    _scroll.dispose();
     super.dispose();
   }
 
@@ -165,7 +173,6 @@ class _TerminalPageState extends State<TerminalPage> {
     if (state == SessionState.closed || state == SessionState.failed) {
       _selectionEcho = null;
       _projectedFirstStable = null;
-      _projectedLastStable = null;
       _terminalController.setExternalSelection(null, null);
       _promptsDismissed.value = true;
     }
@@ -205,6 +212,9 @@ class _TerminalPageState extends State<TerminalPage> {
         rows: msg.rows,
         cursorCol: msg.cursorCol,
         cursorRow: msg.cursorRow,
+        firstStableRow: msg.firstStableRow,
+        screenTopStableRow: msg.screenTopStableRow,
+        title: msg.title,
       );
       // 显示模式随帧走（RenderFrame 已带，M2a 起过边界）：
       // 决定触摸点击/滚轮是转发远端还是保持本地行为。
@@ -212,14 +222,11 @@ class _TerminalPageState extends State<TerminalPage> {
         ..mouseReporting = msg.mouseReporting
         ..alternateScreen = msg.alternateScreen;
       _terminal.applyFrame(frame);
-      // 滚动/重排会改 stable→视口 的映射；映射变了就重新投影选区，
+      _keepScrollPosition();
+      // 最早一行变了（滚回裁掉旧行、清空、重排）行号就整体平移；重新投影选区，
       // 高亮和耳朵才会跟着内容走（拖动进行中映射不变，不会被顶掉）。
-      final first = _terminal.stableRowAt(0);
-      final last =
-          _terminal.height > 0 ? _terminal.stableRowAt(_terminal.height - 1) : null;
-      if (first != _projectedFirstStable || last != _projectedLastStable) {
-        _projectedFirstStable = first;
-        _projectedLastStable = last;
+      if (_terminal.firstStableRow != _projectedFirstStable) {
+        _projectedFirstStable = _terminal.firstStableRow;
         _projectSelection();
       }
       // 重排可能让选区端点失效：这时把还挂着的菜单收回，别留个孤儿气泡。
@@ -251,21 +258,16 @@ class _TerminalPageState extends State<TerminalPage> {
     _projectSelection();
   }
 
-  /// 把引擎回显的选区（绝对行）投影到当前视口并喂给 fork。
-  /// 端点滚出视口时贴边截断（可见部分保留高亮），整体不可见才清空。
+  /// 把引擎回显的选区（绝对行）换成行号喂给 fork（行号覆盖整个滚回，窗口外的部分
+  /// 滚到时照样有高亮）。端点被裁出滚回时贴边，整体都被裁掉才清空。
   void _projectSelection() {
     final echo = _selectionEcho;
     if (echo == null || !echo.hasSelection) {
       _terminalController.setExternalSelection(null, null);
       return;
     }
-    final rows = _terminal.height;
-    final firstStable = rows > 0 ? _terminal.stableRowAt(0) : null;
-    final lastStable = rows > 0 ? _terminal.stableRowAt(rows - 1) : null;
-    if (firstStable == null || lastStable == null) {
-      _terminalController.setExternalSelection(null, null);
-      return;
-    }
+    final first = _terminal.firstStableRow;
+    final last = first + _terminal.height - 1;
 
     // 排序出首端/尾端（首端 = 早的那个），角色保留给 begin/end。
     final anchorIsFirst = echo.anchorRow < echo.focusRow ||
@@ -275,25 +277,96 @@ class _TerminalPageState extends State<TerminalPage> {
     final firstCol = anchorIsFirst ? echo.anchorCol : echo.focusCol;
     final lastCol = anchorIsFirst ? echo.focusCol : echo.anchorCol;
 
-    // 首端滚到视口下方 / 尾端滚到视口上方 = 整个选区都看不见。
-    if (firstStableRow > lastStable || lastStableRow < firstStable) {
+    if (firstStableRow > last || lastStableRow < first) {
       _terminalController.setExternalSelection(null, null);
       return;
     }
-
-    final firstRow = _terminal.viewportRowForStable(firstStableRow);
-    final firstOffset = firstRow != null
-        ? CellOffset(firstCol, firstRow)
-        : const CellOffset(0, 0); // 上方滚出：贴到首行首格
-    final lastRow = _terminal.viewportRowForStable(lastStableRow);
-    final lastOffset = lastRow != null
-        ? CellOffset(lastCol, lastRow)
-        : CellOffset(0, rows); // 下方滚出：贴到末行之后（排他端）
+    final firstOffset = firstStableRow >= first
+        ? CellOffset(firstCol, firstStableRow - first)
+        : const CellOffset(0, 0); // 首端已被裁掉：贴到最早一行行首
+    final lastOffset = lastStableRow <= last
+        ? CellOffset(lastCol, lastStableRow - first)
+        : CellOffset(0, _terminal.height); // 不会出现（尾端总在屏幕以内），兜底贴尾
 
     _terminalController.setExternalSelection(
       anchorIsFirst ? firstOffset : lastOffset,
       anchorIsFirst ? lastOffset : firstOffset,
     );
+  }
+
+  double get _lineHeight => calcCharSize(_style, MediaQuery.textScalerOf(context)).height;
+
+  /// 滚动位置 → 要显示的窗口。在底部就跟着屏幕；滚进滚回后要一段上下各多一屏的窗口，
+  /// 已有的窗口还盖得住可见区（各留半屏余量）就不重发。
+  void _onScroll() {
+    if (!mounted || !_scroll.hasClients || _state != SessionState.connected) return;
+    final position = _scroll.position;
+    final lineHeight = _lineHeight;
+    if (lineHeight <= 0 || !position.hasContentDimensions) return;
+    if (position.pixels >= position.maxScrollExtent - lineHeight / 2) {
+      if (!_followBottom) {
+        _followBottom = true;
+        _window = null;
+        ViewportRequest(
+          sessionId: _sessionId,
+          followBottom: true,
+          topStableRow: 0,
+          rows: 0,
+        ).sendSignalToRust();
+      }
+      return;
+    }
+    final visibleTop = (position.pixels / lineHeight).floor();
+    final visibleRows = (position.viewportDimension / lineHeight).ceil() + 1;
+    final slack = visibleRows ~/ 2;
+    if (!_followBottom &&
+        _window != null &&
+        _terminal.windowCovers(visibleTop - slack, visibleRows + 2 * slack)) {
+      return;
+    }
+    final topIndex = math.max(0, visibleTop - visibleRows);
+    final window = (top: _terminal.firstStableRow + topIndex, rows: visibleRows * 3);
+    if (!_followBottom && window == _window) return;
+    _followBottom = false;
+    _window = window;
+    ViewportRequest(
+      sessionId: _sessionId,
+      followBottom: false,
+      topStableRow: window.top,
+      rows: window.rows,
+    ).sendSignalToRust();
+  }
+
+  /// 新帧之后校正滚动位置：停在滚回里时，最早一行后移了几行就把位置上移几行（内容
+  /// 不在眼前漂走）；远端接管滚动（备用屏、鼠标上报）时回到底部。
+  void _keepScrollPosition() {
+    if (!_scroll.hasClients) return;
+    final position = _scroll.position;
+    if (_terminal.isUsingAltBuffer || _terminal.mouseMode != MouseMode.none) {
+      if (!_followBottom) _scrollToBottom();
+      return;
+    }
+    final shift = _terminal.originShift;
+    if (shift != 0 && !_followBottom && position.hasContentDimensions) {
+      position.correctBy(-shift * _lineHeight);
+    }
+  }
+
+  /// 回到底部（跟着屏幕）。
+  void _scrollToBottom() {
+    if (_scroll.hasClients && _scroll.position.hasContentDimensions) {
+      _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    }
+    if (!_followBottom) {
+      _followBottom = true;
+      _window = null;
+      ViewportRequest(
+        sessionId: _sessionId,
+        followBottom: true,
+        topStableRow: 0,
+        rows: 0,
+      ).sendSignalToRust();
+    }
   }
 
   /// 引擎取文回来 → 进剪贴板 + 清选区（对齐 Termux）。
@@ -340,6 +413,7 @@ class _TerminalPageState extends State<TerminalPage> {
   /// 连接中的输入也照发：Rust 连上后按顺序补上（type-ahead）。
   bool _onTerminalInput(TerminalInputEvent event) {
     if (_state != SessionState.connected && _state != SessionState.connecting) return false;
+    if (event is! MouseInputEvent) _scrollToBottom();
     switch (event) {
       case KeyInputEvent(:final key, :final shift, :final control, :final alt):
         InputRequest(
@@ -505,7 +579,7 @@ class _TerminalPageState extends State<TerminalPage> {
   }
 
   /// 选区端点 → 屏幕锚点。单元格尺寸用 fork 同一套字符度量算，
-  /// 终端区原点取渲染盒的全局坐标（无滚动偏移，M2a 视口即缓冲）。
+  /// 终端区原点取渲染盒的全局坐标，减去滚动位置；端点滚出视口时贴到可见的边上。
   TextSelectionToolbarAnchors _selectionAnchors() {
     final selection = _terminalController.selection!.normalized;
     final box =
@@ -513,15 +587,17 @@ class _TerminalPageState extends State<TerminalPage> {
     if (box == null) {
       return const TextSelectionToolbarAnchors(primaryAnchor: Offset.zero);
     }
-    final origin = box.localToGlobal(Offset.zero);
+    final scroll = _scroll.hasClients ? _scroll.offset : 0.0;
+    final origin = box.localToGlobal(Offset(0, -scroll));
     final cell = calcCharSize(_style, MediaQuery.textScalerOf(context));
     final begin = selection.begin;
     final end = selection.end;
+    double clampY(double y) => y.clamp(scroll, scroll + box.size.height);
     return TextSelectionToolbarAnchors(
       primaryAnchor:
-          origin + Offset(begin.x * cell.width, begin.y * cell.height),
+          origin + Offset(begin.x * cell.width, clampY(begin.y * cell.height)),
       secondaryAnchor: origin +
-          Offset((end.x + 1) * cell.width, (end.y + 1) * cell.height),
+          Offset((end.x + 1) * cell.width, clampY((end.y + 1) * cell.height)),
     );
   }
 
@@ -531,7 +607,7 @@ class _TerminalPageState extends State<TerminalPage> {
     CopyRequest(sessionId: _sessionId).sendSignalToRust();
   }
 
-  /// 全选当前视口（引擎的选区终点列是排除式的，所以终点取列数）。
+  /// 全选：滚回与屏幕的全部内容（引擎的选区终点列是排除式的，所以终点取列数）。
   void _selectAll() {
     if (_state != SessionState.connected || _terminal.height == 0) return;
     final first = _terminal.stableRowAt(0);
@@ -561,7 +637,8 @@ class _TerminalPageState extends State<TerminalPage> {
     _promptsDismissed.value = false;
     _selectionEcho = null;
     _projectedFirstStable = null;
-    _projectedLastStable = null;
+    _followBottom = true;
+    _window = null;
     _terminalController.setExternalSelection(null, null);
     setState(() {
       _state = SessionState.connecting;
@@ -694,6 +771,7 @@ class _TerminalPageState extends State<TerminalPage> {
                         key: _terminalSurfaceKey,
                         terminal: _terminal,
                         controller: _terminalController,
+                        scrollController: _scroll,
                         focusNode: _terminalFocus,
                         style: _style,
                       ),
@@ -727,6 +805,7 @@ class _TerminalPageState extends State<TerminalPage> {
 class _TerminalSurface extends StatelessWidget {
   final FrameTerminal terminal;
   final TerminalController controller;
+  final ScrollController scrollController;
   final FocusNode focusNode;
   final TerminalStyle style;
 
@@ -734,15 +813,25 @@ class _TerminalSurface extends StatelessWidget {
     super.key,
     required this.terminal,
     required this.controller,
+    required this.scrollController,
     required this.focusNode,
     required this.style,
   });
 
   @override
   Widget build(BuildContext context) {
+    // 滚动条跟着 fork 的 Scrollable（滚回）；远端接管滚动时 fork 不滚，也就不显示。
+    return Scrollbar(
+      controller: scrollController,
+      child: _terminalView(),
+    );
+  }
+
+  Widget _terminalView() {
     return TerminalView(
       terminal,
       controller: controller,
+      scrollController: scrollController,
       focusNode: focusNode,
       autoResize: true,
       shortcuts: _terminalShortcuts,

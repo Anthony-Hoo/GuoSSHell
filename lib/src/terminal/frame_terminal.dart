@@ -98,6 +98,10 @@ class _PooledLine {
 ///   fork 的行 Picture 重放靠这个命中，60fps 下的主要收益来源；
 /// * 终端状态（网格/滚动/模式）全部在 Rust，这里没有任何状态机，
 ///   只有最新一帧的投影（铁律 4）。
+///
+/// 滚回：对 fork 而言缓冲的行数 = 滚回 + 屏幕（行号 = 绝对行 − 最早一行），fork 的
+/// Scrollable 照常滚动；内容只有 Rust 渲染过来的那一段窗口，窗口外的行是空白占位，
+/// 滚到那里时页面按滚动位置向 Rust 要新的窗口。
 class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBufferSurface {
   @override
   TerminalBufferSurface get buffer => this;
@@ -114,11 +118,10 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   /// 视口几何变化，由 fork 的 render 在布局期回调（只在变化时）。
   void Function(TerminalGeometry geometry)? onResize;
 
-  /// 行的身份容器。fork 的 CellAnchor 挂在 BufferLine 对象上，锚点的
-  /// 行号 = owner.index，而 index 只有经 IndexAwareCircularBuffer 收养
-  /// （attached）才有效——M2a 起所有行都住在这里。
-  /// 容量固定富余（1024 行，覆盖 iPad 分屏与 M4 的滚回窗口）；
-  /// _length 只能靠 push 长大，帧变高时补齐、变矮时留尾巴（画不到）。
+  /// 窗口里的行（按帧里的顺序）。fork 的 CellAnchor 挂在 BufferLine 对象上，
+  /// 锚点的行号 = owner.index，而 index 只有经 IndexAwareCircularBuffer 收养
+  /// （attached）才有效。容量固定富余（1024 行，够三屏的滚回窗口）；
+  /// _length 只能靠 push 长大，帧变高时补齐、变矮时留尾巴（不再读到）。
   final IndexAwareCircularBuffer<BufferLine> _buffer =
       IndexAwareCircularBuffer<BufferLine>(1024);
 
@@ -126,12 +129,24 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   /// 用行身份而不是屏幕位置，内容滚动时对象跟着内容走。
   final Map<int, _PooledLine> _pool = {};
 
-  /// 视口行 → 引擎绝对行（`stable_row`）。选区的坐标换算要用：
-  /// fork 给的是视口坐标，引擎要的是绝对行号。M2a 无滚回，两者一一对应。
-  final List<int> _stableRows = [];
+  /// 滚回范围与窗口（绝对行）：最早一行、屏幕首行、窗口首行与行数。
+  int _firstStable = 0;
+  int _screenTopStable = 0;
+  int _windowTopStable = 0;
+  int _windowLength = 0;
 
-  /// 绝对行 → 视口行（唯一；帧内不会重复）。收引擎回显时用。
-  final Map<int, int> _viewportByStableRow = {};
+  /// 上一帧以来最早一行后移的行数（滚回满了裁掉旧行、清空滚回…）。
+  /// 停在滚回里时，页面据此把滚动位置上移同样的行数，内容才不会在眼前漂走。
+  int _originShift = 0;
+  int get originShift => _originShift;
+
+  /// 窗口外的行：空白占位（按列宽缓存一份）。
+  BufferLine? _placeholder;
+
+  String _title = '';
+
+  /// 远端设置的窗口标题（OSC 0 / 2）。
+  String get title => _title;
 
   bool _mouseReporting = false;
   bool _alternateScreen = false;
@@ -152,10 +167,8 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
 
   int _cols = 80;
   int _rows = 24;
-  /// 缓冲里「有效」的行数（= 最新一帧的 rows）。
-  /// 不能直接用 `_buffer.length`：帧变矮时旧行还挂在尾部（fork 没暴露
-  /// 删行 API），若把物理长度当高度，那些旧行会被当成缓冲的一部分——
-  /// 实机症状：键盘弹出后旧的下部内容留在屏上、滚动后重复出现。
+  /// fork 看到的行数：滚回 + 屏幕。与 `_buffer.length`（窗口的物理行数，帧变矮时
+  /// 旧行还挂在尾部）无关。
   int _height = 1;
   int _cursorX = 0;
   int _cursorY = 0;
@@ -169,10 +182,16 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   // ── 帧摄入 ──
 
   void applyFrame(TerminalFrame frame) {
+    if (frame.cols != _cols) _placeholder = null;
     _cols = frame.cols;
     _rows = frame.rows;
+    _title = frame.title;
+    _originShift = frame.firstStableRow - _firstStable;
+    _firstStable = frame.firstStableRow;
+    _screenTopStable = frame.screenTopStableRow;
+    final screenIndex = _screenTopStable - _firstStable;
     _cursorX = frame.cursorCol.clamp(0, frame.cols - 1);
-    _cursorY = frame.cursorRow.clamp(0, frame.rows - 1);
+    _cursorY = screenIndex + frame.cursorRow.clamp(0, frame.rows - 1);
     _cursorVisible = frame.cursorCol >= 0 && frame.cursorRow >= 0;
 
     // 行池：key = stable_row。同一行的内容没变就复用同一对象（Picture
@@ -189,36 +208,44 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
       ..clear()
       ..addAll(next);
 
-    // 本帧用到的对象集合：判断某个旧对象的内容是否还在（在 = 锚点已跟着
-    // 对象走到新位置，不需要处理）。
     // 行池按位置铺开：新行补进缓冲、位置上的旧对象换成新对象。选区不再挂
-    // 锚点（权威在引擎），所以不做锚点迁移。
-    _stableRows
-      ..clear()
-      ..addAll([for (final row in frame.lines) row.stableRow]);
-    _viewportByStableRow.clear();
-    for (var i = 0; i < _stableRows.length; i++) {
-      _viewportByStableRow[_stableRows[i]] = i;
-    }
-
+    // 锚点（权威在引擎），所以不做锚点迁移。帧里的行是连续的绝对行。
+    _windowTopStable = frame.lines.isEmpty ? _screenTopStable : frame.lines.first.stableRow;
+    _windowLength = lines.length;
     while (_buffer.length < lines.length) {
       _buffer.push(lines[_buffer.length]);
     }
     for (var i = 0; i < lines.length; i++) {
       _buffer[i] = lines[i];
     }
-    _height = lines.length;
+    _height = (screenIndex + _rows).clamp(1, 1 << 40);
     notifyListeners();
   }
 
-  /// 视口行 → 引擎绝对行。越界返回 null。
-  int? stableRowAt(int viewportRow) {
-    if (viewportRow < 0 || viewportRow >= _stableRows.length) return null;
-    return _stableRows[viewportRow];
+  /// 最早一行的绝对行号（行号 0 对应它）。
+  int get firstStableRow => _firstStable;
+
+  /// 屏幕首行的行号（滚到底时它在视口顶端）。
+  int get screenTopIndex => _screenTopStable - _firstStable;
+
+  /// 行号 → 引擎绝对行。越界返回 null。
+  int? stableRowAt(int index) {
+    if (index < 0 || index >= _height) return null;
+    return _firstStable + index;
   }
 
-  /// 引擎绝对行 → 视口行。不在当前视口内返回 null（选区画不出耳朵）。
-  int? viewportRowForStable(int stableRow) => _viewportByStableRow[stableRow];
+  /// 引擎绝对行 → 行号。不在滚回范围内返回 null。
+  int? indexOfStable(int stableRow) {
+    final index = stableRow - _firstStable;
+    if (index < 0 || index >= _height) return null;
+    return index;
+  }
+
+  /// 窗口是否盖住了行号 [first] 起的 [count] 行。
+  bool windowCovers(int first, int count) {
+    final windowFirst = _windowTopStable - _firstStable;
+    return first >= windowFirst && first + count <= windowFirst + _windowLength;
+  }
 
   /// 该 stable_row 上一帧的行对象在内容仍相同时可以复用。
   _PooledLine? _reusable(FrameRow row) {
@@ -367,12 +394,16 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   int get height => _height;
 
   @override
-  BufferLine lineAt(int index) => _buffer[index];
+  BufferLine lineAt(int index) {
+    final offset = _firstStable + index - _windowTopStable;
+    if (offset >= 0 && offset < _windowLength) return _buffer[offset];
+    return _placeholder ??= BufferLine(_cols);
+  }
 
   @override
   int get cursorX => _cursorX;
 
-  /// 无滚动缓冲：视口行号即绝对行号（scrollback 留 M4）。
+  /// 光标所在行号（屏幕首行的行号 + 光标在屏幕上的行）。
   @override
   int get absoluteCursorY => _cursorY;
 
@@ -394,7 +425,7 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   @override
   BufferRangeLine? getWordBoundary(CellOffset position) {
     if (position.y < 0 || position.y >= _height) return null;
-    final line = _buffer[position.y];
+    final line = lineAt(position.y);
     var start = position.x;
     var end = position.x;
     while (start > 0 && !_wordSeparators.contains(line.getCodePoint(start - 1))) {
@@ -409,7 +440,7 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
 
   @override
   CellAnchor createAnchor(int x, int y) {
-    final line = _buffer[y.clamp(0, _height - 1)];
+    final line = lineAt(y.clamp(0, _height - 1));
     return line.createAnchor(x.clamp(0, _cols - 1));
   }
 
@@ -427,7 +458,7 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
     final builder = StringBuffer();
     for (final segment in range.toSegments()) {
       if (segment.line < 0 || segment.line >= _height) continue;
-      final line = _buffer[segment.line];
+      final line = lineAt(segment.line);
       // 换行规则与 fork 的 Buffer.getText 一致：起始行/首行/wrapped
       // 行前不插换行（软换行的物理行拼回一段）。
       if (!(segment.line == range.begin.y || segment.line == 0 || line.isWrapped)) {

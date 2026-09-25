@@ -6,7 +6,7 @@ import '../bindings/bindings.dart';
 import '../keys/keys_page.dart';
 import 'terminal_font.dart';
 
-/// 设置：终端字体与字号（存在 Rust 侧的默认终端配置里，新会话生效）。
+/// 设置：终端字体、字号与滚回行数（存在 Rust 侧的默认终端配置里，新会话生效）。
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
 
@@ -36,14 +36,22 @@ class _SettingsPageState extends State<SettingsPage> {
     super.dispose();
   }
 
-  void _save({String? fontFamily, double? fontSize}) {
+  void _save({String? fontFamily, double? fontSize, int? scrollbackLines}) {
     final settings = _settings;
     if (settings == null) return;
     SaveSettings(
       fontFamily: fontFamily ?? settings.fontFamily,
       fontSize: fontSize ?? settings.fontSize,
+      scrollbackLines: scrollbackLines ?? settings.scrollbackLines,
     ).sendSignalToRust();
   }
+
+  /// 滚回行数的可选档位，不超过本机上界（上界本身也是一档）。
+  static List<int> _scrollbackChoices(int max) => [
+        for (final lines in const [1000, 2000, 5000, 10000, 20000, 50000, 100000])
+          if (lines < max) lines,
+        max,
+      ];
 
   @override
   Widget build(BuildContext context) {
@@ -124,6 +132,27 @@ class _SettingsPageState extends State<SettingsPage> {
                     fontSize: size,
                     color: Colors.white,
                   ),
+            ),
+          ),
+          const _SectionTitle('滚回'),
+          ListTile(
+            title: const Text('每个会话保留的行数'),
+            subtitle: Text('本机最多 ${settings.maxScrollbackLines} 行（按设备内存）'),
+            trailing: DropdownButton<int>(
+              value: settings.scrollbackLines,
+              items: [
+                for (final lines in _scrollbackChoices(settings.maxScrollbackLines))
+                  DropdownMenuItem(value: lines, child: Text('$lines')),
+                if (!_scrollbackChoices(settings.maxScrollbackLines)
+                    .contains(settings.scrollbackLines))
+                  DropdownMenuItem(
+                    value: settings.scrollbackLines,
+                    child: Text('${settings.scrollbackLines}'),
+                  ),
+              ],
+              onChanged: (lines) {
+                if (lines != null) _save(scrollbackLines: lines);
+              },
             ),
           ),
           Padding(

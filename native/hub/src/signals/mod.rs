@@ -75,6 +75,16 @@ pub struct DisconnectRequest {
     pub session_id: u32,
 }
 
+/// 要显示的窗口（滚回）。`follow_bottom` 时显示屏幕、随输出滚动；否则渲染从
+/// `top_stable_row` 起的 `rows` 行——Dart 按滚动位置请求，含上下余量。
+#[derive(Deserialize, DartSignal)]
+pub struct ViewportRequest {
+    pub session_id: u32,
+    pub follow_bottom: bool,
+    pub top_stable_row: i64,
+    pub rows: u16,
+}
+
 /// 终端输入（M2 输入闭环的边界）。
 ///
 /// 键与文本二选一：`text` 非空 = IME 提交/粘贴的文本（`CommittedText`）；
@@ -229,14 +239,22 @@ pub struct SessionStatus {
 #[derive(Serialize, RustSignalBinary)]
 pub struct FrameUpdate {
     pub session_id: u32,
+    /// 终端尺寸（屏幕的列数与行数）；帧里的行数可以不同（滚回窗口）。
     pub cols: u16,
     pub rows: u16,
     /// 本会话内单调递增的帧序号。Dart 侧用它数**丢帧**：
     /// 收到的 seq 跳变 = 中间有帧没送达（验收：表现为晚一帧，不是花屏）。
     pub seq: u32,
-    /// 光标的视口内坐标（列, 行）。`-1` 表示不可见（隐藏或滚出视口）。
+    /// 帧里第一行的绝对行号（`stable_row`）。
+    pub top_stable_row: i64,
+    /// 滚回范围：最早一行与屏幕首行的绝对行号（备用屏没有滚回，两者相同）。
+    pub first_stable_row: i64,
+    pub screen_top_stable_row: i64,
+    /// 光标在屏幕上的坐标（列, 行）。`-1` 表示隐藏。
     pub cursor_col: i32,
     pub cursor_row: i32,
+    /// 窗口标题（远端用 OSC 0 / 2 设置），标签页上显示。
+    pub title: String,
     /// 远端开启了鼠标上报（DECSET 1000/1002/1003）。Dart 据此决定
     /// 触摸点击/滚轮是转发给远端还是保持本地行为（M2a）。
     pub mouse_reporting: bool,

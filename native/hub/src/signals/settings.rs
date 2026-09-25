@@ -1,4 +1,4 @@
-//! 设置（上游默认 `TerminalProfile` 的字体与字号）。
+//! 设置（上游默认 `TerminalProfile` 的字体、字号与滚回行数）。
 
 use rinf::{DartSignal, RustSignal};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ pub struct SettingsQuery {}
 pub struct SaveSettings {
     pub font_family: String,
     pub font_size: f64,
+    pub scrollback_lines: u32,
 }
 
 /// 当前设置。设置变化后重发。
@@ -22,4 +23,8 @@ pub struct SettingsState {
     pub font_families: Vec<String>,
     pub min_font_size: f64,
     pub max_font_size: f64,
+    /// 每个会话保留的滚回行数（已按本机上界收窄）。
+    pub scrollback_lines: u32,
+    /// 本机的滚回上界（按物理内存分档）。
+    pub max_scrollback_lines: u32,
 }

@@ -20,7 +20,7 @@ use rshell_m0::rshell_core::{
     TerminalInput, TerminalMouseEvent, TerminalSize, Viewport,
 };
 use rshell_m0::rshell_session::{
-    DefaultTerminalEngine, SessionTransport, TerminalEngine, TransportEvent,
+    DefaultTerminalEngine, SessionTransport, TerminalEngine, TransportEvent, ViewportBounds,
 };
 
 use crate::app::AppContext;
@@ -32,7 +32,7 @@ use crate::signals::interaction::InteractionReply;
 use crate::signals::{
     ClipboardText, ConnectHint, ConnectRequest, CopyRequest, DisconnectRequest, FailureKind,
     FrameAck, FrameUpdate, InputRequest, MouseRequest, PasteRequest, PerfStats, ResizeRequest,
-    SelectionRequest, SelectionState, SessionState, SessionStatus,
+    SelectionRequest, SelectionState, SessionState, SessionStatus, ViewportRequest,
 };
 
 const NO_CURSOR: i32 = -1;
@@ -42,6 +42,7 @@ const MIN_ROWS: u16 = 2;
 
 pub enum SessionCommand {
     Resize(TerminalSize),
+    Viewport(Window),
     Disconnect,
     Input(TerminalInput),
     Mouse(TerminalMouseEvent),
@@ -49,6 +50,33 @@ pub enum SessionCommand {
     Copy,
     Paste(String),
     FrameAck(u32),
+}
+
+/// 显示的窗口：跟着屏幕（随输出滚动），或停在滚回里的某一段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    Bottom,
+    /// 从 `top`（绝对行）起的 `rows` 行，含 Dart 要的上下余量。
+    At {
+        top: i64,
+        rows: u16,
+    },
+}
+
+impl Window {
+    fn viewport(self, screen_rows: u16) -> Viewport {
+        match self {
+            // 引擎把越界的 top 夹到屏幕首行。
+            Self::Bottom => Viewport {
+                top_stable_row: i64::MAX,
+                rows: screen_rows,
+            },
+            Self::At { top, rows } => Viewport {
+                top_stable_row: top,
+                rows: rows.max(1),
+            },
+        }
+    }
 }
 
 /// 一个会话任务的收件口。
@@ -89,6 +117,7 @@ pub async fn supervisor(context: Arc<AppContext>) {
     let connect_rx = ConnectRequest::get_dart_signal_receiver();
     let resize_rx = ResizeRequest::get_dart_signal_receiver();
     let disconnect_rx = DisconnectRequest::get_dart_signal_receiver();
+    let viewport_rx = ViewportRequest::get_dart_signal_receiver();
     let input_rx = InputRequest::get_dart_signal_receiver();
     let mouse_rx = MouseRequest::get_dart_signal_receiver();
     let selection_rx = SelectionRequest::get_dart_signal_receiver();
@@ -155,6 +184,16 @@ pub async fn supervisor(context: Arc<AppContext>) {
             pack = disconnect_rx.recv() => {
                 let Some(pack) = pack else { break };
                 send(&sessions, pack.message.session_id, SessionCommand::Disconnect);
+            }
+            pack = viewport_rx.recv() => {
+                let Some(pack) = pack else { break };
+                let request = pack.message;
+                let window = if request.follow_bottom {
+                    Window::Bottom
+                } else {
+                    Window::At { top: request.top_stable_row, rows: request.rows }
+                };
+                send(&sessions, request.session_id, SessionCommand::Viewport(window));
             }
             pack = input_rx.recv() => {
                 let Some(pack) = pack else { break };
@@ -263,10 +302,9 @@ async fn run_session(
             return;
         }
     };
-    let mut viewport = Viewport {
-        top_stable_row: i64::MAX, // 永远看最底部（活动区），与 bench/探针一致
-        rows: size.rows,
-    };
+    // 显示的窗口由 Dart 按滚动位置请求；打字、粘贴时回到屏幕。
+    let mut window = Window::Bottom;
+    let mut screen_rows = size.rows;
     let mut stats = PerfWindow::new();
     let mut pacer = FramePacer::new();
     let mut mouse_motion = MouseMotion::default();
@@ -280,7 +318,7 @@ async fn run_session(
         if let Err(detail) = present(
             session_id,
             &mut engine,
-            viewport,
+            window.viewport(screen_rows),
             selection,
             &mut stats,
             &mut pacer,
@@ -304,7 +342,7 @@ async fn run_session(
                                 if delta.dirty
                                     && pacer.mark_dirty(Instant::now())
                                     && let Err(detail) =
-                                        present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer)
+                                        present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer)
                                 {
                                     break SessionEnd::failed(FailureKind::Other, detail);
                                 }
@@ -335,7 +373,7 @@ async fn run_session(
                 () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
                     if pacer.ready_for_pending(Instant::now())
                         && let Err(detail) =
-                            present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer)
+                            present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer)
                     {
                         break SessionEnd::failed(FailureKind::Other, detail);
                     }
@@ -345,18 +383,27 @@ async fn run_session(
                         if let Err(error) = engine.resize(new_size) {
                             break SessionEnd::failed(FailureKind::Other, format!("engine resize: {error:?}"));
                         }
-                        viewport.rows = new_size.rows;
+                        screen_rows = new_size.rows;
                         if let Err(error) = transport.resize(new_size).await {
                             // window-change 失败不立刻判死；远端布局暂旧，后续 resize 可再试。
                             rinf::debug_print!("window-change failed: {error:?}");
                         }
-                        if let Err(detail) = present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer) {
+                        if let Err(detail) = present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer) {
+                            break SessionEnd::failed(FailureKind::Other, detail);
+                        }
+                    }
+                    Some(SessionCommand::Viewport(requested)) => {
+                        window = requested;
+                        if pacer.mark_dirty(Instant::now())
+                            && let Err(detail) = present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer)
+                        {
                             break SessionEnd::failed(FailureKind::Other, detail);
                         }
                     }
                     Some(SessionCommand::Input(input)) => {
                         // M2 输入闭环：键编码（ETX/Kitty/CSI-u）在引擎里，
-                        // 这里只负责把编码结果写进 transport。
+                        // 这里只负责把编码结果写进 transport。打字回到屏幕（Dart 同时滚到底）。
+                        window = Window::Bottom;
                         match engine.encode_input(input) {
                             Ok(bytes) if !bytes.is_empty() => {
                                 if let Err(error) = transport.write(&bytes).await {
@@ -387,7 +434,7 @@ async fn run_session(
                         // 选区变化：更新引擎持有的选区 → 重渲染发帧（高亮跟着
                         // 内容走）→ 把引擎的选区原样回显（Dart 用它对耳朵/气泡定位）。
                         selection = selection_range_from_request(request);
-                        if let Err(detail) = present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer) {
+                        if let Err(detail) = present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer) {
                             break SessionEnd::failed(FailureKind::Other, detail);
                         }
                         send_selection_state(session_id, selection);
@@ -401,6 +448,7 @@ async fn run_session(
                         ClipboardText { session_id, text }.send_signal_to_dart();
                     }
                     Some(SessionCommand::Paste(text)) => {
+                        window = Window::Bottom;
                         let bytes = paste_bytes(&text, engine.display_modes().bracketed_paste);
                         if !bytes.is_empty()
                             && let Err(error) = transport.write(&bytes).await
@@ -413,7 +461,7 @@ async fn run_session(
                         pacer.acked(seq);
                         if pacer.ready_for_pending(Instant::now())
                             && let Err(detail) =
-                                present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer)
+                                present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer)
                         {
                             break SessionEnd::failed(FailureKind::Other, detail);
                         }
@@ -431,7 +479,7 @@ async fn run_session(
         let _ = present(
             session_id,
             &mut engine,
-            viewport,
+            window.viewport(screen_rows),
             selection,
             &mut stats,
             &mut pacer,
@@ -578,7 +626,13 @@ fn present<E: TerminalEngine>(
         .render(viewport, selection)
         .map_err(|error| format!("render: {error:?}"))?;
     let render_us = micros_since(render_start);
-    let seq = send_frame(session_id, &frame, stats, render_us);
+    let seq = send_frame(
+        session_id,
+        &frame,
+        engine.viewport_bounds(),
+        stats,
+        render_us,
+    );
     pacer.sent(seq, Instant::now());
     if let Some(perf) = stats.maybe_report(session_id) {
         perf.send_signal_to_dart();
@@ -879,17 +933,22 @@ fn micros_since(start: std::time::Instant) -> u32 {
 }
 
 /// 发出一帧，返回它的帧序号。
-fn send_frame(session_id: u32, frame: &RenderFrame, stats: &mut PerfWindow, render_us: u32) -> u32 {
+fn send_frame(
+    session_id: u32,
+    frame: &RenderFrame,
+    bounds: ViewportBounds,
+    stats: &mut PerfWindow,
+    render_us: u32,
+) -> u32 {
+    // 屏幕首行：跟着屏幕时的视口起点（引擎按范围夹过）。
+    let screen_top = bounds.clamp_top(i64::MAX);
     let (cursor_col, cursor_row) = match &frame.cursor {
-        Some(cursor) => {
-            let row = cursor.position.stable_row - frame.viewport_top;
-            let visible = row >= 0 && row < i64::try_from(frame.rows.len()).unwrap_or(i64::MAX);
-            if visible {
-                (i32::from(cursor.position.column), row as i32)
-            } else {
-                (NO_CURSOR, NO_CURSOR)
+        Some(cursor) => match i32::try_from(cursor.position.stable_row - screen_top) {
+            Ok(row) if (0..i32::from(frame.size.rows)).contains(&row) => {
+                (i32::from(cursor.position.column), row)
             }
-        }
+            _ => (NO_CURSOR, NO_CURSOR),
+        },
         None => (NO_CURSOR, NO_CURSOR),
     };
     let pack_start = std::time::Instant::now();
@@ -901,8 +960,12 @@ fn send_frame(session_id: u32, frame: &RenderFrame, stats: &mut PerfWindow, rend
         cols: frame.size.cols,
         rows: frame.size.rows,
         seq,
+        top_stable_row: frame.viewport_top,
+        first_stable_row: bounds.first_stable_row,
+        screen_top_stable_row: screen_top,
         cursor_col,
         cursor_row,
+        title: frame.title.clone(),
         mouse_reporting: frame.mouse_reporting,
         alternate_screen: frame.alternate_screen,
     }
@@ -914,7 +977,8 @@ fn send_frame(session_id: u32, frame: &RenderFrame, stats: &mut PerfWindow, rend
 mod tests {
     #![allow(clippy::expect_used)]
     use super::{
-        FramePacer, MouseMotion, mouse_event_from_request, paste_bytes, terminal_input_from_request,
+        FramePacer, MouseMotion, Window, mouse_event_from_request, paste_bytes,
+        terminal_input_from_request,
     };
     use crate::signals::{InputRequest, MouseRequest};
     use rshell_m0::rshell_core::{
@@ -1193,5 +1257,58 @@ mod tests {
             encode(&mut engine, "release", "left"),
             Some(b"\x1b[<0;4;3m".to_vec())
         );
+    }
+
+    #[test]
+    fn a_window_in_the_scrollback_renders_from_its_top() {
+        let profile = TerminalSettingsV1::default().resolve(&TerminalOverrides::default());
+        let size = TerminalSize {
+            cols: 20,
+            rows: 5,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
+        };
+        let mut engine = DefaultTerminalEngine::new(&profile, size).expect("engine");
+        let output: String = (0..50).map(|i| format!("line {i}\r\n")).collect();
+        engine.advance(output.as_bytes()).expect("output");
+        let bounds = engine.viewport_bounds();
+        let screen_top = bounds.clamp_top(i64::MAX);
+        assert!(
+            screen_top > bounds.first_stable_row,
+            "output scrolled into history"
+        );
+
+        let bottom = engine
+            .render(Window::Bottom.viewport(size.rows), None)
+            .expect("bottom");
+        assert_eq!(bottom.viewport_top, screen_top);
+        assert_eq!(bottom.rows.len(), 5);
+
+        let top = bounds.first_stable_row + 3;
+        let window = engine
+            .render(Window::At { top, rows: 4 }.viewport(size.rows), None)
+            .expect("window");
+        assert_eq!(window.viewport_top, top);
+        assert_eq!(window.rows.len(), 4);
+        let text: String = window.rows[0]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect();
+        assert_eq!(text.trim_end(), "line 3");
+
+        // 窗口越过屏幕底部时只渲染到最后一行。
+        let tail = engine
+            .render(
+                Window::At {
+                    top: screen_top,
+                    rows: 20,
+                }
+                .viewport(size.rows),
+                None,
+            )
+            .expect("tail");
+        assert_eq!(tail.rows.len(), 5);
     }
 }

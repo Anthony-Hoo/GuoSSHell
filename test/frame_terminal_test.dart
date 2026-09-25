@@ -12,20 +12,27 @@ FrameRun run(int start, int len, String text, {int attrs = 0}) => FrameRun(
       text: text,
     );
 
+/// 没有滚回的帧：最早一行 = 屏幕首行 = 帧的第一行。
 TerminalFrame frame({
   int cols = 20,
   int rows = 3,
   required List<FrameRow> lines,
   int cursorCol = -1,
   int cursorRow = -1,
-}) =>
-    TerminalFrame(
-      cols: cols,
-      rows: rows,
-      cursorCol: cursorCol,
-      cursorRow: cursorRow,
-      lines: lines,
-    );
+  int? firstStableRow,
+  int? screenTopStableRow,
+}) {
+  final top = lines.isEmpty ? 0 : lines.first.stableRow;
+  return TerminalFrame(
+    cols: cols,
+    rows: rows,
+    cursorCol: cursorCol,
+    cursorRow: cursorRow,
+    firstStableRow: firstStableRow ?? top,
+    screenTopStableRow: screenTopStableRow ?? top,
+    lines: lines,
+  );
+}
 
 void main() {
   FrameRow rowAt(int stableRow, String text) => FrameRow(
@@ -82,8 +89,8 @@ void main() {
     expect(terminal.stableRowAt(0), 10);
     expect(terminal.stableRowAt(2), 12);
     expect(terminal.stableRowAt(3), isNull);
-    expect(terminal.viewportRowForStable(11), 1);
-    expect(terminal.viewportRowForStable(99), isNull);
+    expect(terminal.indexOfStable(11), 1);
+    expect(terminal.indexOfStable(99), isNull);
 
     // 内容整体上移：换算表跟着新帧更新。
     terminal.applyFrame(frame(lines: [
@@ -92,8 +99,50 @@ void main() {
       rowAt(13, 'dddd'),
     ]));
     expect(terminal.stableRowAt(0), 11);
-    expect(terminal.viewportRowForStable(11), 0);
-    expect(terminal.viewportRowForStable(10), isNull);
+    expect(terminal.indexOfStable(11), 0);
+    expect(terminal.indexOfStable(10), isNull);
+  });
+
+  test('滚回：行数 = 滚回 + 屏幕，窗口外是空白占位，光标在屏幕里', () {
+    final terminal = FrameTerminal();
+    terminal.applyFrame(frame(
+      rows: 3,
+      cursorCol: 2,
+      cursorRow: 1,
+      firstStableRow: 0,
+      screenTopStableRow: 100,
+      lines: [rowAt(50, 'x50'), rowAt(51, 'x51'), rowAt(52, 'x52')],
+    ));
+    expect(terminal.height, 103);
+    expect(terminal.screenTopIndex, 100);
+    expect(terminal.lineAt(51).getText(), 'x51');
+    expect(terminal.lineAt(0).getText(), isEmpty);
+    expect(terminal.lineAt(102).getText(), isEmpty);
+    expect(terminal.absoluteCursorY, 101);
+    expect(terminal.cursorX, 2);
+    expect(terminal.stableRowAt(102), 102);
+    expect(terminal.stableRowAt(103), isNull);
+    expect(terminal.windowCovers(50, 3), isTrue);
+    expect(terminal.windowCovers(49, 3), isFalse);
+    expect(terminal.windowCovers(51, 3), isFalse);
+  });
+
+  test('最早一行后移时报告平移的行数（滚回满了裁掉旧行）', () {
+    final terminal = FrameTerminal();
+    terminal.applyFrame(frame(
+      firstStableRow: 0,
+      screenTopStableRow: 100,
+      lines: [rowAt(100, 'a'), rowAt(101, 'b'), rowAt(102, 'c')],
+    ));
+    terminal.applyFrame(frame(
+      firstStableRow: 5,
+      screenTopStableRow: 105,
+      lines: [rowAt(105, 'd'), rowAt(106, 'e'), rowAt(107, 'f')],
+    ));
+    expect(terminal.originShift, 5);
+    expect(terminal.height, 103);
+    expect(terminal.indexOfStable(105), 100);
+    expect(terminal.indexOfStable(4), isNull);
   });
 
   test('锚点已收养（attached），选区依赖这个性质', () {

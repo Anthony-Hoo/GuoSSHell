@@ -57,7 +57,7 @@ keyring-core = "1.0.0"
 apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
 # OpenPGP 卡经 CryptoTokenKit 访问（iOS 没有 PC/SC）。
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSEnumerator", "NSError", "NSSet", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSEnumerator", "NSError", "NSProcessInfo", "NSSet", "NSString"] }
 objc2-crypto-token-kit = { version = "0.3.2", default-features = false, features = ["std", "TKSmartCard", "TKSmartCardSlotNFCSession", "block2", "bitflags"] }
 block2 = "0.6"
 # 安全密钥经 AuthenticationServices（系统界面在主线程上跑）。

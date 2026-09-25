@@ -64,18 +64,27 @@ class FrameRow {
   });
 }
 
-/// 一帧画面：几何（cols/rows/cursor）+ 按行的 run 列表。
+/// 一帧画面：几何（屏幕的 cols/rows、光标）、滚回范围 + 按行的 run 列表。
 /// 这是**纯展示数据**——Dart 不持有终端状态机（PLAN.md 铁律 4），
-/// 每一帧都是 Rust 权威状态的完整快照投影。
+/// 每一帧都是 Rust 权威状态的一段快照投影：[lines] 是 Dart 请求的窗口
+/// （跟着屏幕时就是屏幕），不一定从 [firstStableRow] 开始。
 class TerminalFrame {
   final int cols, rows;
+  /// 光标在屏幕上的列与行；`-1` = 隐藏。
   final int cursorCol, cursorRow;
+  /// 滚回范围：最早一行与屏幕首行的绝对行号。
+  final int firstStableRow, screenTopStableRow;
+  /// 远端设置的窗口标题（OSC 0 / 2）。
+  final String title;
   final List<FrameRow> lines;
   const TerminalFrame({
     required this.cols,
     required this.rows,
     required this.cursorCol,
     required this.cursorRow,
+    required this.firstStableRow,
+    required this.screenTopStableRow,
+    this.title = '',
     required this.lines,
   });
 }
@@ -91,6 +100,9 @@ TerminalFrame decodeFrame(
   required int rows,
   required int cursorCol,
   required int cursorRow,
+  required int firstStableRow,
+  required int screenTopStableRow,
+  String title = '',
 }) {
   final data = ByteData.sublistView(binary);
   var o = 0;
@@ -183,6 +195,9 @@ TerminalFrame decodeFrame(
     rows: rows,
     cursorCol: cursorCol,
     cursorRow: cursorRow,
+    firstStableRow: firstStableRow,
+    screenTopStableRow: screenTopStableRow,
+    title: title,
     lines: lines,
   );
 }

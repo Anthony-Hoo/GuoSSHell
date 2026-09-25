@@ -162,6 +162,17 @@ class _SettingsPageState extends State<SettingsPage> {
               style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
             ),
           ),
+          const Divider(height: 32),
+          ListTile(
+            leading: const Icon(Icons.info_outline),
+            title: const Text('关于与开源许可'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => showLicensePage(
+              context: context,
+              applicationName: 'GuoSSHell',
+              applicationLegalese: 'SSH 终端客户端。终端与 SSH 内核基于 rsHell（MIT 许可）。',
+            ),
+          ),
         ],
       ),
     );

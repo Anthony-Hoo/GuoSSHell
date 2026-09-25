@@ -4,9 +4,10 @@
 > 这份文件是实现期的唯一参考。所有结论都标注了证据来源；标「实测」的都是本机跑出来的，可复现。
 
 - 上游基线：`hugefiver/rsHell` @ `b2ab8656079225dc2c920c24f5d9e0124f4f83e1`（2026-09-14，MIT），
-  **作为 pin 住 rev 的 git 依赖**（上游源码不进本仓库；见 `rust/UPSTREAM.md`）。
-  **「上游零改动」是手段不是目的**：设计上明显不合理、或挡住必要能力时该改就改，
-  按 §9 的 fork 规则走（fork 到自己仓库、换 `rev`、在 UPSTREAM.md 记录改了哪几行、为什么）。
+  经 fork（`Anthony-Hoo/rsHell` 的 `guosh` 分支：基线 + 小补丁）**作为 pin 住 rev 的 git 依赖**
+  （上游源码不进本仓库；补丁逐条记在 `rust/UPSTREAM.md`）。
+  **改上游的原则**：能不改就不改；设计上明显不合理、或挡住必要能力时就改，按 §9.2 第 3 条
+  的规则走（在 fork 的 `guosh` 分支加提交、换 `rev`、在 UPSTREAM.md 记录改了哪几行、为什么）。
 - 应用名：**GuoSSHell**
 - 开发环境：macOS（Apple Silicon）· Xcode 16+ · Flutter 3.x
   （**本机的具体版本号、工具绝对路径、真机清单、签名配置等一律不入库**，见 §7）
@@ -124,7 +125,7 @@ Flutter 侧不暴露入口即可。
 
 - `alacritty_terminal 0.26.0` 全链为 `aarch64-apple-ios` **零改动编译通过**。
 - `rshell-core` / `rshell-platform` / `rshell-storage` / `rshell-session` 为 iOS 编译通过，
-  且**上游源码零改动**。两处曾经以为必须改上游的地方，现在都在我们这边解决：
+  **不需要为编译改上游**。两处曾经以为必须改上游的地方，都在我们这边解决：
   1. keyring 的 `protected` feature —— 在我们自己的 `Cargo.toml` 里加一条
      `[target.'cfg(target_os = "ios")'.dependencies] apple-native-keyring-store = { features = ["protected"] }`，
      靠 Cargo 的 **feature unification** 生效。不改上游的 `Cargo.toml`。
@@ -365,7 +366,7 @@ m1bar 60fps 不回退、M1 画面能力持平。
 **范围排除**：滚动锁底部（scrollback 留 M4）；无选区/粘贴/鼠标（M2a）；
 无字体/主题的用户自定义（M3+ 设置体系）。
 
-### M2a — 指针交互（M2 与 M3 之间）
+### M2a — 指针交互（M2 与 M3 之间）—— ✅ 已完成（2026-09-25，模拟器验收；mini 真机复验待硬件）
 
 选区（长按/拖动/按词）+ 复制/粘贴（bracketed paste 由引擎协商）+ 鼠标转发
 （`encode_mouse`，htop 等程序的点击）。三者共享「帧模型上的选区/命中测试」地基——
@@ -373,6 +374,9 @@ m1bar 60fps 不回退、M1 画面能力持平。
 `htop` 里点击列头排序、点选进程。
 另含 M1-b 缩减而来的**小屏验收**：13 mini / 12 mini 上过一遍布局
 （帧画布、键位条换行、安全区、旋转）。
+**交付**：选区与复制（含硬件键盘 ⌘C / ⌘A）全部走引擎；粘贴由 Rust 规范化并按远端模式包
+bracketed paste；鼠标转发覆盖触摸点击、触摸拖动转滚轮、鼠标设备的按下/拖动/悬停与修饰键；
+SGR 4 下划线绘制。决定见 §6.1「M2a 粘贴与鼠标决定」。
 
 ### M3 — 连接管理与凭证
 
@@ -572,6 +576,16 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 `HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
 平台不答复的键（死键等）150 ms 超时兜底。
 
+**M2a 粘贴与鼠标决定（2026-09-25）：**
+粘贴走 `PasteRequest`，由 Rust 处理：换行统一成 CR，剔除 Tab 以外的控制字符（防
+`ESC[201~` 注入），远端开了 bracketed paste（DECSET 2004，模式由 rsHell fork 补丁 P1 暴露）
+时包 `ESC[200~ … ESC[201~`；软键盘 / 输入法一次插入多行文本也改走粘贴。
+鼠标：Dart 只转发，编码与模式判断全在 Rust（`encode_mouse`；远端没开对应的上报就丢弃，
+同一格内的移动不重复上报）。触摸：点击 = 单击，拖动 = 滚动（全屏程序里转成滚轮，程序没开
+鼠标上报时转成方向键），长按 = 本地选区。鼠标设备（iPad 触控板 / 鼠标、macOS）：按下、
+拖动、松开、悬停全部上报并带 Shift / Alt / Ctrl；按住 Shift 走本地选区；已上报的按下不再
+触发点按、双击选词、拖选或右键菜单。
+
 ### 6.2 明确不用
 
 | 东西 | 为什么不用 |
@@ -625,7 +639,7 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 | M0 主机密钥策略：**TOFU 自动接受并落盘** | M0 前提是「不接 UI」，走完整确认会自相矛盾。**明确的技术债，M3 还清** |
 | release profile **不要设 `panic = "abort"`** | 上游 actor 靠 `catch_unwind` 把 panic 转成 `SessionEvent::Crashed`（有 `actor_panic_gtk_survival_macos` 测试守着），abort 会毁掉这条韧性设计 |
 | iPad 优先，iPhone 作为子项 | iPad 有大屏 + 硬件键盘 + 指针支持，能把最难的 IME/软键盘问题推到 M1-b |
-| **仓库形态：独立仓库 + 上游作 git 依赖** | 本仓库只装我们自己的代码。上游 pin 到具体 `rev`，**源码零改动**，所以能这么做；`Cargo.lock` 进版本控制保证复现。代价：首次构建要联网、上游只读。见 `rust/UPSTREAM.md` |
+| **仓库形态：独立仓库 + 上游经 fork 作 git 依赖** | 本仓库只装我们自己的代码。上游 pin 到 fork 上的具体 `rev`（基线 + 逐条记录的小补丁）；`Cargo.lock` 进版本控制保证复现。代价：首次构建要联网、升级上游要在 fork 里 rebase。见 `rust/UPSTREAM.md` |
 | **keyring 的 iOS feature 从我们这边打开** | 不用改上游 `Cargo.toml`——Cargo 的 feature 是按包统一的。见 §3.2 |
 | **不应用上游的 `portable-pty-psmux` patch** | 它的改动全在 `src/win/*`，我们的目标不编译这些文件；换 git 依赖后 dev-dep 的 feature 冲突也自动消失 |
 | **iOS 上不删上游的本地传输，靠 `-Wl,-dead_strip` 裁符号** | 保留了 M5 里 macOS/Android 白拿本地面板的可能；将来真要摘掉就得 fork 上游（见 §9.2） |
@@ -652,19 +666,16 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
    但 120×40 只是基准值。真实 iPad 上的默认字号/行列数要等 M1 画出来才好定。
 2. **M3 的凭证 UI 形态**：钥匙串存密码「每次连接都读」还是「读一次缓存在内存」，
    影响 Face ID / 自动填充的介入点。等 M3 再定。
-3. **什么时候需要 fork 上游 —— git 依赖的第一个真实代价。**
-   目前上游零改动是**成立的**，但有三个已知的、可能逼我们 fork 的需求：
+3. **上游 fork 的边界。** 已经 fork（bracketed paste，UPSTREAM.md 的 P1）。还有两个已知的
+   可能再改上游的需求，都不急：
    - **把 iOS 不可用的三个传输（`local` / `pty` / `system_ssh`）从编译图里摘掉**，
      而不是靠链接器裁符号。现在靠 `-Wl,-dead_strip` 能压到 0（§3.2），所以**不急**；
      但如果哪天想做 App Store 的静态审查友好度，或者要减 `.a` 的 65 MB，就得 fork 加 feature gate。
    - **给 `rshell-platform` 加真正的 iOS 分支**（它现在只分 `windows`/`unix`）。
      §2 里列过它「需要 iOS 分支」，但那可能是「实现时才发现不需要」——
      等到 M0-c（内网权限）或 M3（keyring）真的碰到壁垒再决定。
-   - **bracketed paste**：上游 `TerminalDisplayModes` 没有暴露 `BRACKETED_PASTE`
-     （见 `docs/followups/20260923_bracketed-paste-上游缺display-modes.md`）。
-     属于「上游漏了一个字段」型的小改动，是当前最可能的第一个 fork 点。
-   **决策规则**：一旦要改上游，就 fork 到自己的仓库，把 `rev=` 换成 fork 的 commit；
-   在 `rust/UPSTREAM.md` 里记下改了哪几行、为什么。
+   **决策规则**：改上游就在 fork 的 `guosh` 分支加提交、换 `rev=`，
+   在 `rust/UPSTREAM.md` 的「fork 补丁」里记下改了哪几行、为什么。
 4. **自动发现（mDNS）要不要做**：本期明确不做，但如果 M0-c 的手填体验在局域网里太差，
    可以把它拉回来做一个独立里程碑（编号往后排，不要把 §5 的 M5 占掉——M5 是平台宽度）。
    候选插件已在 §6.1。
@@ -760,6 +771,13 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
     默认 enabled），终端里 `"` 会变成 `“`。要显式关掉。
 23. **模拟器的自动输入（`simctl` 等）走的是硬件键盘事件**，覆盖的是硬件键盘路径；软键盘路径
     （delta 插入/删除）要点屏幕键盘验证。模拟器默认输入法可能是拼音，英文输入先切到英文键盘。
+24. **iOS 的「双空格变句号」**：在「词 + 空格」后再敲空格，iOS 把前一个空格替换成「.」
+    （有时一步替换成「. 」）。终端里前一个空格早已发出，必须识别这条替换、按「用户敲的是
+    空格」处理，且它不算对按键的答复（`text_input_delta.dart`）。
+25. **`simctl pbcopy` 写进模拟器剪贴板的内容，App 读不到**（`Operation not authorized`）。
+    粘贴验收先在 App 内复制；真机读其他 App 的剪贴板会弹授权提示（见 followup）。
+26. **增删 `pubspec_overrides.yaml` 后要手动 `flutter pub get`**；`flutter run` 不重新解析依赖，
+    会继续用 `pubspec.lock` 里的旧来源。
 
 ---
 
@@ -813,7 +831,7 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
 - [x] 帧传输性能基准（§4 的全部数字）
 - [x] 复用候选调研（渲染层 `terminal_view`；mDNS 备查）
 - [x] 全部产物收敛到 `GuoSSHell/`
-- [x] **上游改为 git 依赖**，源码零改动，vendored 副本已删除（227 → 23 个文件）
+- [x] **上游改为 git 依赖**，vendored 副本已删除（227 → 23 个文件）
 - [x] **iOS 编译 + 链接实测**（§3.2）：两个切片都链得进 iOS 可执行文件，
       唯一额外标志 `-liconv`；PTY/fork 符号靠 `-Wl,-dead_strip` 归零
 - [x] `scripts/link-check.sh`（不用开 Xcode 的起飞前检查）
@@ -874,12 +892,24 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
       重连不再卡「连接中」、连接中的尺寸变化连上后补发、pixel 为整个终端像素；
       密码所有权移入 SecretString；帧流控（ACK，至多一帧在途），m1bar 60fps 不回退、
       20 万行输出末屏完整；诊断探针移出连接路径
-- [ ] M2a / M3 / M3a / M3b / M3c(不急) / M3d(不急) / M4 / M5
+
+**M2a —— 指针交互 —— ✅ 已完成（2026-09-25，模拟器验收）**
+
+- [x] 选区（长按选词 / 拖选 / 手柄）与复制走引擎，硬件键盘 ⌘C / ⌘A 同样走引擎
+- [x] 粘贴：Rust 侧规范化 + bracketed paste（rsHell fork 补丁 P1）；vim autoindent 下
+      多行粘贴不出台阶
+- [x] 鼠标：htop 点列头排序、点选进程，触摸拖动转滚轮；鼠标设备的拖动 / 悬停 / 修饰键
+      上报（fork 组件测试 + 引擎编码测试；iPad 触控板与 macOS 上实测随 M5）；中键修正
+- [x] SGR 4 下划线绘制
+- [x] 小屏布局：13 mini 模拟器竖屏；mini 真机复验待硬件
+- [ ] M3 / M3a / M3b / M3c(不急) / M3d(不急) / M4 / M5
 
 **关于提交**
 
-本项目的提交需要签名，而签名在自动化环境里做不到（私钥不在磁盘上，必须人工操作）。
-因此自动化只负责 `git add` 和把提交信息写成文件，最后一步由人工执行：
+main 上的提交需要签名，而签名在自动化环境里做不到（私钥不在磁盘上，必须人工操作）。
+因此自动化在**功能分支**上提交（不签名；按里程碑一条分支，依次叠在前一条上），人工审阅后
+重签合入 main。需要直接在 main 上提交时，自动化只负责 `git add` 和把提交信息写成文件，
+最后一步由人工执行：
 
 ```bash
 git commit -F <提交信息文件>

@@ -1,20 +1,26 @@
 # UPSTREAM.md —— 上游来源、依赖方式与许可
 
 本项目是**基于 rsHell 改出来的独立仓库**。上游内核不在本仓库里，而是作为
-**git 依赖**被 pin 到一个 commit。
+**git 依赖**被 pin 到一个 commit——这个 commit 在我们的 fork 上：上游基线之上
+叠了几个小补丁（见文末「fork 补丁」），每一个都写明改了哪几行、为什么。
 
 | 项 | 值 |
 |---|---|
-| 仓库 | https://github.com/hugefiver/rsHell |
-| 基线 commit | `b2ab8656079225dc2c920c24f5d9e0124f4f83e1` |
+| 上游仓库 | https://github.com/hugefiver/rsHell |
+| 上游基线 commit | `b2ab8656079225dc2c920c24f5d9e0124f4f83e1` |
+| fork 仓库 | https://github.com/Anthony-Hoo/rsHell（`guosh` 分支） |
+| pin 住的 commit | `103a00b6165670d9d433bd3a4058a8f18ea6d1ff`（基线 + 下文补丁） |
 | 许可证 | MIT，Copyright (c) 2026 hugefiver（副本见 `LICENSES/rsHell-MIT.txt`） |
 
 依赖声明在 `Cargo.toml`：
 
 ```toml
-rshell-core = { git = "https://github.com/hugefiver/rsHell", rev = "b2ab8656079225dc2c920c24f5d9e0124f4f83e1" }
-rshell-session = { git = "https://github.com/hugefiver/rsHell", rev = "b2ab8656079225dc2c920c24f5d9e0124f4f83e1" }
+rshell-core = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "103a00b6165670d9d433bd3a4058a8f18ea6d1ff" }
+rshell-session = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "103a00b6165670d9d433bd3a4058a8f18ea6d1ff" }
 ```
+
+升级上游 = 在 fork 里把 `guosh` 分支 rebase 到新基线（补丁都很小，冲突面可控），
+跑上游 `rshell-core` / `rshell-session` 的测试与我们的回归，再换这里的 rev。
 
 ## 为什么是 git 依赖，而不是 vendor 进仓库
 
@@ -23,16 +29,16 @@ rshell-session = { git = "https://github.com/hugefiver/rsHell", rev = "b2ab86560
 
 - 仓库干净：本仓库只装**我们自己的**代码。
 - provenance 就写在一行 `rev = "..."` 里，比一个副本目录更难说谎。
-- **前提是上游源码零改动**——这一点是实测确认的，见下。
+- 对上游的改动收在 fork 上、逐条记录（见文末「fork 补丁」），不和我们自己的代码混在一起。
 
 代价（必须知道）：
 
 1. **全新环境首次构建需要网络。** cargo 要把仓库 clone 进 `~/.cargo/git/`。
    离线机器要先 `cargo fetch`。
-2. **上游代码只读。** 一旦需要改上游（哪怕一行），就必须先 fork，
-   然后把 `rev=` 换成自己 fork 的 commit。这不是理论风险，见下面第 3 条。
+2. **改上游要走 fork。** 需要改上游时在 fork 的 `guosh` 分支上加提交、换 `rev=`，
+   并在文末「fork 补丁」记一笔。
 
-## 上游源码是零改动的 —— 以及为此做的三件事
+## 不需要改上游就能解决的三件事
 
 ### 1. iOS 的 keyring `protected` feature：不需要改上游
 
@@ -53,7 +59,7 @@ error: The `protected` feature is required on iOS
 apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
 ```
 
-实测有效：`cargo check --target aarch64-apple-ios` 通过，上游零改动。
+实测有效：`cargo check --target aarch64-apple-ios` 通过，不用为此改上游。
 
 ### 2. `[patch.crates-io] portable-pty-psmux`：我们不需要
 
@@ -76,19 +82,18 @@ package `rshell-session` depends on `portable-pty-psmux` with feature
 实测：去掉 patch、纯 git 依赖，`cargo check --target aarch64-apple-ios` 通过。
 补丁说明留档在 `LICENSES/portable-pty-psmux-PATCH-NOTES.md`。
 
-### 3. 已知的上游改动需求（还没做，是 git 依赖的第一个真实代价）
+### 3. iOS 不可用的传输：靠链接器裁掉
 
 链接出来的 iOS 可执行文件**会导入** `_openpty` / `_login_tty` / `_fork` /
 `_posix_spawnp` 等符号——它们来自 `rshell-session` 里那三个 iOS 不可用的传输
 （`local` / `pty` / `system_ssh`），我们从不调用，但**符号被保留下来了**。
 
-**暂时的结论是这不影响交付**：加 `-Wl,-dead_strip`（Xcode 的
+**这不影响交付**：加 `-Wl,-dead_strip`（Xcode 的
 `DEAD_CODE_STRIPPING = YES`，Release 默认开）后这些导入**全部消失**，
 二进制从 13 MB 降到 3.7 MB。实测见 `PLAN.md` §3.2。
 
-**但如果将来需要把这些传输从编译图里彻底摘掉**（而不是靠链接器裁），
-就必须 fork 上游把 `transport/local.rs` + `pty.rs` 用 feature gate 关掉——
-那就是「改上游」，就得按上面第 2 点先 fork。
+如果将来需要把这些传输从编译图里彻底摘掉（而不是靠链接器裁），就在 fork 上用
+feature gate 关掉 `transport/local.rs` + `pty.rs`，并在文末「fork 补丁」记一笔。
 
 ## 顺带：`LICENSES/`
 
@@ -100,3 +105,9 @@ package `rshell-session` depends on `portable-pty-psmux` with feature
 
 MIT 要求「许可声明随软件或其重要部分一起分发」。App Store 提交时需要一份
 第三方许可清单，这三个文件就是它的起点。
+
+## fork 补丁（`guosh` 分支，按提交顺序）
+
+| # | 提交 | 改了什么 | 为什么 |
+|---|---|---|---|
+| P1 | `103a00b` feat(core): expose bracketed paste in terminal display modes | `rshell-core/src/render.rs`：`TerminalDisplayModes` 加 `bracketed_paste`（`#[serde(default)]`）；`rshell-session/src/alacritty_display.rs`：由 `TermMode::BRACKETED_PASTE` 填充；两处测试字面量补字段、`engine_contract.rs` 加用例 | 粘贴要按远端是否开启 DECSET 2004 包 `ESC[200~ … ESC[201~`，这个模式原本只在 alacritty 适配层内部可见。不计入 `has_residue()`、恢复序列也不重置它——shell 在每个提示符都会打开它 |

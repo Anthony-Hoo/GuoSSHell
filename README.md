@@ -1,7 +1,7 @@
 # GuoSSHell
 
 一个 **纯 SSH 客户端**的 iOS / iPadOS 版（iPad 优先）。业务与终端语义跑在 **Rust**
-（上游 [rsHell](https://github.com/hugefiver/rsHell) 的内核，作为 pin 住 rev 的 git 依赖），
+（上游 [rsHell](https://github.com/hugefiver/rsHell) 的内核，经我们的 fork 作为 pin 住 rev 的 git 依赖），
 只有渲染与交互用 **Flutter** 重写。Dart 不写业务逻辑。
 
 > **实现期的唯一参考是 [`PLAN.md`](PLAN.md)。** 动代码之前先读它。
@@ -70,8 +70,8 @@ flutter run -d <模拟器id> \
 ## 上游与许可
 
 上游 `hugefiver/rsHell` @ `b2ab8656079225dc2c920c24f5d9e0124f4f83e1`，MIT。
-**上游源码零改动** —— 所以才能用 git 依赖而不是 fork。原因与代价见
-[`rust/UPSTREAM.md`](rust/UPSTREAM.md)。
+经我们的 fork（`Anthony-Hoo/rsHell` 的 `guosh` 分支）作为 git 依赖引入：基线之上只叠了
+几个小补丁，逐条记在 [`rust/UPSTREAM.md`](rust/UPSTREAM.md)。
 
 我们只依赖 4 个内核 crate（`rshell-core` / `rshell-session` / `rshell-platform` /
 `rshell-storage`），**不用** `rshell-ui`（22,812 行 GTK4/Relm4 界面层，正是要用 Flutter 替掉的那层）。

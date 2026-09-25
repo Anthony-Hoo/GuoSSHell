@@ -19,23 +19,19 @@ import 'package:terminal_view/terminal_view.dart'
 // （与行身份缓冲同一类实现级依赖）。
 // ignore: implementation_imports
 import 'package:terminal_view/src/ui/char_metrics.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'package:guosh_shell/src/bindings/bindings.dart';
 
+import '../settings/terminal_font.dart';
 import 'frame.dart';
 import 'frame_terminal.dart';
+import 'prompt_dialogs.dart';
+import 'session_target.dart';
 import 'terminal_key_bar.dart';
 
-const double _fontSize = 14;
-
-/// 终端字体样式：视图渲染与选区菜单锚点定位共用同一份。
-const TerminalStyle _terminalStyle = TerminalStyle(
-  fontSize: _fontSize,
-  fontFamily: 'Menlo',
-  fontFamilyFallback: ['Menlo', 'monospace', 'Courier New'],
-);
-
-enum _Phase { form, session }
+/// 本进程内会话编号（rinf 信号按类型全局广播，靠它分流）。
+int _nextSessionId = 1;
 
 /// 复制 / 全选的快捷键（⌘C / ⌘A 等，按平台由 fork 的默认表给出）改走引擎：
 /// 选区权威在引擎（PLAN §6.1 M2a 选区决定），fork 自带的这两个动作用的是
@@ -57,51 +53,18 @@ final Map<ShortcutActivator, Intent> _terminalShortcuts = {
     },
 };
 
-/// 待发的连接请求：等首次布局几何到达后才真正发出（见 _onTerminalResize）。
-class _PendingConnect {
-  final String host;
-  final int port;
-  final String username;
-  final String password;
-  final String command;
-
-  const _PendingConnect({
-    required this.host,
-    required this.port,
-    required this.username,
-    required this.password,
-    required this.command,
-  });
-}
-
-/// 主界面：连接表单 → 终端（fork 渲染 + 帧驱动适配器 + 键位条）。
+/// 一次 SSH 会话的页面：终端（fork 渲染 + 帧驱动适配器 + 键位条）。
+/// 会话在页面打开后、终端完成首次布局时发起（几何随连接请求一起带上）。
 class TerminalPage extends StatefulWidget {
-  final String? autoHost;
-  final int? autoPort;
-  final String? autoUsername;
-  final String? autoPassword;
-  final String? autoCommand;
+  final SessionTarget target;
 
-  const TerminalPage({
-    super.key,
-    this.autoHost,
-    this.autoPort,
-    this.autoUsername,
-    this.autoPassword,
-    this.autoCommand,
-  });
+  const TerminalPage({super.key, required this.target});
 
   @override
   State<TerminalPage> createState() => _TerminalPageState();
 }
 
 class _TerminalPageState extends State<TerminalPage> {
-  final _host = TextEditingController();
-  final _port = TextEditingController(text: '22');
-  final _username = TextEditingController();
-  final _password = TextEditingController();
-  final _command = TextEditingController();
-
   final FrameTerminal _terminal = FrameTerminal();
   final TerminalController _terminalController =
       TerminalController(pointerInputs: const PointerInputs.all());
@@ -112,11 +75,21 @@ class _TerminalPageState extends State<TerminalPage> {
   /// Flutter 自带的选区菜单（iOS 上是系统风格气垫）。
   final ContextMenuController _selectionMenu = ContextMenuController();
 
+  /// 终端样式：视图渲染与选区菜单锚点定位共用同一份（取自设置，页面内不变）。
+  late final TerminalStyle _style = terminalStyle(SettingsState.latestRustSignal!.message);
+
   StreamSubscription? _statusSub;
   StreamSubscription? _frameSub;
   StreamSubscription? _selectionSub;
   StreamSubscription? _clipboardSub;
   StreamSubscription? _perfSub;
+  StreamSubscription? _promptSub;
+
+  /// 当前会话编号；重连换新编号，旧会话迟到的信号不再生效。
+  int _sessionId = 0;
+
+  /// 会话已失败 / 结束：还开着的交互对话框据此自行关闭。
+  final ValueNotifier<bool> _promptsDismissed = ValueNotifier(false);
 
   /// 引擎最近一次选区回显（绝对行坐标）。视口一变就要拿它重新投影。
   SelectionState? _selectionEcho;
@@ -125,9 +98,10 @@ class _TerminalPageState extends State<TerminalPage> {
   int? _projectedFirstStable;
   int? _projectedLastStable;
 
-  _Phase _phase = _Phase.form;
   SessionState? _state;
+  FailureKind _failure = FailureKind.none;
   String _detail = '';
+  String _localNetworkSettingsUrl = '';
 
   @override
   void initState() {
@@ -136,6 +110,7 @@ class _TerminalPageState extends State<TerminalPage> {
     _frameSub = FrameUpdate.rustSignalStream.listen(_onFrame);
     _selectionSub = SelectionState.rustSignalStream.listen(_onSelectionState);
     _clipboardSub = ClipboardText.rustSignalStream.listen(_onClipboardText);
+    _promptSub = InteractionPrompt.rustSignalStream.listen(_onPrompt);
     if (kDebugMode) {
       _perfSub = PerfStats.rustSignalStream.listen(_onPerfStats);
     }
@@ -145,26 +120,20 @@ class _TerminalPageState extends State<TerminalPage> {
     _terminalController
       ..addListener(_onSelectionChanged)
       ..onSelectionIntent = _onSelectionIntent;
-    if (widget.autoHost != null && widget.autoHost!.isNotEmpty) {
-      SchedulerBinding.instance.addPostFrameCallback((_) {
-        _sendConnect(
-          host: widget.autoHost!,
-          port: widget.autoPort ?? 22,
-          username: widget.autoUsername ?? '',
-          password: widget.autoPassword ?? '',
-          command: widget.autoCommand ?? '',
-        );
-      });
-    }
+    _startSession();
   }
 
   @override
   void dispose() {
+    // 任何方式离开页面都结束会话（连接中的也一并取消）。
+    if (_sessionId != 0 && !_ended) DisconnectRequest(sessionId: _sessionId).sendSignalToRust();
     _statusSub?.cancel();
     _frameSub?.cancel();
     _selectionSub?.cancel();
     _clipboardSub?.cancel();
     _perfSub?.cancel();
+    _promptSub?.cancel();
+    _promptsDismissed.dispose();
     _terminalController
       ..removeListener(_onSelectionChanged)
       ..onSelectionIntent = null;
@@ -172,35 +141,61 @@ class _TerminalPageState extends State<TerminalPage> {
     _resizeTimer?.cancel();
     _terminalController.dispose();
     _terminalFocus.dispose();
-    _host.dispose();
-    _port.dispose();
-    _username.dispose();
-    _password.dispose();
-    _command.dispose();
     super.dispose();
   }
 
+  bool get _ended =>
+      _state == SessionState.failed ||
+      _state == SessionState.closed ||
+      _state == SessionState.cancelled;
+
   void _onStatus(RustSignalPack<SessionStatus> pack) {
-    if (!mounted) return;
-    final state = pack.message.state;
-    // 会话结束（失败/断开）：引擎那边选区没了，别再留着高亮/耳朵。
+    final msg = pack.message;
+    if (!mounted || msg.sessionId != _sessionId) return;
+    final state = msg.state;
+    // 连接前被取消（关了密码框等）：回到上一页。
+    if (state == SessionState.cancelled) {
+      _state = state;
+      Navigator.of(context).maybePop();
+      return;
+    }
+    // 会话结束（失败/断开）：引擎那边选区没了，别再留着高亮/耳朵；
+    // 还开着的交互对话框也收起。
     if (state == SessionState.closed || state == SessionState.failed) {
       _selectionEcho = null;
       _projectedFirstStable = null;
       _projectedLastStable = null;
       _terminalController.setExternalSelection(null, null);
+      _promptsDismissed.value = true;
     }
     setState(() {
       _state = state;
-      _detail = pack.message.detail;
+      _failure = msg.failure;
+      _detail = msg.detail;
+      _localNetworkSettingsUrl = msg.localNetworkSettingsUrl;
     });
     // 连接中视图几何可能又变了（键盘弹出、旋转）：连上即补发最新尺寸。
     if (state == SessionState.connected) _flushResize();
   }
 
+  /// 连接过程中的问题（密码、主机密钥、keyboard-interactive）→ 对话框 → 回答。
+  Future<void> _onPrompt(RustSignalPack<InteractionPrompt> pack) async {
+    final prompt = pack.message;
+    if (!mounted || prompt.sessionId != _sessionId) return;
+    final answer = await showPromptDialog(context, prompt, _promptsDismissed);
+    if (prompt.sessionId != _sessionId) return;
+    InteractionReply(
+      sessionId: prompt.sessionId,
+      promptId: prompt.promptId,
+      accept: answer.accept,
+      answers: answer.answers,
+      remember: answer.remember,
+    ).sendSignalToRust();
+  }
+
   void _onFrame(RustSignalPack<FrameUpdate> pack) {
-    if (!mounted) return;
     final msg = pack.message;
+    if (!mounted || msg.sessionId != _sessionId) return;
     try {
       final frame = decodeFrame(
         pack.binary,
@@ -233,7 +228,7 @@ class _TerminalPageState extends State<TerminalPage> {
       debugPrint('[frame] decode failed: $error');
     } finally {
       // 流控：Rust 等到这一帧的 ACK 才发下一帧（解码失败也要回，免得它空等）。
-      FrameAck(seq: msg.seq).sendSignalToRust();
+      FrameAck(sessionId: msg.sessionId, seq: msg.seq).sendSignalToRust();
     }
   }
 
@@ -241,6 +236,7 @@ class _TerminalPageState extends State<TerminalPage> {
   /// 出帧数与渲染/打包耗时。
   void _onPerfStats(RustSignalPack<PerfStats> pack) {
     final p = pack.message;
+    if (p.sessionId != _sessionId) return;
     final fps = p.windowMs == 0 ? 0 : p.frames * 1000 / p.windowMs;
     debugPrint('[perf] ${fps.toStringAsFixed(1)} fps · render avg ${p.renderUsAvg}µs '
         'max ${p.renderUsMax}µs · pack avg ${p.packUsAvg}µs · ${p.bytesAvg} B/frame');
@@ -248,7 +244,7 @@ class _TerminalPageState extends State<TerminalPage> {
 
   /// 引擎回显选区 → 记住（绝对行坐标）→ 投影到当前视口。
   void _onSelectionState(RustSignalPack<SelectionState> pack) {
-    if (!mounted) return;
+    if (!mounted || pack.message.sessionId != _sessionId) return;
     _selectionEcho = pack.message;
     _projectSelection();
   }
@@ -300,7 +296,7 @@ class _TerminalPageState extends State<TerminalPage> {
 
   /// 引擎取文回来 → 进剪贴板 + 清选区（对齐 Termux）。
   void _onClipboardText(RustSignalPack<ClipboardText> pack) {
-    if (!mounted) return;
+    if (!mounted || pack.message.sessionId != _sessionId) return;
     Clipboard.setData(ClipboardData(text: pack.message.text));
     _sendSelectionRequest(clear: true);
   }
@@ -316,6 +312,7 @@ class _TerminalPageState extends State<TerminalPage> {
     final focusRow = _terminal.stableRowAt(end.y);
     if (anchorRow == null || focusRow == null) return;
     SelectionRequest(
+      sessionId: _sessionId,
       clear: false,
       anchorRow: anchorRow,
       anchorCol: begin.x,
@@ -327,6 +324,7 @@ class _TerminalPageState extends State<TerminalPage> {
 
   void _sendSelectionRequest({required bool clear}) {
     SelectionRequest(
+      sessionId: _sessionId,
       clear: clear,
       anchorRow: 0,
       anchorCol: 0,
@@ -337,17 +335,30 @@ class _TerminalPageState extends State<TerminalPage> {
   }
 
   /// fork 的输入口 → rinf → Rust（键编码权威在 encode_input）。
+  /// 连接中的输入也照发：Rust 连上后按顺序补上（type-ahead）。
   bool _onTerminalInput(TerminalInputEvent event) {
-    if (_state != SessionState.connected) return false;
+    if (_state != SessionState.connected && _state != SessionState.connecting) return false;
     switch (event) {
       case KeyInputEvent(:final key, :final shift, :final control, :final alt):
-        InputRequest(text: '', key: key, shift: shift, control: control, alt: alt)
-            .sendSignalToRust();
+        InputRequest(
+          sessionId: _sessionId,
+          text: '',
+          key: key,
+          shift: shift,
+          control: control,
+          alt: alt,
+        ).sendSignalToRust();
       case TextInputEvent(:final text):
-        InputRequest(text: text, key: '', shift: false, control: false, alt: false)
-            .sendSignalToRust();
+        InputRequest(
+          sessionId: _sessionId,
+          text: text,
+          key: '',
+          shift: false,
+          control: false,
+          alt: false,
+        ).sendSignalToRust();
       case PasteInputEvent(:final text):
-        PasteRequest(text: text).sendSignalToRust();
+        PasteRequest(sessionId: _sessionId, text: text).sendSignalToRust();
       case MouseInputEvent(
           :final button,
           :final action,
@@ -358,6 +369,7 @@ class _TerminalPageState extends State<TerminalPage> {
         ):
         // 滚轮走 Scroll（上游 validate 拒绝「滚轮走 press」）。
         MouseRequest(
+          sessionId: _sessionId,
           kind: button != null && button.isWheel
               ? 'scroll'
               : switch (action) {
@@ -387,7 +399,7 @@ class _TerminalPageState extends State<TerminalPage> {
   /// 有待发的连接请求时带着真实几何发 ConnectRequest——否则远端 PTY 只能按
   /// 缺省 2×2 建立，exec 输出会在换行历史里塞满垃圾。
   void _onTerminalResize(TerminalGeometry geometry) {
-    if (_pendingConnect != null) {
+    if (_connectPending) {
       _flushPendingConnect();
       return;
     }
@@ -409,6 +421,7 @@ class _TerminalPageState extends State<TerminalPage> {
     if (geometry == null || geometry == _sentGeometry) return;
     _sentGeometry = geometry;
     ResizeRequest(
+      sessionId: _sessionId,
       cols: geometry.cols,
       rows: geometry.rows,
       pixelWidth: geometry.pixelWidth,
@@ -420,17 +433,19 @@ class _TerminalPageState extends State<TerminalPage> {
   /// 有待发的连接请求且已量到几何 → 发出 ConnectRequest。
   /// 还没有几何（首次布局前）就等 fork 的 resize 回调再发。
   void _flushPendingConnect() {
-    final pending = _pendingConnect;
     final geometry = _terminal.measuredGeometry;
-    if (pending == null || geometry == null || !mounted) return;
-    _pendingConnect = null;
+    if (!_connectPending || geometry == null || !mounted) return;
+    _connectPending = false;
     _sentGeometry = geometry;
+    final target = widget.target;
     ConnectRequest(
-      host: pending.host,
-      port: pending.port,
-      username: pending.username,
-      password: pending.password,
-      command: pending.command,
+      sessionId: _sessionId,
+      connectionId: target.connectionId,
+      host: target.host,
+      port: target.port,
+      username: target.username,
+      password: target.password,
+      command: target.command,
       cols: geometry.cols,
       rows: geometry.rows,
       pixelWidth: geometry.pixelWidth,
@@ -497,7 +512,7 @@ class _TerminalPageState extends State<TerminalPage> {
       return const TextSelectionToolbarAnchors(primaryAnchor: Offset.zero);
     }
     final origin = box.localToGlobal(Offset.zero);
-    final cell = calcCharSize(_terminalStyle, MediaQuery.textScalerOf(context));
+    final cell = calcCharSize(_style, MediaQuery.textScalerOf(context));
     final begin = selection.begin;
     final end = selection.end;
     return TextSelectionToolbarAnchors(
@@ -511,7 +526,7 @@ class _TerminalPageState extends State<TerminalPage> {
   /// 复制选区：取文在引擎里（Dart 不碰 BufferLine），发请求等 ClipboardText。
   void _copySelection() {
     if (_state != SessionState.connected) return;
-    CopyRequest().sendSignalToRust();
+    CopyRequest(sessionId: _sessionId).sendSignalToRust();
   }
 
   /// 全选当前视口（引擎的选区终点列是排除式的，所以终点取列数）。
@@ -521,6 +536,7 @@ class _TerminalPageState extends State<TerminalPage> {
     final last = _terminal.stableRowAt(_terminal.height - 1);
     if (first == null || last == null) return;
     SelectionRequest(
+      sessionId: _sessionId,
       clear: false,
       anchorRow: first,
       anchorCol: 0,
@@ -537,145 +553,101 @@ class _TerminalPageState extends State<TerminalPage> {
     _terminal.paste(text);
   }
 
-  void _connect() {
-    FocusManager.instance.primaryFocus?.unfocus();
-    _sendConnect(
-      host: _host.text.trim(),
-      port: int.tryParse(_port.text.trim()) ?? 22,
-      username: _username.text,
-      password: _password.text,
-      command: _command.text.trim(),
-    );
-  }
-
-  void _sendConnect({
-    required String host,
-    required int port,
-    required String username,
-    required String password,
-    required String command,
-  }) {
+  /// 发起（或重新发起）会话：换新编号，等终端量好几何后发 ConnectRequest。
+  void _startSession() {
+    _sessionId = _nextSessionId++;
+    _promptsDismissed.value = false;
+    _selectionEcho = null;
+    _projectedFirstStable = null;
+    _projectedLastStable = null;
+    _terminalController.setExternalSelection(null, null);
     setState(() {
-      _phase = _Phase.session;
       _state = SessionState.connecting;
-      _detail = '$host:$port';
+      _failure = FailureKind.none;
+      _detail = '';
+      _localNetworkSettingsUrl = '';
       // 不立刻发请求：等会话视图完成布局、拿到真实几何再发。
-      _pendingConnect = _PendingConnect(
-        host: host,
-        port: port,
-        username: username,
-        password: password,
-        command: command,
-      );
+      _connectPending = true;
     });
     // 布局后几何变了 → fork 回调 _onTerminalResize 已经发出；没变（重连时
     // 视图尺寸通常不变，fork 不再回调）→ 这里用已量到的几何发出。
     SchedulerBinding.instance.addPostFrameCallback((_) => _flushPendingConnect());
   }
 
-  _PendingConnect? _pendingConnect;
+  bool _connectPending = false;
 
-  void _backToForm() {
-    DisconnectRequest().sendSignalToRust();
-    setState(() {
-      _phase = _Phase.form;
-      _state = null;
-      _pendingConnect = null;
-    });
+  /// 离开会话。连着的先确认，确认后断开并返回列表。
+  Future<void> _leave() async {
+    if (_state == SessionState.connected) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('断开与「${widget.target.title}」的连接？'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('断开'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
+    Navigator.of(context).pop();
+  }
+
+  Future<void> _openSettings(String url) async {
+    await launchUrl(Uri.parse(url));
   }
 
   @override
   Widget build(BuildContext context) {
-    return _phase == _Phase.form ? _buildForm(context) : _buildSession(context);
-  }
-
-  Widget _buildForm(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('GuoSSHell')),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          TextField(
-            controller: _host,
-            keyboardType: TextInputType.url,
-            autofillHints: const [AutofillHints.url],
-            decoration: const InputDecoration(
-              labelText: '主机',
-              hintText: '192.168.x.x 或域名',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _port,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: '端口',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _username,
-            autofillHints: const [AutofillHints.username],
-            decoration: const InputDecoration(
-              labelText: '用户名',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _password,
-            obscureText: true,
-            autofillHints: const [AutofillHints.password],
-            decoration: const InputDecoration(
-              labelText: '密码',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _command,
-            decoration: const InputDecoration(
-              labelText: '命令（可选）',
-              hintText: '填了就连上直接执行，如 top；留空进 shell',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 20),
-          FilledButton.icon(
-            onPressed: _connect,
-            icon: const Icon(Icons.terminal),
-            label: const Text('连接'),
-          ),
-          if (_detail.isNotEmpty) ...[
-            const SizedBox(height: 16),
-            Text(
-              _detail,
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.error,
-                fontSize: 12,
-              ),
-            ),
-          ],
-        ],
-      ),
+    // 连着的时候，系统返回（iOS 边缘右滑等）也走「确认后断开」。
+    return PopScope(
+      canPop: _state != SessionState.connected,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _leave();
+      },
+      child: _buildSession(context),
     );
   }
 
   Widget _buildSession(BuildContext context) {
     final banner = switch (_state) {
-      SessionState.connecting => const _Banner(icon: Icons.sync, text: '连接中…'),
+      SessionState.connecting => _Banner(
+          icon: Icons.sync,
+          text: '正在连接 ${widget.target.title}…',
+        ),
       SessionState.failed => _Banner(
           icon: Icons.error_outline,
-          text: '失败：$_detail',
+          text: _failureText(_failure),
+          detail: _detail,
           error: true,
-          onBack: _backToForm,
+          actions: [
+            if (_localNetworkSettingsUrl.isNotEmpty)
+              TextButton(
+                onPressed: () => _openSettings(_localNetworkSettingsUrl),
+                child: const Text('打开设置'),
+              ),
+            TextButton(onPressed: _startSession, child: const Text('重试')),
+            TextButton(onPressed: _leave, child: const Text('返回')),
+          ],
+          hint: _localNetworkSettingsUrl.isEmpty
+              ? null
+              : '服务器在局域网内时，需要允许 GuoSSHell 访问本地网络。',
         ),
       SessionState.closed => _Banner(
           icon: Icons.link_off,
-          text: '已断开：$_detail',
-          onBack: _backToForm,
+          text: '会话已结束',
+          detail: _detail,
+          actions: [
+            TextButton(onPressed: _startSession, child: const Text('重新连接')),
+            TextButton(onPressed: _leave, child: const Text('返回')),
+          ],
         ),
       _ => null,
     };
@@ -704,6 +676,7 @@ class _TerminalPageState extends State<TerminalPage> {
                         terminal: _terminal,
                         controller: _terminalController,
                         focusNode: _terminalFocus,
+                        style: _style,
                       ),
                     ),
                   ),
@@ -721,6 +694,7 @@ class _TerminalPageState extends State<TerminalPage> {
               onCopy: _copySelection,
               onPaste: _pasteClipboard,
               onToggleKeyboard: _toggleKeyboard,
+              onDisconnect: _leave,
             ),
           ],
         ),
@@ -735,12 +709,14 @@ class _TerminalSurface extends StatelessWidget {
   final FrameTerminal terminal;
   final TerminalController controller;
   final FocusNode focusNode;
+  final TerminalStyle style;
 
   const _TerminalSurface({
     super.key,
     required this.terminal,
     required this.controller,
     required this.focusNode,
+    required this.style,
   });
 
   @override
@@ -754,7 +730,7 @@ class _TerminalSurface extends StatelessWidget {
       // iOS 软键盘的退格不产生硬件按键事件，必须靠编辑增量探测
       // （fork 的 onDelete → keyInput(backspace)）。
       deleteDetection: true,
-      textStyle: _terminalStyle,
+      textStyle: style,
       theme: TerminalThemes.defaultTheme,
       keyboardType: TextInputType.emailAddress,
       keyboardAppearance: Brightness.dark,
@@ -762,37 +738,86 @@ class _TerminalSurface extends StatelessWidget {
   }
 }
 
+/// 失败分类 → 文案。
+String _failureText(FailureKind failure) => switch (failure) {
+      FailureKind.none || FailureKind.other => '连接出错',
+      FailureKind.notFound => '这条连接已不存在',
+      FailureKind.invalidTarget => '连接目标无效：请检查主机、端口和用户名',
+      FailureKind.authentication => '认证失败：用户名或密码不正确',
+      FailureKind.hostKeyRejected => '已拒绝服务器的主机密钥',
+      FailureKind.hostKeyChanged => '主机密钥已变更，连接已中止',
+      FailureKind.network => '无法连接到服务器',
+      FailureKind.timeout => '连接超时',
+      FailureKind.keychain => '读写钥匙串失败',
+    };
+
 class _Banner extends StatelessWidget {
   final IconData icon;
   final String text;
+  final String detail;
+  final String? hint;
   final bool error;
-  final VoidCallback? onBack;
+  final List<Widget> actions;
 
   const _Banner({
     required this.icon,
     required this.text,
+    this.detail = '',
+    this.hint,
     this.error = false,
-    this.onBack,
+    this.actions = const [],
   });
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final foreground = error ? scheme.onErrorContainer : scheme.onSurface;
     return Material(
       color: error ? scheme.errorContainer : scheme.surface.withValues(alpha: 0.92),
       child: SafeArea(
         bottom: false,
-        child: ListTile(
-          dense: true,
-          leading: Icon(icon, color: error ? scheme.onErrorContainer : null),
-          title: Text(
-            text,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(color: error ? scheme.onErrorContainer : null),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Icon(icon, color: foreground, size: 20),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(text, style: TextStyle(color: foreground)),
+                  ),
+                ],
+              ),
+              if (hint != null)
+                Padding(
+                  padding: const EdgeInsets.only(left: 32, top: 4),
+                  child: Text(hint!, style: TextStyle(color: foreground, fontSize: 13)),
+                ),
+              if (detail.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(left: 32, top: 2),
+                  child: Text(
+                    detail,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: foreground.withValues(alpha: 0.7),
+                      fontSize: 11,
+                    ),
+                  ),
+                ),
+              if (actions.isNotEmpty)
+                TextButtonTheme(
+                  data: TextButtonThemeData(
+                    style: TextButton.styleFrom(foregroundColor: foreground),
+                  ),
+                  child: Row(mainAxisAlignment: MainAxisAlignment.end, children: actions),
+                ),
+            ],
           ),
-          trailing:
-              onBack == null ? null : TextButton(onPressed: onBack, child: const Text('返回')),
         ),
       ),
     );

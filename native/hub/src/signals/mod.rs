@@ -1,28 +1,52 @@
 //! rinf 边界上的信号类型（适配层）。
 //!
-//! 业务模型（`RenderFrame` / `SessionUiCommand` ...）属于上游 `rshell-core::protocol`，
-//! 不在这里重建（PLAN.md 铁律 1/4）。这里只放三样东西：
-//! * Dart → Rust 的请求信号（协议类型的平铺投影）
-//! * Rust → Dart 的状态信号
-//! * Rust → Dart 的帧信号（结构化字段 + 二进制通道里的 run 压缩字节流）
+//! 业务模型（`RenderFrame` / `ConnectionProfile` ...）属于上游 `rshell-core`，
+//! 不在这里重建（PLAN.md 铁律 1/4）。这里只放边界上的平铺投影：
+//! * 本文件：启动与会话（请求、状态、帧——帧的 run 压缩字节走二进制通道）
+//! * [`catalog`]：连接目录；[`interaction`]：连接过程中的交互；[`settings`]：设置
+//!
+//! 会话类信号都带 `session_id`（Dart 分配，本进程内唯一）：rinf 的信号按类型
+//! 全局广播，多个会话并存时靠它分流。
+
+pub mod catalog;
+pub mod interaction;
+pub mod settings;
 
 use rinf::{DartSignal, RustSignal, RustSignalBinary, SignalPiece};
 use serde::{Deserialize, Serialize};
 
+// ── 启动 ─────────────────────────────────────────────────────────────────────
+
+/// App 启动时发一次：平台给 App 的私有数据目录（Flutter 用 path_provider 取）。
+/// 连接目录（SQLite）与 known_hosts 都放在这里。
+#[derive(Deserialize, DartSignal)]
+pub struct AppStart {
+    pub support_dir: String,
+}
+
+/// 启动结果。`ok = false` 时存储不可用（`detail` 说明原因），目录与连接都不能用。
+#[derive(Serialize, RustSignal)]
+pub struct AppReady {
+    pub ok: bool,
+    pub detail: String,
+}
+
 // ── Dart → Rust ──────────────────────────────────────────────────────────────
 
-/// 建立一条 SSH 会话。
+/// 建立一条 SSH 会话：`connection_id` 非空连目录里的连接；为空是**快速连接**
+/// （不存目录），目标取下面几个字段。
 ///
-/// 密码按明文过边界——上游的 `SecretString` 刻意不可序列化（PLAN.md §2.2），
-/// Rust 在接收处立刻包成 `SecretString`，之后不再以明文持有、不进日志。
+/// 快速连接的密码可以随请求带来（按明文过边界——上游的 `SecretString` 刻意不可
+/// 序列化，PLAN.md §2.2；Rust 在接收处立刻包成 `SecretString`），为空则连接时弹框问。
 #[derive(Deserialize, DartSignal)]
 pub struct ConnectRequest {
+    pub session_id: u32,
+    pub connection_id: String,
     pub host: String,
     pub port: u16,
     pub username: String,
     pub password: String,
     /// 非空 = exec 模式：连接后在远端直接执行该命令（如 `top`），不进 shell。
-    /// M1 的帧率实测靠它，不需要输入能力。
     pub command: String,
     /// 首次几何。度量的唯一权威是 Flutter（PLAN.md §8）：
     /// 它量完格子后随连接请求一起带来。
@@ -36,6 +60,7 @@ pub struct ConnectRequest {
 /// 视口变化（旋转 / 改窗口）。→ `engine.resize` + `transport.resize`（远端 window-change）。
 #[derive(Deserialize, DartSignal)]
 pub struct ResizeRequest {
+    pub session_id: u32,
     pub cols: u16,
     pub rows: u16,
     pub pixel_width: u32,
@@ -44,7 +69,9 @@ pub struct ResizeRequest {
 }
 
 #[derive(Deserialize, DartSignal)]
-pub struct DisconnectRequest {}
+pub struct DisconnectRequest {
+    pub session_id: u32,
+}
 
 /// 终端输入（M2 输入闭环的边界）。
 ///
@@ -55,6 +82,7 @@ pub struct DisconnectRequest {}
 /// 键编码（ETX/Kitty/CSI-u…）是 Rust 侧 `encode_input` 的事，Dart 只转发。
 #[derive(Deserialize, DartSignal)]
 pub struct InputRequest {
+    pub session_id: u32,
     pub text: String,
     pub key: String,
     pub shift: bool,
@@ -69,6 +97,7 @@ pub struct InputRequest {
 /// 滚轮必须用 `kind: "scroll"`（上游 validate 会拒绝「滚轮走 press」）。
 #[derive(Deserialize, DartSignal)]
 pub struct MouseRequest {
+    pub session_id: u32,
     /// press / release / move / scroll
     pub kind: String,
     /// left / middle / right / wheel_up / wheel_down；无键移动（悬停）为空
@@ -87,6 +116,7 @@ pub struct MouseRequest {
 /// 渲染/取文时自己排序，所以拖耳朵越过对端不用特殊处理。
 #[derive(Deserialize, DartSignal)]
 pub struct SelectionRequest {
+    pub session_id: u32,
     pub clear: bool,
     pub anchor_row: i64,
     pub anchor_col: u16,
@@ -98,12 +128,15 @@ pub struct SelectionRequest {
 
 /// 复制当前选区（取文在引擎里，见 `TerminalEngine::selected_text`）。
 #[derive(Deserialize, DartSignal)]
-pub struct CopyRequest {}
+pub struct CopyRequest {
+    pub session_id: u32,
+}
 
 /// 粘贴一段文本。换行规范化、控制字符过滤、按远端模式包 bracketed paste
 /// 都是 Rust 的事（`session::paste_bytes`），Dart 只转发剪贴板原文。
 #[derive(Deserialize, DartSignal)]
 pub struct PasteRequest {
+    pub session_id: u32,
     pub text: String,
 }
 
@@ -111,6 +144,7 @@ pub struct PasteRequest {
 /// Rust 只保留最新状态，不在 rinf 的无界队列里积压）。
 #[derive(Deserialize, DartSignal)]
 pub struct FrameAck {
+    pub session_id: u32,
     pub seq: u32,
 }
 
@@ -121,20 +155,48 @@ pub enum SessionState {
     Connecting,
     Connected,
     Failed,
+    /// 会话结束（远端退出、断开）。
     Closed,
+    /// 连接完成前被用户取消（关闭页面、取消密码框）。
+    Cancelled,
+}
+
+/// 失败分类（`SessionState::Failed` 时有意义）。文案由 Dart 按分类给出。
+#[derive(Serialize, SignalPiece, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    None,
+    /// 目录里没有这条连接（已被删除）。
+    NotFound,
+    /// 快速连接的目标无效（主机、端口或用户名）。
+    InvalidTarget,
+    Authentication,
+    HostKeyRejected,
+    /// 主机密钥与记录的不一致，且没有被接受替换。
+    HostKeyChanged,
+    Network,
+    Timeout,
+    /// 钥匙串读写失败。
+    Keychain,
+    Other,
 }
 
 #[derive(Serialize, RustSignal)]
 pub struct SessionStatus {
+    pub session_id: u32,
     pub state: SessionState,
-    /// 人类可读的补充信息（失败分类 / 退出码等）。绝不包含密码。
+    pub failure: FailureKind,
+    /// 补充信息（目标地址、诊断分类等）。绝不包含密码。
     pub detail: String,
+    /// 失败可能源于系统的本地网络权限（目标在局域网，失败是网络或超时类）。
+    /// 非空时是打开系统设置对应页面的 URL（平台相关，由 Rust 给出）。
+    pub local_network_settings_url: String,
 }
 
 /// 一帧终端画面。二进制部分是 [`crate::frame_codec::pack_runs`] 的产物，
 /// 走 `RustSignalBinary` 的原始字节通道（PLAN.md §4.3 的落地方案）。
 #[derive(Serialize, RustSignalBinary)]
 pub struct FrameUpdate {
+    pub session_id: u32,
     pub cols: u16,
     pub rows: u16,
     /// 本会话内单调递增的帧序号。Dart 侧用它数**丢帧**：
@@ -156,6 +218,7 @@ pub struct FrameUpdate {
 /// ——拖耳朵越过对端时角色才不会乱（引擎自己渲染/取文时才排序）。
 #[derive(Serialize, RustSignal)]
 pub struct SelectionState {
+    pub session_id: u32,
     pub has_selection: bool,
     pub anchor_row: i64,
     pub anchor_col: u16,
@@ -167,6 +230,7 @@ pub struct SelectionState {
 /// 的 `selection_text`），Dart 直接进剪贴板。无选区时是空串。
 #[derive(Serialize, RustSignal)]
 pub struct ClipboardText {
+    pub session_id: u32,
     pub text: String,
 }
 
@@ -174,6 +238,7 @@ pub struct ClipboardText {
 /// 单帧预算 16.67 ms（PLAN §4）：render_us + pack_us 的 max 是 Rust 侧的真实开销。
 #[derive(Serialize, RustSignal)]
 pub struct PerfStats {
+    pub session_id: u32,
     /// 统计窗口内实际打包发出的帧数。fps = frames / window_ms * 1000。
     pub frames: u32,
     pub window_ms: u32,

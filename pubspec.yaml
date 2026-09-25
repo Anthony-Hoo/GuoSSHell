@@ -45,6 +45,8 @@ dependencies:
       url: https://github.com/Anthony-Hoo/terminal_view.git
       ref: "742f7214eb318b5e8bf3c31bdf220ebdc3eee23a"
   rinf: ^8.10.1
+  path_provider: ^2.1.6
+  url_launcher: ^6.3.2
 
 dev_dependencies:
   flutter_test:
@@ -67,6 +69,15 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # 终端内置字体：MesloLGS NF（Meslo LG 的 Nerd Font 补丁版，带 powerline / 图标字形；
+  # Apache 2.0，见 assets/fonts/LICENSE-MesloLGS-NF.txt）。只带常规与粗体，斜体由引擎合成。
+  fonts:
+    - family: MesloLGS NF
+      fonts:
+        - asset: assets/fonts/MesloLGS-NF-Regular.ttf
+        - asset: assets/fonts/MesloLGS-NF-Bold.ttf
+          weight: 700
 
   # To add assets to your application, add an assets section, like this:
   # assets:

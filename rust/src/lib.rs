@@ -21,6 +21,21 @@ use std::sync::Arc;
 // hub 通过这里拿类型，避免第二处 rev 需要同步升级。
 pub use rshell_core;
 pub use rshell_session;
+pub use rshell_storage;
+
+/// 把平台的钥匙串设为 keyring 的默认存储（`SystemCredentialVault` 经它读写）。
+///
+/// keyring v1 在 macOS / Windows / Linux 上会自己注册，iOS 上什么都不做——
+/// 这里补上 iOS 的 protected data store（不随 iCloud 同步）。其他平台是空操作。
+pub fn register_credential_store() -> Result<(), String> {
+    #[cfg(target_os = "ios")]
+    {
+        let store = apple_native_keyring_store::protected::Store::new()
+            .map_err(|error| format!("keychain store: {error}"))?;
+        keyring_core::set_default_store(store);
+    }
+    Ok(())
+}
 
 use rshell_core::{
     AuthenticationKind, ConnectionProfile, HostKeyDecision, InteractionRequest,

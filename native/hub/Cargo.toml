@@ -23,6 +23,8 @@ serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.45.0", features = ["rt", "macros", "time", "net", "sync", "io-util"] }
 # 边界上的密码在 Rust 侧接收处立刻包成 SecretString（PLAN.md §2.2）。
 secrecy = "0.10.3"
+# 边界上的连接 id 是字符串，解析成上游的 ConnectionId(Uuid)。
+uuid = "1"
 
 # 业务内核唯一入口：`rshell-m0`（根 workspace 成员，path 依赖）。
 # 它再导出 rshell-core / rshell-session，并把上游 git 依赖的 rev pin 在

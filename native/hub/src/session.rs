@@ -1,11 +1,13 @@
-//! 会话 actor：把 M0 验证过的装配（`rust/src/lib.rs` 的 smoke 路径——
-//! `ConnectionProfile` / `AuthPlan` / `KnownHostsVerifier` / `interaction_channel` /
-//! `NativeSshTransport`）接上 rinf 信号，并把远端字节喂进
-//! `DefaultTerminalEngine` → `render` → run 压缩 → `FrameUpdate`。
+//! 会话：每条 SSH 会话一个任务。连接由 [`crate::connect`] 建立；连上后把远端字节
+//! 喂进 `DefaultTerminalEngine` → `render` → run 压缩 → `FrameUpdate`，并把 Dart 的
+//! 输入、鼠标、选区、粘贴转给引擎与远端。
 //!
-//! 单任务拥有 transport（它的方法都要 `&mut self`），用 `select!` 同时听
-//! 远端事件与 Dart 命令——这是上游 actor 的形状，M1 用裸 tokio 任务就够了。
+//! 单任务拥有 transport（它的方法都要 `&mut self`），用 `select!` 同时听远端事件与
+//! Dart 命令——这是上游 actor 的形状。会话类信号都带 `session_id`，[`supervisor`]
+//! 按它把请求分给对应的会话任务。
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rinf::{DartSignal, RustSignal, RustSignalBinary, debug_print};
@@ -14,21 +16,23 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::{Instant, sleep_until};
 
 use rshell_m0::rshell_core::{
-    AuthenticationKind, CellPosition, ConnectionProfile, HostKeyDecision, InteractionRequest,
-    InteractionResponse, KeyCode, KeyModifiers, MouseButton, MouseEventKind, RenderFrame,
-    ResolvedTerminalProfile, SelectionRange, TerminalInput, TerminalMouseEvent, TerminalOverrides,
-    TerminalSettingsV1, TerminalSize, TransportKind, Viewport,
+    CellPosition, KeyCode, KeyModifiers, MouseButton, MouseEventKind, RenderFrame, SelectionRange,
+    TerminalInput, TerminalMouseEvent, TerminalSize, Viewport,
 };
 use rshell_m0::rshell_session::{
-    AuthPlan, DefaultTerminalEngine, KnownHostsVerifier, NativeSshTransport, SessionTransport,
-    TerminalEngine, TransportEvent, TransportRequest, interaction_channel,
+    DefaultTerminalEngine, SessionTransport, TerminalEngine, TransportEvent,
 };
 
+use crate::app::AppContext;
+use crate::connect::{self, Abort, Channels, Connected};
 use crate::frame_codec::pack_runs;
+use crate::local_network;
+use crate::settings;
+use crate::signals::interaction::InteractionReply;
 use crate::signals::{
-    ClipboardText, ConnectRequest, CopyRequest, DisconnectRequest, FrameAck, FrameUpdate,
-    InputRequest, MouseRequest, PasteRequest, PerfStats, ResizeRequest, SelectionRequest,
-    SelectionState, SessionState, SessionStatus,
+    ClipboardText, ConnectRequest, CopyRequest, DisconnectRequest, FailureKind, FrameAck,
+    FrameUpdate, InputRequest, MouseRequest, PasteRequest, PerfStats, ResizeRequest,
+    SelectionRequest, SelectionState, SessionState, SessionStatus,
 };
 
 const NO_CURSOR: i32 = -1;
@@ -36,7 +40,7 @@ const NO_CURSOR: i32 = -1;
 const MIN_COLS: u16 = 2;
 const MIN_ROWS: u16 = 2;
 
-enum SessionCommand {
+pub enum SessionCommand {
     Resize(TerminalSize),
     Disconnect,
     Input(TerminalInput),
@@ -47,9 +51,41 @@ enum SessionCommand {
     FrameAck(u32),
 }
 
-/// 常驻任务：接住 Dart 的请求，逐个转交给当前会话。
-/// 每个会话一个独立任务；新连接顶掉旧连接（单会话 UI）。
-pub async fn supervisor() {
+/// 一个会话任务的收件口。
+struct SessionHandle {
+    /// 区分同一 `session_id` 先后的两个任务（结束通知只清自己的登记）。
+    generation: u64,
+    commands: UnboundedSender<SessionCommand>,
+    replies: UnboundedSender<InteractionReply>,
+}
+
+/// 会话的结局。
+struct SessionEnd {
+    state: SessionState,
+    failure: FailureKind,
+    detail: String,
+}
+
+impl SessionEnd {
+    fn closed(detail: impl Into<String>) -> Self {
+        Self {
+            state: SessionState::Closed,
+            failure: FailureKind::None,
+            detail: detail.into(),
+        }
+    }
+
+    fn failed(failure: FailureKind, detail: impl Into<String>) -> Self {
+        Self {
+            state: SessionState::Failed,
+            failure,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// 常驻任务：接住 Dart 的会话类请求，按 `session_id` 转给对应的会话任务。
+pub async fn supervisor(context: Arc<AppContext>) {
     let connect_rx = ConnectRequest::get_dart_signal_receiver();
     let resize_rx = ResizeRequest::get_dart_signal_receiver();
     let disconnect_rx = DisconnectRequest::get_dart_signal_receiver();
@@ -59,21 +95,50 @@ pub async fn supervisor() {
     let copy_rx = CopyRequest::get_dart_signal_receiver();
     let ack_rx = FrameAck::get_dart_signal_receiver();
     let paste_rx = PasteRequest::get_dart_signal_receiver();
-    let mut session_tx: Option<UnboundedSender<SessionCommand>> = None;
+    let reply_rx = InteractionReply::get_dart_signal_receiver();
+    let (finished_tx, mut finished_rx) = unbounded_channel::<(u32, u64)>();
+    let mut sessions: HashMap<u32, SessionHandle> = HashMap::new();
+    let mut generations: u64 = 0;
+
+    let send =
+        |sessions: &HashMap<u32, SessionHandle>, session_id: u32, command: SessionCommand| {
+            if let Some(handle) = sessions.get(&session_id) {
+                let _ = handle.commands.send(command);
+            }
+        };
 
     loop {
         tokio::select! {
             pack = connect_rx.recv() => {
                 let Some(pack) = pack else { break };
-                debug_print!("[session] connect request: {}:{} ({}x{})",
-                    pack.message.host, pack.message.port,
-                    pack.message.cols, pack.message.rows);
-                if let Some(old) = session_tx.take() {
-                    let _ = old.send(SessionCommand::Disconnect);
+                let request = pack.message;
+                let session_id = request.session_id;
+                debug_print!("[session {session_id}] connect ({}x{})", request.cols, request.rows);
+                if let Some(old) = sessions.remove(&session_id) {
+                    let _ = old.commands.send(SessionCommand::Disconnect);
                 }
-                let (tx, rx) = unbounded_channel();
-                session_tx = Some(tx);
-                tokio::spawn(run_session(pack.message, rx));
+                generations += 1;
+                let generation = generations;
+                let (commands_tx, commands) = unbounded_channel();
+                let (replies_tx, replies) = unbounded_channel();
+                sessions.insert(session_id, SessionHandle {
+                    generation,
+                    commands: commands_tx,
+                    replies: replies_tx,
+                });
+                let context = context.clone();
+                let finished = finished_tx.clone();
+                tokio::spawn(async move {
+                    run_session(context, request, commands, replies).await;
+                    let _ = finished.send((session_id, generation));
+                });
+            }
+            finished = finished_rx.recv() => {
+                if let Some((session_id, generation)) = finished
+                    && sessions.get(&session_id).is_some_and(|handle| handle.generation == generation)
+                {
+                    sessions.remove(&session_id);
+                }
             }
             pack = resize_rx.recv() => {
                 let Some(pack) = pack else { break };
@@ -85,115 +150,62 @@ pub async fn supervisor() {
                     pixel_height: request.pixel_height,
                     dpi: request.dpi,
                 });
-                if let Some(tx) = &session_tx {
-                    let _ = tx.send(SessionCommand::Resize(size));
-                }
+                send(&sessions, request.session_id, SessionCommand::Resize(size));
             }
             pack = disconnect_rx.recv() => {
-                let Some(_pack) = pack else { break };
-                if let Some(tx) = session_tx.take() {
-                    let _ = tx.send(SessionCommand::Disconnect);
-                }
+                let Some(pack) = pack else { break };
+                send(&sessions, pack.message.session_id, SessionCommand::Disconnect);
             }
             pack = input_rx.recv() => {
                 let Some(pack) = pack else { break };
-                if let Some(tx) = &session_tx
-                    && let Some(input) = terminal_input_from_request(pack.message)
-                {
-                    let _ = tx.send(SessionCommand::Input(input));
+                let session_id = pack.message.session_id;
+                if let Some(input) = terminal_input_from_request(pack.message) {
+                    send(&sessions, session_id, SessionCommand::Input(input));
                 }
             }
             pack = mouse_rx.recv() => {
                 let Some(pack) = pack else { break };
-                if let Some(tx) = &session_tx
-                    && let Some(event) = mouse_event_from_request(pack.message)
-                {
-                    let _ = tx.send(SessionCommand::Mouse(event));
+                let session_id = pack.message.session_id;
+                if let Some(event) = mouse_event_from_request(pack.message) {
+                    send(&sessions, session_id, SessionCommand::Mouse(event));
                 }
             }
             pack = selection_rx.recv() => {
                 let Some(pack) = pack else { break };
-                if let Some(tx) = &session_tx {
-                    let _ = tx.send(SessionCommand::Selection(pack.message));
-                }
+                send(&sessions, pack.message.session_id, SessionCommand::Selection(pack.message));
             }
             pack = copy_rx.recv() => {
-                let Some(_pack) = pack else { break };
-                if let Some(tx) = &session_tx {
-                    let _ = tx.send(SessionCommand::Copy);
-                }
+                let Some(pack) = pack else { break };
+                send(&sessions, pack.message.session_id, SessionCommand::Copy);
             }
             pack = paste_rx.recv() => {
                 let Some(pack) = pack else { break };
-                if let Some(tx) = &session_tx {
-                    let _ = tx.send(SessionCommand::Paste(pack.message.text));
-                }
+                send(&sessions, pack.message.session_id, SessionCommand::Paste(pack.message.text));
             }
             pack = ack_rx.recv() => {
                 let Some(pack) = pack else { break };
-                if let Some(tx) = &session_tx {
-                    let _ = tx.send(SessionCommand::FrameAck(pack.message.seq));
+                send(&sessions, pack.message.session_id, SessionCommand::FrameAck(pack.message.seq));
+            }
+            pack = reply_rx.recv() => {
+                let Some(pack) = pack else { break };
+                if let Some(handle) = sessions.get(&pack.message.session_id) {
+                    let _ = handle.replies.send(pack.message);
                 }
             }
         }
     }
 }
 
-async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceiver<SessionCommand>) {
-    let target = format!("{}:{}", request.host, request.port);
-    send_status(SessionState::Connecting, target.clone());
-
-    let mut profile = ConnectionProfile::new("guosh", &request.host);
-    profile.host = request.host.clone();
-    profile.port = request.port;
-    profile.username = request.username.clone();
-    profile.transport = TransportKind::NativeSsh;
-    profile.authentication = AuthenticationKind::Password;
-    // 非空命令 = exec 模式：PTY 照开，但远端直接执行该命令而不是 shell
-    //（上游 configure_channel 的行为）。M1 帧率实测（top/htop）靠它。
-    profile.remote_command = if request.command.is_empty() {
-        None
-    } else {
-        Some(request.command.clone())
-    };
-
-    // 密码的所有权直接移进 SecretString（drop 时清零），请求里不留明文副本
-    // （PLAN.md §2.2：secret 不可序列化，协议层手写转换）。
-    let password = SecretString::from(std::mem::take(&mut request.password));
-    let auth = match AuthPlan::from_secret(&profile, Some(password)) {
-        Ok(auth) => auth,
-        Err(error) => {
-            send_status(SessionState::Failed, format!("AuthPlan: {error:?}"));
-            return;
-        }
-    };
-
-    let Some(known_hosts_path) = known_hosts_path() else {
-        send_status(
-            SessionState::Failed,
-            "no writable HOME directory".to_owned(),
-        );
-        return;
-    };
-    let verifier = KnownHostsVerifier::new(&known_hosts_path);
-    let (broker, mut interactions) = interaction_channel();
-
-    // M1 沿用 M0 的 TOFU：主机密钥一律接受并落盘（PLAN.md §8，M3 换成真实确认 UI）。
-    let responder = {
-        let broker = broker.clone();
-        tokio::spawn(async move {
-            while let Some((id, prompt)) = interactions.recv().await {
-                let response = match prompt {
-                    InteractionRequest::HostKey(_) => {
-                        InteractionResponse::HostKey(HostKeyDecision::AcceptAndStore)
-                    }
-                    _ => InteractionResponse::Cancel,
-                };
-                let _ = broker.respond(id, response);
-            }
-        })
-    };
-
+async fn run_session(
+    context: Arc<AppContext>,
+    mut request: ConnectRequest,
+    mut commands: UnboundedReceiver<SessionCommand>,
+    mut replies: UnboundedReceiver<InteractionReply>,
+) {
+    let session_id = request.session_id;
+    // 快速连接的密码：所有权直接移进 SecretString（drop 时清零），请求里不留明文副本
+    // （PLAN.md §2.2：secret 不可序列化，边界上手写转换）。
+    let quick_password = SecretString::from(std::mem::take(&mut request.password));
     // 首个 PTY 尺寸就是连接请求带来的几何（Dart 在布局完成后才发请求）。
     let size = clamped_size(TerminalSize {
         cols: request.cols,
@@ -203,36 +215,51 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
         dpi: request.dpi,
     });
 
-    let mut transport = match NativeSshTransport::new(profile, auth, verifier) {
-        Ok(transport) => transport,
-        Err(error) => {
-            send_status(
-                SessionState::Failed,
-                format!("NativeSshTransport: {error:?}"),
-            );
-            responder.abort();
+    let target = match connect::resolve_target(&context, &request).await {
+        Ok(target) => target,
+        Err(abort) => {
+            report_abort(session_id, abort, "", 0).await;
             return;
         }
     };
-    if let Err(error) = transport
-        .connect(&TransportRequest::new(size), broker)
-        .await
-    {
-        debug_print!("[session] connect failed: {error:?}");
-        send_status(SessionState::Failed, format!("connect: {error:?}"));
-        responder.abort();
-        return;
-    }
-    debug_print!("[session] connected, starting engine loop");
-    send_status(SessionState::Connected, target);
+    let described = target.describe();
+    let (host, port) = (target.profile.host.clone(), target.profile.port);
+    report(session_id, SessionState::Connecting, described.clone());
 
-    let term_profile: ResolvedTerminalProfile =
-        TerminalSettingsV1::default().resolve(&TerminalOverrides::default());
-    let mut engine = match DefaultTerminalEngine::new(&term_profile, size) {
+    // 连接期间收到的输入 / 尺寸变化：连上后先按原顺序处理。
+    let mut backlog = VecDeque::new();
+    let channels = Channels {
+        commands: &mut commands,
+        replies: &mut replies,
+        backlog: &mut backlog,
+    };
+    let established =
+        connect::establish(&context, session_id, target, quick_password, size, channels).await;
+    drop(replies);
+    let Connected {
+        mut transport,
+        profile,
+    } = match established {
+        Ok(connected) => connected,
+        Err(abort) => {
+            report_abort(session_id, abort, &host, port).await;
+            return;
+        }
+    };
+    debug_print!("[session {session_id}] connected");
+    report(session_id, SessionState::Connected, described);
+
+    let terminal = settings::terminal_settings(&context)
+        .await
+        .resolve(&profile.terminal_overrides);
+    let mut engine = match DefaultTerminalEngine::new(&terminal, size) {
         Ok(engine) => engine,
         Err(error) => {
-            send_status(SessionState::Failed, format!("engine: {error:?}"));
-            responder.abort();
+            report_end(
+                session_id,
+                SessionEnd::failed(FailureKind::Other, format!("engine: {error:?}")),
+            );
+            let _ = transport.shutdown().await;
             return;
         }
     };
@@ -248,166 +275,219 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
     // 自己维护一套坐标。
     let mut selection: Option<SelectionRange> = None;
 
-    // 连接建立即送第一帧（欢迎横幅可能已经进了引擎）。
-    if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
-        send_status(SessionState::Failed, detail);
-    }
-    send_selection_state(None);
+    let end = 'session: {
+        // 连接建立即送第一帧（欢迎横幅可能已经进了引擎）。
+        if let Err(detail) = present(
+            session_id,
+            &mut engine,
+            viewport,
+            selection,
+            &mut stats,
+            &mut pacer,
+        ) {
+            break 'session SessionEnd::failed(FailureKind::Other, detail);
+        }
+        send_selection_state(session_id, None);
 
-    let (end_state, end_detail) = loop {
-        let frame_deadline = pacer.deadline();
-        tokio::select! {
-            event = transport.next_event() => match event {
-                Ok(TransportEvent::Output(bytes)) => {
-                    match engine.advance(&bytes) {
-                        Ok(delta) => {
-                            // 引擎对远端查询的应答（DA / 光标位置报告…）必须回写，
-                            // 否则对端会一直等（m0 探针忽略它只是因为探针不需要应答）。
-                            if !delta.outbound.is_empty() {
-                                let _ = transport.write(&delta.outbound).await;
-                            }
-                            if delta.dirty
-                                && pacer.mark_dirty(Instant::now())
-                                && let Err(detail) =
-                                    present(&mut engine, viewport, selection, &mut stats, &mut pacer)
-                            {
-                                break (SessionState::Failed, detail);
-                            }
-                        }
-                        Err(error) => {
-                            break (SessionState::Failed, format!("advance: {error:?}"));
-                        }
-                    }
-                }
-                Ok(TransportEvent::Failure(failure)) => {
-                    break (SessionState::Failed, format!("session: {failure:?}"));
-                }
-                Ok(TransportEvent::Eof) => {
-                    break (SessionState::Closed, "eof".to_owned());
-                }
-                Ok(TransportEvent::Exit(status)) => {
-                    break (
-                        SessionState::Closed,
-                        format!("exit code={:?} success={}", status.code, status.success),
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    break (SessionState::Failed, format!("transport: {error:?}"));
-                }
-            },
-            // 合帧：高输出期间攒下的内容到点一次性画出。
-            () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
-                if pacer.ready_for_pending(Instant::now())
-                    && let Err(detail) =
-                        present(&mut engine, viewport, selection, &mut stats, &mut pacer)
-                {
-                    break (SessionState::Failed, detail);
-                }
-            }
-            command = commands.recv() => match command {
-                Some(SessionCommand::Resize(new_size)) => {
-                    if let Err(error) = engine.resize(new_size) {
-                        break (SessionState::Failed, format!("engine resize: {error:?}"));
-                    }
-                    viewport.rows = new_size.rows;
-                    if let Err(error) = transport.resize(new_size).await {
-                        // window-change 失败不立刻判死；远端布局暂旧，后续 resize 可再试。
-                        rinf::debug_print!("window-change failed: {error:?}");
-                    }
-                    if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
-                        break (SessionState::Failed, detail);
-                    }
-                }
-                Some(SessionCommand::Input(input)) => {
-                    // M2 输入闭环：键编码（ETX/Kitty/CSI-u）在引擎里，
-                    // 这里只负责把编码结果写进 transport。
-                    match engine.encode_input(input) {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            if let Err(error) = transport.write(&bytes).await {
-                                break (
-                                    SessionState::Failed,
-                                    format!("input write: {error:?}"),
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            break (SessionState::Failed, format!("encode_input: {error:?}"));
-                        }
-                    }
-                }
-                Some(SessionCommand::Mouse(event)) => {
-                    // 远端没开对应的鼠标上报（shell 等）时 encode 返回 Err——
-                    // 远端不要这类事件，静默忽略（M2a）。
-                    if mouse_motion.admit(&event) {
-                        match engine.encode_mouse(event) {
-                            Ok(bytes) if !bytes.is_empty() => {
-                                if let Err(error) = transport.write(&bytes).await {
-                                    break (
-                                        SessionState::Failed,
-                                        format!("mouse write: {error:?}"),
-                                    );
+        loop {
+            let frame_deadline = pacer.deadline();
+            tokio::select! {
+                event = transport.next_event() => match event {
+                    Ok(TransportEvent::Output(bytes)) => {
+                        match engine.advance(&bytes) {
+                            Ok(delta) => {
+                                // 引擎对远端查询的应答（DA / 光标位置报告…）必须回写，
+                                // 否则对端会一直等（m0 探针忽略它只是因为探针不需要应答）。
+                                if !delta.outbound.is_empty() {
+                                    let _ = transport.write(&delta.outbound).await;
+                                }
+                                if delta.dirty
+                                    && pacer.mark_dirty(Instant::now())
+                                    && let Err(detail) =
+                                        present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer)
+                                {
+                                    break SessionEnd::failed(FailureKind::Other, detail);
                                 }
                             }
-                            Ok(_) | Err(_) => {}
+                            Err(error) => {
+                                break SessionEnd::failed(FailureKind::Other, format!("advance: {error:?}"));
+                            }
                         }
                     }
-                }
-                Some(SessionCommand::Selection(request)) => {
-                    // 选区变化：更新引擎持有的选区 → 重渲染发帧（高亮跟着
-                    // 内容走）→ 把引擎的选区原样回显（Dart 用它对耳朵/气泡定位）。
-                    selection = selection_range_from_request(request);
-                    if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
-                        break (SessionState::Failed, detail);
+                    Ok(TransportEvent::Failure(failure)) => {
+                        break SessionEnd::failed(connect::failure_kind(failure.failure()), format!("session: {failure:?}"));
                     }
-                    send_selection_state(selection);
-                }
-                Some(SessionCommand::Copy) => {
-                    // 取文在引擎里（跨行拼接、裁行尾空格都由它负责）。
-                    let text = match selection {
-                        Some(range) => engine.selected_text(range).unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    ClipboardText { text }.send_signal_to_dart();
-                }
-                Some(SessionCommand::Paste(text)) => {
-                    let bytes = paste_bytes(&text, engine.display_modes().bracketed_paste);
-                    if !bytes.is_empty()
-                        && let Err(error) = transport.write(&bytes).await
-                    {
-                        break (SessionState::Failed, format!("paste write: {error:?}"));
+                    Ok(TransportEvent::Eof) => {
+                        break SessionEnd::closed("eof");
                     }
-                }
-                Some(SessionCommand::FrameAck(seq)) => {
-                    // 上一帧 Dart 已处理完：攒着的变化现在可以画了（节拍允许的话）。
-                    pacer.acked(seq);
+                    Ok(TransportEvent::Exit(status)) => {
+                        break SessionEnd::closed(format!(
+                            "exit code={:?} success={}",
+                            status.code, status.success
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        break SessionEnd::failed(connect::failure_kind(error.failure()), format!("transport: {error:?}"));
+                    }
+                },
+                // 合帧：高输出期间攒下的内容到点一次性画出。
+                () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
                     if pacer.ready_for_pending(Instant::now())
                         && let Err(detail) =
-                            present(&mut engine, viewport, selection, &mut stats, &mut pacer)
+                            present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer)
                     {
-                        break (SessionState::Failed, detail);
+                        break SessionEnd::failed(FailureKind::Other, detail);
                     }
                 }
-                Some(SessionCommand::Disconnect) | None => {
-                    break (SessionState::Closed, "disconnect".to_owned());
-                }
-            },
+                command = next_command(&mut backlog, &mut commands) => match command {
+                    Some(SessionCommand::Resize(new_size)) => {
+                        if let Err(error) = engine.resize(new_size) {
+                            break SessionEnd::failed(FailureKind::Other, format!("engine resize: {error:?}"));
+                        }
+                        viewport.rows = new_size.rows;
+                        if let Err(error) = transport.resize(new_size).await {
+                            // window-change 失败不立刻判死；远端布局暂旧，后续 resize 可再试。
+                            rinf::debug_print!("window-change failed: {error:?}");
+                        }
+                        if let Err(detail) = present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer) {
+                            break SessionEnd::failed(FailureKind::Other, detail);
+                        }
+                    }
+                    Some(SessionCommand::Input(input)) => {
+                        // M2 输入闭环：键编码（ETX/Kitty/CSI-u）在引擎里，
+                        // 这里只负责把编码结果写进 transport。
+                        match engine.encode_input(input) {
+                            Ok(bytes) if !bytes.is_empty() => {
+                                if let Err(error) = transport.write(&bytes).await {
+                                    break SessionEnd::failed(FailureKind::Other, format!("input write: {error:?}"));
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                break SessionEnd::failed(FailureKind::Other, format!("encode_input: {error:?}"));
+                            }
+                        }
+                    }
+                    Some(SessionCommand::Mouse(event)) => {
+                        // 远端没开对应的鼠标上报（shell 等）时 encode 返回 Err——
+                        // 远端不要这类事件，静默忽略（M2a）。
+                        if mouse_motion.admit(&event) {
+                            match engine.encode_mouse(event) {
+                                Ok(bytes) if !bytes.is_empty() => {
+                                    if let Err(error) = transport.write(&bytes).await {
+                                        break SessionEnd::failed(FailureKind::Other, format!("mouse write: {error:?}"));
+                                    }
+                                }
+                                Ok(_) | Err(_) => {}
+                            }
+                        }
+                    }
+                    Some(SessionCommand::Selection(request)) => {
+                        // 选区变化：更新引擎持有的选区 → 重渲染发帧（高亮跟着
+                        // 内容走）→ 把引擎的选区原样回显（Dart 用它对耳朵/气泡定位）。
+                        selection = selection_range_from_request(request);
+                        if let Err(detail) = present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer) {
+                            break SessionEnd::failed(FailureKind::Other, detail);
+                        }
+                        send_selection_state(session_id, selection);
+                    }
+                    Some(SessionCommand::Copy) => {
+                        // 取文在引擎里（跨行拼接、裁行尾空格都由它负责）。
+                        let text = match selection {
+                            Some(range) => engine.selected_text(range).unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        ClipboardText { session_id, text }.send_signal_to_dart();
+                    }
+                    Some(SessionCommand::Paste(text)) => {
+                        let bytes = paste_bytes(&text, engine.display_modes().bracketed_paste);
+                        if !bytes.is_empty()
+                            && let Err(error) = transport.write(&bytes).await
+                        {
+                            break SessionEnd::failed(FailureKind::Other, format!("paste write: {error:?}"));
+                        }
+                    }
+                    Some(SessionCommand::FrameAck(seq)) => {
+                        // 上一帧 Dart 已处理完：攒着的变化现在可以画了（节拍允许的话）。
+                        pacer.acked(seq);
+                        if pacer.ready_for_pending(Instant::now())
+                            && let Err(detail) =
+                                present(session_id, &mut engine, viewport, selection, &mut stats, &mut pacer)
+                        {
+                            break SessionEnd::failed(FailureKind::Other, detail);
+                        }
+                    }
+                    Some(SessionCommand::Disconnect) | None => {
+                        break SessionEnd::closed("disconnect");
+                    }
+                },
+            }
         }
     };
 
     // 会话结束：先把合帧里攒着的变化画出来（最后一屏输出不能丢），再报状态。
     if pacer.has_pending() {
-        let _ = present(&mut engine, viewport, selection, &mut stats, &mut pacer);
+        let _ = present(
+            session_id,
+            &mut engine,
+            viewport,
+            selection,
+            &mut stats,
+            &mut pacer,
+        );
     }
-    send_status(end_state, end_detail);
+    report_end(session_id, end);
 
     let _ = transport.shutdown().await;
-    responder.abort();
 }
 
-fn send_status(state: SessionState, detail: String) {
-    SessionStatus { state, detail }.send_signal_to_dart();
+/// 下一条命令：连接期间攒下的先出。
+async fn next_command(
+    backlog: &mut VecDeque<SessionCommand>,
+    commands: &mut UnboundedReceiver<SessionCommand>,
+) -> Option<SessionCommand> {
+    match backlog.pop_front() {
+        Some(command) => Some(command),
+        None => commands.recv().await,
+    }
+}
+
+fn report(session_id: u32, state: SessionState, detail: String) {
+    SessionStatus {
+        session_id,
+        state,
+        failure: FailureKind::None,
+        detail,
+        local_network_settings_url: String::new(),
+    }
+    .send_signal_to_dart();
+}
+
+fn report_end(session_id: u32, end: SessionEnd) {
+    SessionStatus {
+        session_id,
+        state: end.state,
+        failure: end.failure,
+        detail: end.detail,
+        local_network_settings_url: String::new(),
+    }
+    .send_signal_to_dart();
+}
+
+/// 连接没建成：取消报 Closed；失败时顺带判断是否可能是本地网络权限。
+async fn report_abort(session_id: u32, abort: Abort, host: &str, port: u16) {
+    match abort {
+        Abort::Cancelled => report(session_id, SessionState::Cancelled, String::new()),
+        Abort::Failed { failure, detail } => SessionStatus {
+            session_id,
+            state: SessionState::Failed,
+            failure,
+            detail,
+            local_network_settings_url: local_network::settings_url(host, port, failure).await,
+        }
+        .send_signal_to_dart(),
+    }
 }
 
 /// 鼠标移动只在跨格（或换了按住的键）时上报——与 xterm 一致；指针在同一格内
@@ -482,6 +562,7 @@ fn clamped_size(size: TerminalSize) -> TerminalSize {
 
 /// 渲染当前视口并发帧（附带 5 秒一次的性能汇总）。
 fn present<E: TerminalEngine>(
+    session_id: u32,
     engine: &mut E,
     viewport: Viewport,
     selection: Option<SelectionRange>,
@@ -494,9 +575,9 @@ fn present<E: TerminalEngine>(
         .render(viewport, selection)
         .map_err(|error| format!("render: {error:?}"))?;
     let render_us = micros_since(render_start);
-    let seq = send_frame(&frame, stats, render_us);
+    let seq = send_frame(session_id, &frame, stats, render_us);
     pacer.sent(seq, Instant::now());
-    if let Some(perf) = stats.maybe_report() {
+    if let Some(perf) = stats.maybe_report(session_id) {
         perf.send_signal_to_dart();
     }
     Ok(())
@@ -592,9 +673,10 @@ impl FramePacer {
 
 /// 把引擎当前持有的选区回显给 Dart。保留 anchor/focus 的原始角色不排序
 /// （`SelectionRange` 渲染/取文时才 `ordered`），拖耳朵越过对端时角色才不会乱。
-fn send_selection_state(selection: Option<SelectionRange>) {
+fn send_selection_state(session_id: u32, selection: Option<SelectionRange>) {
     let state = match selection {
         Some(range) => SelectionState {
+            session_id,
             has_selection: true,
             anchor_row: range.start.stable_row,
             anchor_col: range.start.column,
@@ -602,6 +684,7 @@ fn send_selection_state(selection: Option<SelectionRange>) {
             focus_col: range.end.column,
         },
         None => SelectionState {
+            session_id,
             has_selection: false,
             anchor_row: 0,
             anchor_col: 0,
@@ -764,13 +847,14 @@ impl PerfWindow {
     }
 
     /// 满 5 秒发一条汇总并重开窗口。
-    fn maybe_report(&mut self) -> Option<PerfStats> {
+    fn maybe_report(&mut self, session_id: u32) -> Option<PerfStats> {
         let elapsed = self.window_start.elapsed();
         if elapsed < std::time::Duration::from_secs(5) || self.frames == 0 {
             return None;
         }
         let frames = self.frames;
         let stats = PerfStats {
+            session_id,
             frames,
             window_ms: u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX),
             render_us_avg: (self.render_us_total / u64::from(frames)) as u32,
@@ -792,7 +876,7 @@ fn micros_since(start: std::time::Instant) -> u32 {
 }
 
 /// 发出一帧，返回它的帧序号。
-fn send_frame(frame: &RenderFrame, stats: &mut PerfWindow, render_us: u32) -> u32 {
+fn send_frame(session_id: u32, frame: &RenderFrame, stats: &mut PerfWindow, render_us: u32) -> u32 {
     let (cursor_col, cursor_row) = match &frame.cursor {
         Some(cursor) => {
             let row = cursor.position.stable_row - frame.viewport_top;
@@ -810,6 +894,7 @@ fn send_frame(frame: &RenderFrame, stats: &mut PerfWindow, render_us: u32) -> u3
     let pack_us = micros_since(pack_start);
     let seq = stats.record(render_us, pack_us, binary.len());
     FrameUpdate {
+        session_id,
         cols: frame.size.cols,
         rows: frame.size.rows,
         seq,
@@ -820,44 +905,6 @@ fn send_frame(frame: &RenderFrame, stats: &mut PerfWindow, render_us: u32) -> u3
     }
     .send_signal_to_dart(binary);
     seq
-}
-
-/// known_hosts 落在 App 沙箱内（iOS 的 `HOME` 就是容器主目录）。
-/// 第二次连接不再触发主机密钥交互——M0b 验收的同一条性质。
-///
-/// ⚠ 实机实测（M2，iPhone）：真机上 `HOME` 不一定指向可写的容器目录
-/// （探针报 `Storage { step: CreateParent }`），所以不能用「HOME 存在」
-/// 想当然——以**实际创建目录成功**为准，失败回退沙箱 `tmp`（TMPDIR 由
-/// 系统注入，必在容器内）。tmp 可能被系统清理 → 重新 TOFU（M2 是自动
-/// 接受，无 UX 影响）；目录决策随 M3 的 Keychain/设置一起重定。
-fn known_hosts_path() -> Option<String> {
-    let candidates = [
-        std::env::var("HOME")
-            .ok()
-            .map(|home| std::path::PathBuf::from(home).join(".guosh")),
-        Some(std::env::temp_dir().join("guosh")),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        if std::fs::create_dir_all(&candidate).is_ok() {
-            let path = candidate.join("known_hosts");
-            // 早期探针 bug 曾把这个文件路径当目录建出来（create_dir_all 当父目录
-            // 处理）。is_known 见「路径存在但不是文件」就报 Verification → 上游
-            // 折叠成 Platform，之后每次连接都死在这。路径上只可能是那次 bug 留下
-            // 的目录，安全移除；若是文件则不动。
-            if path.is_dir() {
-                match std::fs::remove_dir_all(&path) {
-                    Ok(()) => rinf::debug_print!(
-                        "[session] removed stale known_hosts directory (legacy probe leftover)"
-                    ),
-                    Err(error) => rinf::debug_print!(
-                        "[session] stale known_hosts directory removal failed: {error:?}"
-                    ),
-                }
-            }
-            return Some(path.display().to_string());
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -877,6 +924,7 @@ mod tests {
 
     fn input(key: &str, control: bool) -> Option<TerminalInput> {
         terminal_input_from_request(InputRequest {
+            session_id: 1,
             text: String::new(),
             key: key.to_owned(),
             shift: false,
@@ -1020,6 +1068,7 @@ mod tests {
     #[test]
     fn text_wins_and_carries_no_key() {
         let request = InputRequest {
+            session_id: 1,
             text: "你好".to_owned(),
             key: String::new(),
             shift: false,
@@ -1043,6 +1092,7 @@ mod tests {
 
     fn mouse(kind: &str, button: &str, col: u16, row: u16) -> MouseRequest {
         MouseRequest {
+            session_id: 1,
             kind: kind.to_owned(),
             button: button.to_owned(),
             col,

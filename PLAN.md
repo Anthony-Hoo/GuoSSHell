@@ -406,7 +406,7 @@ synchronizable 条目。（iOS 硬规则：`kSecClassKey` 不参与 iCloud Keych
 iCloud 钥匙串同步开关（默认关，开关前确认，私钥与口令整体搬迁）。
 决定见 §6.1「M3a 私钥决定」。
 
-### M3b — 硬件密钥：OpenPGP 卡 Ed25519 —— 已立项（2026-09-23 拍板）
+### M3b — 硬件密钥：OpenPGP 卡 Ed25519 —— ✅ 已完成（2026-09-26，模拟器 + 模拟卡验收；真卡与 NFC 待真机）
 
 **验证先行（不阻塞，不等 M3/M3a）**：
 
@@ -430,12 +430,13 @@ iCloud 钥匙串同步开关（默认关，开关前确认，私钥与口令整�
   直接可用，无 DigestInfo / mpint 转换
 - ⚠ russh `Signer` 返回 `to_sign 原文 + string(算法名) + string(签名)`，
   **不是裸签名**（russh 源码 `client/encrypted.rs`；最容易做错）
-- 上游 rsHell **无 Signer 注入点**（`AuthPlan` 只有 Password/PublicKey/Agent/
-  KeyboardInteractive）→ 两条路：① **agent 伪装**：进程内 `ssh-agent-lib` +
-  `SSH_AUTH_SOCK` 走上游现成 Agent 认证（零上游改动，**先验证这条**）；
-  ② fork 上游加卡认证变体（§9.2.3，①走不通才做）
-- PIN 交互：复用 `InteractionRequest`（PrivateKeyPassphrase 变体），或 fork 时
-  加通用 PIN 变体
+- 上游 rsHell 原本**无 Signer 注入点**（`AuthPlan` 只有 Password/PublicKey/Agent/
+  KeyboardInteractive）→ rsHell 补丁 P5 加 `ExternalSigner` 与 `AuthPlan::Signer`，
+  卡签名器实现它。不走进程内 agent + `SSH_AUTH_SOCK`：上游 Agent 认证从进程环境变量
+  找 agent，而进程已是多线程，设环境变量不安全；agent 协议里也没有会话，PIN 提问
+  对应不到发起连接的会话
+- PIN 交互：hub 自己的 `InteractionPrompt`（`CardPin`，带剩余次数），经会话的连接
+  循环一问一答
 
 **iOS 传输层**（复用 `card-backend` trait 自写 iOS 后端——iOS SDK 无
 PCSC.framework，已确认）：
@@ -454,6 +455,12 @@ PCSC.framework，已确认）：
 NFC 任一通道打通即可。
 
 **范围排除**：RSA / ECDSA → M3c；WebAuthn / FIDO2 → M3d；PIV 不做。
+
+**交付**：「私钥」页可以添加 OpenPGP 卡——读出插着的卡（iOS 26 起也可经 NFC），登记认证槽的
+Ed25519 公钥（复制到服务器、改名、删除登记，与钥匙串私钥同一套管理）；连接选它即用卡登录：
+卡在不在、密钥是否就是登记的那把先查，再问 PIN（显示剩余次数，错了重问，可记住到退出 App），
+需要时提示按卡上的按键；卡不在、密钥不符、PIN 锁定、没按键等失败各有提示。
+决定见 §6.1「M3b OpenPGP 卡决定」。
 
 ### M3c — OpenPGP 其他算法（RSA / ECDSA）—— ⏸ 不急着做
 
@@ -579,6 +586,16 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 `HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
 平台不答复的键（死键等）150 ms 超时兜底。
 
+**M3b OpenPGP 卡决定（2026-09-26）：**
+卡上认证槽签名（`VERIFY P2=82` + INTERNAL AUTHENTICATE，Ed25519 直接签 SSH 数据），APDU 层用
+openpgp-card，卡来源抽象为 `CardReader`：iOS / macOS 用 CryptoTokenKit（objc2 绑定，纯 Rust，
+不写 Swift；读卡器插槽，iOS 26 起的 NFC 卡槽），debug 构建设 `GUOSH_VIRTUAL_CARD` 时另有一张
+软件模拟卡（只实现认证用到的 APDU，release 里没有）。签名经上游 `ExternalSigner`（补丁 P5）接入：
+服务器接受公钥后才动卡——先确认卡在、公钥与登记的一致、PIN 剩余次数，再问 PIN、让卡签名；
+卡不在而设备能用 NFC 时先问 PIN 再弹 NFC 界面（系统界面会盖住 App）。PIN 错了立即丢掉记住的
+PIN、带剩余次数重问；PIN 只在内存里记住（用户勾选时，到退出 App）。卡的登记与钥匙串私钥用同一种
+信封（有卡号、没有私钥原文），连接配置同样写 `keychain:<id>`。同一时刻只有一个操作在用卡。
+
 **M3a 私钥决定（2026-09-25）：**
 私钥整块存钥匙串的 generic password（service `guosshell.ssh-key`，account 是私钥 id），内容是
 JSON 信封：名称、私钥原文（可能加密）、OpenSSH 公钥、是否加密——同步到别的设备时信封完整；
@@ -699,7 +716,7 @@ shell）。数据目录由 Dart 用 path_provider 取 Application Support 交给
 2. **M3 的凭证 UI 形态**：已定——每次连接都读钥匙串，不在内存缓存（§6.1 M3 决定）。
    Face ID 保护（钥匙串条目的访问控制）留到需要时再加。
 3. **上游 fork 的边界。** 已经 fork（UPSTREAM.md 的 P1 bracketed paste、P2 密码可不存、
-   P3 主机密钥变更提示、P4 内存私钥认证）。还有两个已知的可能再改上游的需求，都不急：
+   P3 主机密钥变更提示、P4 内存私钥认证、P5 外部签名认证）。还有两个已知的可能再改上游的需求，都不急：
    - **把 iOS 不可用的三个传输（`local` / `pty` / `system_ssh`）从编译图里摘掉**，
      而不是靠链接器裁符号。现在靠 `-Wl,-dead_strip` 能压到 0（§3.2），所以**不急**；
      但如果哪天想做 App Store 的静态审查友好度，或者要减 `.a` 的 65 MB，就得 fork 加 feature gate。
@@ -853,6 +870,9 @@ cargo build --release --lib --target aarch64-apple-ios-sim
 ```
 
 ```bash
+# 模拟器里用模拟 OpenPGP 卡（debug 构建）：带环境变量启动 App
+SIMCTL_CHILD_GUOSH_VIRTUAL_CARD=1 xcrun simctl launch booted com.example.guoshShell
+
 # 本地验收 SSH 服务器（Docker；probe / probe，127.0.0.1:2223，自带 vim / htop / m1bar）
 ./scripts/sshd-test.sh up
 ./scripts/sshd-test.sh rekey      # 重新生成主机密钥（验收密钥变更告警）
@@ -972,7 +992,16 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
 - [x] 管理：复制公钥与原文件一致；改名；删除，有连接在用时说明并拒绝
 - [x] 同步开关：开启确认后私钥与口令搬进 iCloud 钥匙串且照常连接，关闭后搬回本机
 - [ ] 真机：双设备 iCloud 钥匙串同步（待签名构建与两台设备）
-- [ ] M3b / M3c / M3d / M4 / M5
+
+**M3b —— OpenPGP 卡 Ed25519 —— ✅ 已完成（2026-09-26，模拟器 + 模拟卡验收）**
+
+- [x] rsHell 补丁 P5（`ExternalSigner`）：外部签名器连测试服务器认证通过；签名器失败即认证失败
+- [x] 卡操作单测（模拟卡）：读卡、PIN 计数与锁定、签名可验、换卡 / 换密钥被拒、PIN 记住与取消
+- [x] 模拟器（`GUOSH_VIRTUAL_CARD`）：添加卡、复制公钥授权到容器；连接时 PIN 错一次提示剩 2 次、
+      输对后提示按键、容器按卡的 Ed25519 公钥放行；不带模拟卡启动时提示没有找到卡
+- [ ] 真机：CanoKey 经 USB-C 直插 iPhone 登录容器；iOS 26 设备经 NFC 读卡
+      （followup「OpenPGP卡NFC读卡待真机」）；macOS 随 M5
+- [ ] M3c / M3d / M4 / M5
 
 **关于提交**
 

@@ -29,6 +29,10 @@ uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 # 私钥原文用完即清零。
 zeroize = "1"
+# OpenPGP 卡（M3b）：APDU 层与它的卡后端 trait；卡签名经上游 ExternalSigner 接入认证。
+openpgp-card = "0.7.0"
+card-backend = "0.2.0"
+async-trait = "0.1"
 
 # 业务内核唯一入口：`rshell-m0`（根 workspace 成员，path 依赖）。
 # 它再导出 rshell-core / rshell-session，并把上游 git 依赖的 rev pin 在
@@ -42,6 +46,11 @@ rshell-m0 = { path = "../../rust" }
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
 keyring-core = "1.0.0"
 apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
+# OpenPGP 卡经 CryptoTokenKit 访问（iOS 没有 PC/SC）。
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSEnumerator", "NSError", "NSString"] }
+objc2-crypto-token-kit = { version = "0.3.2", default-features = false, features = ["std", "TKSmartCard", "TKSmartCardSlotNFCSession", "block2", "bitflags"] }
+block2 = "0.6"
 
 # Uncomment below to target the web.
 # tokio_with_wasm = { version = "0.8.5", features = ["rt", "macros", "time"] }

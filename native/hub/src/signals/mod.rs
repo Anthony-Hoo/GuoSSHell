@@ -181,7 +181,29 @@ pub enum FailureKind {
     Timeout,
     /// 钥匙串读写失败。
     Keychain,
+    /// OpenPGP 卡：没有找到这张卡（没插上、没靠近）。
+    CardNotFound,
+    /// OpenPGP 卡：认证槽的密钥与登记时的不同。
+    CardKeyMismatch,
+    /// OpenPGP 卡：认证槽没有密钥，或算法暂不支持。
+    CardUnsupported,
+    /// OpenPGP 卡：PIN 已锁定。
+    CardPinBlocked,
+    /// OpenPGP 卡：要在卡上按键确认，但没有等到。
+    CardTouchTimeout,
+    /// OpenPGP 卡：其他读卡错误。
+    CardError,
     Other,
+}
+
+/// 连接中的提示。
+#[derive(Serialize, SignalPiece, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectHint {
+    None,
+    /// 请按 OpenPGP 卡上的按键确认。
+    TouchCard,
+    /// 请把 OpenPGP 卡靠近设备（NFC）。
+    TapCard,
 }
 
 #[derive(Serialize, RustSignal)]
@@ -194,6 +216,8 @@ pub struct SessionStatus {
     /// 失败可能源于系统的本地网络权限（目标在局域网，失败是网络或超时类）。
     /// 非空时是打开系统设置对应页面的 URL（平台相关，由 Rust 给出）。
     pub local_network_settings_url: String,
+    /// Connecting：要用户在设备之外做的事（按卡上的按键等）。
+    pub hint: ConnectHint,
 }
 
 /// 一帧终端画面。二进制部分是 [`crate::frame_codec::pack_runs`] 的产物，

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../bindings/bindings.dart';
+import '../keys/card_scan_page.dart';
 import '../keys/key_import_page.dart';
 import '../terminal/session_target.dart';
 import '../terminal/terminal_page.dart';
@@ -60,6 +61,13 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
   Future<void> _importKey() async {
     final id = await Navigator.of(context).push<String>(MaterialPageRoute(
       builder: (_) => const KeyImportPage(),
+    ));
+    if (id != null && mounted) setState(() => _keyId = id);
+  }
+
+  Future<void> _addCard() async {
+    final id = await Navigator.of(context).push<String>(MaterialPageRoute(
+      builder: (_) => const CardScanPage(),
     ));
     if (id != null && mounted) setState(() => _keyId = id);
   }
@@ -223,7 +231,9 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
                     DropdownMenuItem(
                       value: key.id,
                       child: Text(
-                        '${key.name}（${key.algorithm}）',
+                        key.cardIdent.isEmpty
+                            ? '${key.name}（${key.algorithm}）'
+                            : '${key.name}（OpenPGP 卡）',
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
@@ -232,10 +242,20 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
               ),
               Align(
                 alignment: Alignment.centerRight,
-                child: TextButton.icon(
-                  onPressed: _importKey,
-                  icon: const Icon(Icons.add),
-                  label: const Text('导入私钥…'),
+                child: Wrap(
+                  alignment: WrapAlignment.end,
+                  children: [
+                    TextButton.icon(
+                      onPressed: _addCard,
+                      icon: const Icon(Icons.credit_card),
+                      label: const Text('添加 OpenPGP 卡…'),
+                    ),
+                    TextButton.icon(
+                      onPressed: _importKey,
+                      icon: const Icon(Icons.add),
+                      label: const Text('导入私钥…'),
+                    ),
+                  ],
                 ),
               ),
             ] else ...[

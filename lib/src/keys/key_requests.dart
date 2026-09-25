@@ -38,6 +38,20 @@ Future<KeyResult> deleteKey(String id) =>
 Future<KeyResult> forgetPassphrase(String id) => _request(
     (requestId) => ForgetPassphrase(requestId: requestId, id: id).sendSignalToRust());
 
+Future<KeyResult> addCardKey(String ident, String name) => _request((requestId) =>
+    AddCardKey(requestId: requestId, ident: ident, name: name).sendSignalToRust());
+
+/// 读卡。NFC 读卡要等用户把卡靠近，超时放宽。
+Future<CardScanResult> scanCards({bool nfc = false}) {
+  final requestId = _nextRequestId++;
+  final result = CardScanResult.rustSignalStream
+      .map((pack) => pack.message)
+      .firstWhere((result) => result.requestId == requestId)
+      .timeout(nfc ? const Duration(seconds: 90) : _timeout);
+  ScanCards(requestId: requestId, nfc: nfc).sendSignalToRust();
+  return result;
+}
+
 Future<KeyResult> setKeySync(bool enabled) => _request(
     (requestId) => SetKeySync(requestId: requestId, enabled: enabled).sendSignalToRust());
 
@@ -51,4 +65,6 @@ String keyErrorText(KeyError error) => switch (error) {
       KeyError.inUse => '还有连接在用这把私钥',
       KeyError.keychain => '钥匙串读写失败',
       KeyError.syncUnavailable => '无法写入 iCloud 钥匙串',
+      KeyError.cardNotFound => '没有找到 OpenPGP 卡',
+      KeyError.cardUnsupported => '这张卡的认证密钥暂不支持（目前只支持 Ed25519）',
     };

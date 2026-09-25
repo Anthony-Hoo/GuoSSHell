@@ -1,8 +1,8 @@
 //! 建立连接：连接配置（目录里的，或快速连接的临时目标）→ 认证材料 → 握手
 //! （含主机密钥确认）。
 //!
-//! 期间要用户回答的问题——密码、主机密钥确认、keyboard-interactive——发成
-//! `InteractionPrompt`，回答经会话的 `replies` 通道回来。用户在此期间的其他操作
+//! 期间要用户回答的问题——密码、私钥口令、OpenPGP 卡的 PIN、主机密钥确认、
+//! keyboard-interactive——发成 `InteractionPrompt`，回答经会话的 `replies` 通道回来。用户在此期间的其他操作
 //! （输入、改尺寸）存进 backlog，连上后按原顺序处理；Disconnect 立即中止连接。
 
 use std::collections::{HashMap, VecDeque};
@@ -18,14 +18,16 @@ use rshell_m0::rshell_session::{
     AuthPlan, InteractionBroker, KnownHostsVerifier, NativeSshTransport, SessionTransport,
     TransportRequest, interaction_channel,
 };
-use rshell_m0::russh::keys::PrivateKey;
+use rshell_m0::russh::keys::{PrivateKey, PublicKey};
 use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 
 use crate::app::AppContext;
+use crate::card::{CardFailure, CardRequest, CardSigner, PinQuestion};
 use crate::catalog;
-use crate::keys;
+use crate::keys::{self, StoredKey};
 use crate::session::SessionCommand;
 use crate::signals::interaction::{InteractionPrompt, InteractionReply, PromptField, PromptKind};
 use crate::signals::keys::KeyError;
@@ -140,7 +142,10 @@ pub async fn establish(
     mut channels: Channels<'_>,
 ) -> Result<Connected, Abort> {
     let mut prompts = PromptIds::default();
+    let described = target.describe();
     let Target { profile, saved } = target;
+    // OpenPGP 卡签名器与它要会话代问的事（PIN）。
+    let mut card: Option<(Arc<CardSigner>, UnboundedReceiver<CardRequest>)> = None;
 
     // 密码：目录里存了就从钥匙串读（每次连接读，不缓存——PLAN §9.2.2）；
     // 没存、读不到、或快速连接没带，就问用户。
@@ -174,9 +179,38 @@ pub async fn establish(
             AuthPlan::from_secret(&profile, Some(password))
         }
         AuthenticationKind::PublicKey => {
-            let key =
-                unlock_key(context, session_id, &mut prompts, &profile, &mut channels).await?;
-            AuthPlan::from_private_key(&profile, Arc::new(key))
+            let (id, stored) = load_key(context, &profile).await?;
+            match stored.card.clone() {
+                Some(ident) => {
+                    let public_key = PublicKey::from_openssh(&stored.public_key)
+                        .map_err(|_| Abort::failed(FailureKind::KeyNotFound, id))?;
+                    let (requests, receiver) = mpsc::unbounded_channel();
+                    let signer = Arc::new(CardSigner::new(
+                        context.cards.clone(),
+                        session_id,
+                        described,
+                        stored.name.clone(),
+                        ident,
+                        public_key.clone(),
+                        requests,
+                    ));
+                    card = Some((signer.clone(), receiver));
+                    AuthPlan::from_signer(&profile, public_key, signer)
+                }
+                None => {
+                    let key = unlock_key(
+                        context,
+                        session_id,
+                        &mut prompts,
+                        &profile,
+                        id,
+                        stored,
+                        &mut channels,
+                    )
+                    .await?;
+                    AuthPlan::from_private_key(&profile, Arc::new(key))
+                }
+            }
         }
         _ => AuthPlan::from_secret(&profile, None),
     }
@@ -194,10 +228,13 @@ pub async fn establish(
 
     let (broker, mut requests) = interaction_channel();
     let transport_request = TransportRequest::new(size);
+    let (card_signer, mut card_requests) = card.unzip();
     let result = {
         let connect = transport.connect(&transport_request, broker.clone());
         tokio::pin!(connect);
         let mut pending = HashMap::new();
+        let mut pending_pins: HashMap<u32, oneshot::Sender<Option<(SecretString, bool)>>> =
+            HashMap::new();
         loop {
             tokio::select! {
                 result = &mut connect => break result,
@@ -206,11 +243,22 @@ pub async fn establish(
                         forward_prompt(session_id, &profile, &broker, &mut prompts, &mut pending, id, request);
                     }
                 }
+                request = next_card_request(&mut card_requests) => match request {
+                    Some(CardRequest::Pin { question, reply }) => {
+                        let prompt_id = prompts.next();
+                        card_pin_prompt(session_id, prompt_id, &profile, question)
+                            .send_signal_to_dart();
+                        pending_pins.insert(prompt_id, reply);
+                    }
+                    None => card_requests = None,
+                },
                 reply = channels.replies.recv() => {
-                    if let Some(reply) = reply
-                        && let Some((id, kind)) = pending.remove(&reply.prompt_id)
-                    {
-                        let _ = broker.respond(id, broker_response(kind, reply));
+                    if let Some(reply) = reply {
+                        if let Some((id, kind)) = pending.remove(&reply.prompt_id) {
+                            let _ = broker.respond(id, broker_response(kind, reply));
+                        } else if let Some(answer) = pending_pins.remove(&reply.prompt_id) {
+                            let _ = answer.send(pin_answer(reply));
+                        }
                     }
                 }
                 command = channels.commands.recv() => channels.defer(command)?,
@@ -219,6 +267,10 @@ pub async fn establish(
     };
     if let Err(error) = result {
         debug_print!("[connect] {error:?}");
+        // 卡签名失败时认证失败只是表象，原因在签名器里。
+        if let Some(failure) = card_signer.as_ref().and_then(|signer| signer.failure()) {
+            return Err(card_abort(failure));
+        }
         return Err(Abort::failed(
             failure_kind(error.failure()),
             format!("connect: {error:?}"),
@@ -304,15 +356,11 @@ async fn ask_secret(
     }
 }
 
-/// 私钥认证：从钥匙串取出私钥；加密的先用存下的口令解开，解不开就问用户（口令错了
-/// 带 `retry` 再问）。勾选保存的口令在解开后存进私钥所在的存储。
-async fn unlock_key(
+/// 从钥匙串取出连接用的私钥（或 OpenPGP 卡的登记）。
+async fn load_key(
     context: &Arc<AppContext>,
-    session_id: u32,
-    prompts: &mut PromptIds,
     profile: &ConnectionProfile,
-    channels: &mut Channels<'_>,
-) -> Result<PrivateKey, Abort> {
+) -> Result<(String, StoredKey), Abort> {
     let id = keys::key_id(profile)
         .map(str::to_owned)
         .ok_or_else(|| Abort::failed(FailureKind::KeyNotFound, String::new()))?;
@@ -323,7 +371,20 @@ async fn unlock_key(
         .map_err(|error| Abort::failed(FailureKind::Other, format!("key task: {error}")))?
         .map_err(|error| Abort::failed(FailureKind::Keychain, format!("key: {error:?}")))?
         .ok_or_else(|| Abort::failed(FailureKind::KeyNotFound, id.clone()))?;
+    Ok((id, stored))
+}
 
+/// 解开钥匙串里的私钥：加密的先用存下的口令，解不开就问用户（口令错了带 `retry`
+/// 再问）。勾选保存的口令在解开后存进私钥所在的存储。
+async fn unlock_key(
+    context: &Arc<AppContext>,
+    session_id: u32,
+    prompts: &mut PromptIds,
+    profile: &ConnectionProfile,
+    id: String,
+    stored: StoredKey,
+    channels: &mut Channels<'_>,
+) -> Result<PrivateKey, Abort> {
     if !stored.encrypted {
         return decode_key(&stored.private_key, None)
             .await
@@ -382,6 +443,57 @@ async fn decode_key(
     })
     .await
     .unwrap_or(Err(KeyError::Invalid))
+}
+
+/// 卡签名器要问的下一件事；没有卡（或签名器已结束）时永远等待。
+async fn next_card_request(
+    requests: &mut Option<UnboundedReceiver<CardRequest>>,
+) -> Option<CardRequest> {
+    match requests {
+        Some(requests) => requests.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn card_pin_prompt(
+    session_id: u32,
+    prompt_id: u32,
+    profile: &ConnectionProfile,
+    question: PinQuestion,
+) -> InteractionPrompt {
+    InteractionPrompt {
+        name: question.key_name,
+        can_remember: true,
+        retry: question.retry,
+        tries_left: question.tries_left.map_or(-1, i32::from),
+        ..empty_prompt(session_id, prompt_id, PromptKind::CardPin, profile)
+    }
+}
+
+/// PIN 框的回答：PIN 与「记住到退出 App」；取消为 `None`。
+fn pin_answer(reply: InteractionReply) -> Option<(SecretString, bool)> {
+    if !reply.accept {
+        return None;
+    }
+    let pin = reply.answers.into_iter().next()?;
+    Some((SecretString::from(pin), reply.remember))
+}
+
+/// 卡签名失败的原因 → 连接失败的分类。
+fn card_abort(failure: CardFailure) -> Abort {
+    let kind = match &failure {
+        CardFailure::Cancelled => return Abort::Cancelled,
+        CardFailure::NotFound => FailureKind::CardNotFound,
+        CardFailure::KeyMismatch => FailureKind::CardKeyMismatch,
+        CardFailure::Unsupported => FailureKind::CardUnsupported,
+        CardFailure::PinBlocked | CardFailure::PinWrong { tries_left: 0 } => {
+            FailureKind::CardPinBlocked
+        }
+        CardFailure::PinWrong { .. } => FailureKind::Authentication,
+        CardFailure::TouchTimeout => FailureKind::CardTouchTimeout,
+        CardFailure::Io(_) => FailureKind::CardError,
+    };
+    Abort::failed(kind, format!("card: {failure:?}"))
 }
 
 /// 上游 broker 的问题 → Dart。上游只会问主机密钥与 keyboard-interactive；
@@ -446,6 +558,7 @@ fn empty_prompt(
         fields: Vec::new(),
         can_remember: false,
         retry: false,
+        tries_left: -1,
     }
 }
 
@@ -501,9 +614,13 @@ fn broker_response(kind: PromptKind, reply: InteractionReply) -> InteractionResp
         (PromptKind::KeyboardInteractive, true) => InteractionResponse::Answers(
             reply.answers.into_iter().map(SecretString::from).collect(),
         ),
-        (PromptKind::KeyboardInteractive | PromptKind::Password | PromptKind::Passphrase, _) => {
-            InteractionResponse::Cancel
-        }
+        (
+            PromptKind::KeyboardInteractive
+            | PromptKind::Password
+            | PromptKind::Passphrase
+            | PromptKind::CardPin,
+            _,
+        ) => InteractionResponse::Cancel,
     }
 }
 

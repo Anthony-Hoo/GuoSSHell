@@ -2,6 +2,8 @@
 //! PLAN §5 M3a），连同名称与公钥打成一个 JSON 信封——同步到别的设备时信封是完整的，
 //! 列表靠按 service 搜索钥匙串得到，不另存元数据。口令单独一项，与私钥放在同一个存储
 //! （仅本机，或 iCloud 钥匙串）。连接配置的 `identity_file` 写 `keychain:<私钥 id>`。
+//!
+//! OpenPGP 卡上的密钥（M3b）也登记成一个信封：只有公钥与卡号，私钥在卡里。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,9 +20,10 @@ use tokio::task::spawn_blocking;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::AppContext;
+use crate::card::CardInfo;
 use crate::signals::keys::{
-    DeleteKey, ForgetPassphrase, ImportKey, KeyError, KeyListState, KeyQuery, KeyResult,
-    KeySummary, RenameKey, SetKeySync,
+    AddCardKey, CardScanResult, CardSummary, DeleteKey, ForgetPassphrase, ImportKey, KeyError,
+    KeyListState, KeyQuery, KeyResult, KeySummary, RenameKey, ScanCards, SetKeySync,
 };
 
 /// 连接配置里指向钥匙串私钥的 `identity_file` 前缀。
@@ -214,6 +217,9 @@ struct Envelope {
     /// OpenSSH 一行格式的公钥。
     public_key: String,
     encrypted: bool,
+    /// OpenPGP 卡上的密钥：卡号（`private_key` 为空）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    card: Option<String>,
 }
 
 impl Drop for Envelope {
@@ -234,13 +240,17 @@ impl Envelope {
     }
 }
 
-/// 连接时用的私钥（原文与已存的口令）。
+/// 连接时用的私钥（原文与已存的口令），或 OpenPGP 卡的卡号与公钥。
 pub struct StoredKey {
     pub name: String,
     pub private_key: SecretString,
     pub encrypted: bool,
     pub synchronized: bool,
     pub passphrase: Option<SecretString>,
+    /// OpenPGP 卡上的密钥：卡号。
+    pub card: Option<String>,
+    /// OpenSSH 一行格式的公钥。
+    pub public_key: String,
 }
 
 /// 连接配置引用的私钥 id（`identity_file` 是 `keychain:<id>` 时）。
@@ -325,14 +335,7 @@ pub fn import(
     let private_key = private_key.trim();
     let passphrase = Some(passphrase).filter(|passphrase| !passphrase.is_empty());
     let (public_key, encrypted) = inspect(private_key, passphrase)?;
-    let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
-    for id in all_ids(context.keys.as_ref())?.keys() {
-        if let Some((existing, _)) = load_envelope(context.keys.as_ref(), id)?
-            && fingerprint_of(&existing.public_key).as_deref() == Some(fingerprint.as_str())
-        {
-            return Err(KeyError::AlreadyExists);
-        }
-    }
+    reject_duplicate(context, &public_key)?;
 
     let comment = public_key.comment().as_str_lossy().trim().to_owned();
     let name = match name.trim() {
@@ -340,13 +343,103 @@ pub fn import(
         "" => public_key.algorithm().as_str().to_owned(),
         name => name.to_owned(),
     };
-    let envelope = Envelope {
-        version: 1,
-        name,
-        private_key: private_key.to_owned(),
-        public_key: public_key.to_openssh().map_err(|_| KeyError::Invalid)?,
-        encrypted,
+    store_new(
+        context,
+        &Envelope {
+            version: 1,
+            name,
+            private_key: private_key.to_owned(),
+            public_key: public_key.to_openssh().map_err(|_| KeyError::Invalid)?,
+            encrypted,
+            card: None,
+        },
+    )
+}
+
+/// 登记 OpenPGP 卡的认证密钥（上次读卡看到的卡号为 `ident` 的卡），返回 id。
+/// 名称为空时用持卡人名，再没有就用卡号。
+pub fn add_card(context: &AppContext, ident: &str, name: &str) -> Result<String, KeyError> {
+    let card = context.cards.scanned(ident).ok_or(KeyError::CardNotFound)?;
+    let public_key = card.public_key.ok_or(KeyError::CardUnsupported)?;
+    reject_duplicate(context, &public_key)?;
+    let name = match name.trim() {
+        "" if !card.cardholder.is_empty() => card.cardholder.clone(),
+        "" => format!("OpenPGP 卡 {ident}"),
+        name => name.to_owned(),
     };
+    store_new(
+        context,
+        &Envelope {
+            version: 1,
+            name,
+            private_key: String::new(),
+            public_key: public_key.to_openssh().map_err(|_| KeyError::Invalid)?,
+            encrypted: false,
+            card: Some(ident.to_owned()),
+        },
+    )
+}
+
+/// 读卡，并标出已经登记过的。
+pub fn scan_cards(context: &AppContext, nfc: bool) -> Result<Vec<CardSummary>, KeyError> {
+    let cards = context.cards.scan(nfc).map_err(|failure| {
+        debug_print!("[keys] card scan: {failure:?}");
+        KeyError::CardNotFound
+    })?;
+    let known = known_fingerprints(context)?;
+    Ok(cards
+        .into_iter()
+        .map(|card| card_summary(card, &known))
+        .collect())
+}
+
+fn card_summary(card: CardInfo, known: &[String]) -> CardSummary {
+    let (public_key, fingerprint) = card
+        .public_key
+        .as_ref()
+        .map(|key| {
+            (
+                key.to_openssh().unwrap_or_default(),
+                key.fingerprint(HashAlg::Sha256).to_string(),
+            )
+        })
+        .unwrap_or_default();
+    CardSummary {
+        added: !fingerprint.is_empty() && known.contains(&fingerprint),
+        ident: card.ident,
+        cardholder: card.cardholder,
+        algorithm: card.algorithm,
+        public_key,
+        fingerprint,
+        pin_tries_left: u32::from(card.pin_tries_left),
+        touch: card.touch,
+    }
+}
+
+/// 已登记的全部公钥指纹。
+fn known_fingerprints(context: &AppContext) -> Result<Vec<String>, KeyError> {
+    let mut known = Vec::new();
+    for id in all_ids(context.keys.as_ref())?.keys() {
+        if let Some((envelope, _)) = load_envelope(context.keys.as_ref(), id)?
+            && let Some(fingerprint) = fingerprint_of(&envelope.public_key)
+        {
+            known.push(fingerprint);
+        }
+    }
+    Ok(known)
+}
+
+/// 同一把公钥只登记一次。
+fn reject_duplicate(context: &AppContext, public_key: &PublicKey) -> Result<(), KeyError> {
+    let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+    if known_fingerprints(context)?.contains(&fingerprint) {
+        return Err(KeyError::AlreadyExists);
+    }
+    Ok(())
+}
+
+/// 存一个新信封（按同步开关选存储），返回新 id。
+fn store_new(context: &AppContext, envelope: &Envelope) -> Result<String, KeyError> {
     let id = uuid::Uuid::new_v4().to_string();
     let synchronized = context.preferences.get().sync_keys;
     context
@@ -466,6 +559,8 @@ pub fn load(context: &AppContext, id: &str) -> Result<Option<StoredKey>, KeyErro
         encrypted: envelope.encrypted,
         synchronized,
         passphrase,
+        card: envelope.card.clone(),
+        public_key: envelope.public_key.clone(),
     }))
 }
 
@@ -532,6 +627,7 @@ pub fn summaries(
             passphrase_saved,
             synchronized,
             used_by: used_by(catalog, id),
+            card_ident: envelope.card.clone().unwrap_or_default(),
         });
     }
     keys.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -545,6 +641,8 @@ pub async fn run(context: Arc<AppContext>) {
     let delete_rx = DeleteKey::get_dart_signal_receiver();
     let forget_rx = ForgetPassphrase::get_dart_signal_receiver();
     let sync_rx = SetKeySync::get_dart_signal_receiver();
+    let scan_rx = ScanCards::get_dart_signal_receiver();
+    let add_card_rx = AddCardKey::get_dart_signal_receiver();
     loop {
         tokio::select! {
             pack = query_rx.recv() => {
@@ -591,6 +689,36 @@ pub async fn run(context: Arc<AppContext>) {
                 })
                 .await;
                 reply(request_id, result.map(|()| String::new()));
+            }
+            pack = scan_rx.recv() => {
+                let Some(pack) = pack else { break };
+                let request = pack.message;
+                let nfc_available = context.cards.reader.nfc_supported();
+                let (error, cards) = match blocking(&context, move |context| {
+                    scan_cards(context, request.nfc)
+                })
+                .await
+                {
+                    Ok(cards) => (KeyError::None, cards),
+                    Err(error) => (error, Vec::new()),
+                };
+                CardScanResult {
+                    request_id: request.request_id,
+                    error,
+                    cards,
+                    nfc_available,
+                }
+                .send_signal_to_dart();
+                continue;
+            }
+            pack = add_card_rx.recv() => {
+                let Some(pack) = pack else { break };
+                let request_id = pack.message.request_id;
+                let result = blocking(&context, move |context| {
+                    add_card(context, &pack.message.ident, &pack.message.name)
+                })
+                .await;
+                reply(request_id, result);
             }
             pack = sync_rx.recv() => {
                 let Some(pack) = pack else { break };
@@ -719,10 +847,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Item, MemoryKeyStore, PreferenceFile, decode, delete, forget_passphrase, import, key_ref,
-        load, rename, save_passphrase, set_sync, summaries,
+        Item, MemoryKeyStore, PreferenceFile, add_card, decode, delete, forget_passphrase, import,
+        key_ref, load, rename, save_passphrase, scan_cards, set_sync, summaries,
     };
+    use crate::card::virtual_card::{CARDHOLDER, IDENT, VirtualCard};
     use crate::app::AppContext;
+    use crate::card::{CardContext, NoCards};
     use crate::signals::keys::KeyError;
     use rshell_m0::rshell_core::{
         AuthenticationKind, CatalogMutation, ConnectionCatalog, ConnectionProfile, TransportKind,
@@ -731,7 +861,7 @@ mod tests {
         CredentialCoordinator, MemoryCredentialVault, SqliteRepository,
     };
     use rshell_m0::russh::keys::ssh_key::LineEnding;
-    use rshell_m0::russh::keys::{Algorithm, PrivateKey, key::safe_rng};
+    use rshell_m0::russh::keys::{Algorithm, PrivateKey, PublicKey, key::safe_rng};
     use secrecy::{ExposeSecret, SecretString};
     use tokio::sync::Notify;
 
@@ -752,6 +882,7 @@ mod tests {
             repository,
             known_hosts: PathBuf::new(),
             keys: Arc::new(MemoryKeyStore::new(cloud_available)),
+            cards: Arc::new(CardContext::new(Arc::new(NoCards))),
             preferences: PreferenceFile::open(preferences),
             catalog_changed: Notify::new(),
             keys_changed: Notify::new(),
@@ -951,5 +1082,34 @@ mod tests {
             available.keys.list(Item::Key, false).expect("list").len(),
             2
         );
+    }
+
+    #[test]
+    fn a_scanned_card_is_registered_once_and_loads_as_a_card_key() {
+        let mut context = context(false);
+        let card = VirtualCard::new([7; 32], false);
+        context.cards = Arc::new(CardContext::new(Arc::new(card.clone())));
+
+        assert_eq!(add_card(&context, IDENT, ""), Err(KeyError::CardNotFound));
+        let scanned = scan_cards(&context, false).expect("scan");
+        assert_eq!(scanned.len(), 1);
+        assert!(!scanned[0].added);
+        assert!(scanned[0].public_key.starts_with("ssh-ed25519 "));
+
+        let id = add_card(&context, IDENT, "").expect("register");
+        assert_eq!(add_card(&context, IDENT, "again"), Err(KeyError::AlreadyExists));
+        assert!(scan_cards(&context, false).expect("scan")[0].added);
+
+        let listed = summaries(&context, &catalog()).expect("list");
+        assert_eq!(listed[0].name, CARDHOLDER);
+        assert_eq!(listed[0].card_ident, IDENT);
+        assert!(!listed[0].encrypted);
+
+        let stored = load(&context, &id).expect("load").expect("stored");
+        assert_eq!(stored.card.as_deref(), Some(IDENT));
+        assert!(stored.private_key.expose_secret().is_empty());
+        let public_key = PublicKey::from_openssh(&stored.public_key).expect("public key");
+        assert_eq!(public_key.key_data(), card.public_key().key_data());
+        assert_eq!(public_key.comment().as_str_lossy(), "cardno:FFFF00000001");
     }
 }

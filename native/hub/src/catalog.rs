@@ -324,6 +324,7 @@ mod tests {
 
     use super::{delete, duplicate, load, profile_from_request, save, secret_update, summary};
     use crate::app::AppContext;
+    use crate::card::{CardContext, NoCards};
     use crate::keys::{MemoryKeyStore, PreferenceFile};
     use crate::signals::catalog::{AuthMethod, CatalogError, PasswordAction, SaveConnection};
     use rshell_m0::rshell_core::{AuthenticationKind, CredentialRef, SecretUpdate, TransportKind};
@@ -343,6 +344,7 @@ mod tests {
             repository,
             known_hosts: PathBuf::new(),
             keys: Arc::new(MemoryKeyStore::new(false)),
+            cards: Arc::new(CardContext::new(Arc::new(NoCards))),
             preferences: PreferenceFile::open(
                 std::env::temp_dir().join("guosh-test-preferences.json"),
             ),

@@ -9,6 +9,7 @@ use rshell_m0::rshell_storage::{CredentialCoordinator, SqliteRepository, SystemC
 use tokio::sync::Notify;
 use tokio::task::spawn_blocking;
 
+use crate::card::{self, CardContext};
 use crate::keys::{KeyStore, PreferenceFile};
 use crate::signals::{AppReady, AppStart};
 use crate::{catalog, keys, session, settings};
@@ -26,6 +27,8 @@ pub struct AppContext {
     pub known_hosts: PathBuf,
     /// 私钥与口令（钥匙串）。
     pub keys: Arc<dyn KeyStore>,
+    /// OpenPGP 卡（读卡器、记住的 PIN）。
+    pub cards: Arc<CardContext>,
     pub preferences: PreferenceFile,
     /// 目录在目录任务之外被改动（连接成功后存密码）时通知它重发。
     pub catalog_changed: Notify,
@@ -55,6 +58,7 @@ impl AppContext {
             credentials,
             known_hosts: support_dir.join(KNOWN_HOSTS_FILE),
             keys: platform_key_store()?,
+            cards: Arc::new(CardContext::new(card::platform_reader())),
             preferences: PreferenceFile::open(support_dir.join(PREFERENCES_FILE)),
             catalog_changed: Notify::new(),
             keys_changed: Notify::new(),

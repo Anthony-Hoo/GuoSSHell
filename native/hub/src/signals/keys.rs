@@ -1,4 +1,5 @@
-//! 私钥（存在钥匙串里；私钥本身永不过边界，导入时的原文除外）。
+//! 私钥（存在钥匙串里；私钥本身永不过边界，导入时的原文除外）与 OpenPGP 卡上的密钥
+//! （钥匙串里只登记公钥与卡号，私钥在卡里）。
 
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,8 @@ pub struct KeySummary {
     pub synchronized: bool,
     /// 使用它的连接数。
     pub used_by: u32,
+    /// OpenPGP 卡上的密钥：卡号（`厂商:序列号`）；钥匙串里的私钥为空。
+    pub card_ident: String,
 }
 
 /// 私钥列表与同步开关。私钥或开关变化后重发。
@@ -73,6 +76,47 @@ pub struct SetKeySync {
     pub enabled: bool,
 }
 
+/// 读卡：找出现在能用的 OpenPGP 卡（`nfc = true` 时弹出系统的 NFC 界面等卡靠近）。
+/// 回答是 `CardScanResult`。
+#[derive(Deserialize, DartSignal)]
+pub struct ScanCards {
+    pub request_id: u32,
+    pub nfc: bool,
+}
+
+/// 读到的一张卡（认证槽）。
+#[derive(Serialize, SignalPiece)]
+pub struct CardSummary {
+    pub ident: String,
+    pub cardholder: String,
+    pub algorithm: String,
+    /// OpenSSH 一行格式的公钥；空 = 认证槽没有密钥，或算法暂不支持。
+    pub public_key: String,
+    pub fingerprint: String,
+    pub pin_tries_left: u32,
+    /// 签名要在卡上按键确认。
+    pub touch: bool,
+    /// 已经登记过（同一把公钥）。
+    pub added: bool,
+}
+
+#[derive(Serialize, RustSignal)]
+pub struct CardScanResult {
+    pub request_id: u32,
+    pub error: KeyError,
+    pub cards: Vec<CardSummary>,
+    /// 这台设备能用 NFC 读卡。
+    pub nfc_available: bool,
+}
+
+/// 登记上次读卡看到的一张卡（卡号 `ident`）的认证密钥。回答是 `KeyResult`。
+#[derive(Deserialize, DartSignal)]
+pub struct AddCardKey {
+    pub request_id: u32,
+    pub ident: String,
+    pub name: String,
+}
+
 #[derive(Serialize, SignalPiece, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyError {
     None,
@@ -89,6 +133,10 @@ pub enum KeyError {
     Keychain,
     /// 写不进 iCloud 钥匙串。
     SyncUnavailable,
+    /// 没有找到 OpenPGP 卡（没插上、没靠近，或 NFC 读卡被取消）。
+    CardNotFound,
+    /// 卡的认证槽没有密钥，或算法暂不支持。
+    CardUnsupported,
 }
 
 /// 私钥操作的结果，`request_id` 原样带回；`key_id` 是导入的私钥。

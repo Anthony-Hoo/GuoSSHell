@@ -30,8 +30,8 @@ use crate::local_network;
 use crate::settings;
 use crate::signals::interaction::InteractionReply;
 use crate::signals::{
-    ClipboardText, ConnectRequest, CopyRequest, DisconnectRequest, FailureKind, FrameAck,
-    FrameUpdate, InputRequest, MouseRequest, PasteRequest, PerfStats, ResizeRequest,
+    ClipboardText, ConnectHint, ConnectRequest, CopyRequest, DisconnectRequest, FailureKind,
+    FrameAck, FrameUpdate, InputRequest, MouseRequest, PasteRequest, PerfStats, ResizeRequest,
     SelectionRequest, SelectionState, SessionState, SessionStatus,
 };
 
@@ -460,6 +460,7 @@ fn report(session_id: u32, state: SessionState, detail: String) {
         failure: FailureKind::None,
         detail,
         local_network_settings_url: String::new(),
+        hint: ConnectHint::None,
     }
     .send_signal_to_dart();
 }
@@ -471,6 +472,7 @@ fn report_end(session_id: u32, end: SessionEnd) {
         failure: end.failure,
         detail: end.detail,
         local_network_settings_url: String::new(),
+        hint: ConnectHint::None,
     }
     .send_signal_to_dart();
 }
@@ -485,6 +487,7 @@ async fn report_abort(session_id: u32, abort: Abort, host: &str, port: u16) {
             failure,
             detail,
             local_network_settings_url: local_network::settings_url(host, port, failure).await,
+            hint: ConnectHint::None,
         }
         .send_signal_to_dart(),
     }

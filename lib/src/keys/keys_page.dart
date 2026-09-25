@@ -4,10 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../bindings/bindings.dart';
+import 'card_scan_page.dart';
 import 'key_import_page.dart';
 import 'key_requests.dart';
+import 'name_dialog.dart';
 
-/// 私钥：列表、导入、查看公钥、改名、删除，以及 iCloud 钥匙串同步开关。
+/// 私钥：列表、导入私钥、登记 OpenPGP 卡、查看公钥、改名、删除，以及 iCloud 钥匙串同步开关。
 class KeysPage extends StatefulWidget {
   const KeysPage({super.key});
 
@@ -56,6 +58,12 @@ class _KeysPageState extends State<KeysPage> {
     ));
   }
 
+  Future<void> _addCard() async {
+    await Navigator.of(context).push<String>(MaterialPageRoute(
+      builder: (_) => const CardScanPage(),
+    ));
+  }
+
   /// 开关同步前讲清楚后果，用户同意才动。
   Future<void> _toggleSync(bool enabled) async {
     final confirmed = await showDialog<bool>(
@@ -87,7 +95,7 @@ class _KeysPageState extends State<KeysPage> {
   Future<void> _rename(KeySummary key) async {
     final name = await showDialog<String>(
       context: context,
-      builder: (_) => _RenameDialog(name: key.name),
+      builder: (_) => NameDialog(title: '重命名私钥', initial: key.name),
     );
     if (name != null) await _run(() => renameKey(key.id, name));
   }
@@ -110,9 +118,11 @@ class _KeysPageState extends State<KeysPage> {
       context: context,
       builder: (context) => AlertDialog(
         title: Text('删除私钥「${key.name}」？'),
-        content: Text(key.synchronized
-            ? '私钥会从 iCloud 钥匙串删除，其他设备上也将不再有它。'
-            : '私钥与存下的口令会从钥匙串删除。'),
+        content: Text(switch ((key.cardIdent.isNotEmpty, key.synchronized)) {
+          (true, _) => '只删除这张卡的登记，卡上的密钥不受影响，以后可以再添加。',
+          (false, true) => '私钥会从 iCloud 钥匙串删除，其他设备上也将不再有它。',
+          (false, false) => '私钥与存下的口令会从钥匙串删除。',
+        }),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
           TextButton(
@@ -139,10 +149,12 @@ class _KeysPageState extends State<KeysPage> {
             children: [
               Text(key.name, style: Theme.of(context).textTheme.titleLarge),
               const SizedBox(height: 8),
-              Text(switch ((key.encrypted, key.passphraseSaved)) {
-                (false, _) => key.algorithm,
-                (true, false) => '${key.algorithm} · 有口令保护',
-                (true, true) => '${key.algorithm} · 有口令保护，口令已存入钥匙串',
+              Text(switch ((key.cardIdent.isNotEmpty, key.encrypted, key.passphraseSaved)) {
+                (true, _, _) => '${key.algorithm} · 私钥在 OpenPGP 卡（卡号 ${key.cardIdent}）上，'
+                    '登录时要插着卡并输入卡的 PIN',
+                (false, false, _) => key.algorithm,
+                (false, true, false) => '${key.algorithm} · 有口令保护',
+                (false, true, true) => '${key.algorithm} · 有口令保护，口令已存入钥匙串',
               }),
               if (key.usedBy > 0) Text('${key.usedBy} 个连接在用'),
               const SizedBox(height: 12),
@@ -212,7 +224,15 @@ class _KeysPageState extends State<KeysPage> {
       appBar: AppBar(
         title: const Text('私钥'),
         actions: [
-          IconButton(tooltip: '导入私钥', icon: const Icon(Icons.add), onPressed: _import),
+          PopupMenuButton<VoidCallback>(
+            tooltip: '添加',
+            icon: const Icon(Icons.add),
+            onSelected: (action) => action(),
+            itemBuilder: (_) => [
+              PopupMenuItem(value: _import, child: const Text('导入私钥')),
+              PopupMenuItem(value: _addCard, child: const Text('添加 OpenPGP 卡')),
+            ],
+          ),
         ],
       ),
       body: state == null
@@ -236,20 +256,34 @@ class _KeysPageState extends State<KeysPage> {
                         children: [
                           const Text('还没有私钥'),
                           const SizedBox(height: 12),
-                          FilledButton.icon(
-                            onPressed: _import,
-                            icon: const Icon(Icons.add),
-                            label: const Text('导入私钥'),
+                          Wrap(
+                            spacing: 12,
+                            runSpacing: 8,
+                            alignment: WrapAlignment.center,
+                            children: [
+                              FilledButton.icon(
+                                onPressed: _import,
+                                icon: const Icon(Icons.add),
+                                label: const Text('导入私钥'),
+                              ),
+                              OutlinedButton.icon(
+                                onPressed: _addCard,
+                                icon: const Icon(Icons.credit_card),
+                                label: const Text('添加 OpenPGP 卡'),
+                              ),
+                            ],
                           ),
                         ],
                       ),
                     ),
                   for (final key in state.keys)
                     ListTile(
-                      leading: const Icon(Icons.key),
+                      leading: Icon(key.cardIdent.isEmpty ? Icons.key : Icons.credit_card),
                       title: Text(key.name),
                       subtitle: Text(
-                        '${key.algorithm} · ${key.fingerprint}',
+                        key.cardIdent.isEmpty
+                            ? '${key.algorithm} · ${key.fingerprint}'
+                            : 'OpenPGP 卡 ${key.cardIdent} · ${key.fingerprint}',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
@@ -259,45 +293,6 @@ class _KeysPageState extends State<KeysPage> {
                 ],
               ),
             ),
-    );
-  }
-}
-
-/// 改名对话框。输入框的控制器随对话框一起销毁（对话框关闭动画期间还在用它）。
-class _RenameDialog extends StatefulWidget {
-  final String name;
-  const _RenameDialog({required this.name});
-
-  @override
-  State<_RenameDialog> createState() => _RenameDialogState();
-}
-
-class _RenameDialogState extends State<_RenameDialog> {
-  late final _controller = TextEditingController(text: widget.name);
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('重命名私钥'),
-      content: TextField(
-        controller: _controller,
-        autofocus: true,
-        decoration: const InputDecoration(labelText: '名称'),
-        onSubmitted: (value) => Navigator.pop(context, value),
-      ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
-        FilledButton(
-          onPressed: () => Navigator.pop(context, _controller.text),
-          child: const Text('保存'),
-        ),
-      ],
     );
   }
 }

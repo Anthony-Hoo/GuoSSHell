@@ -1,7 +1,8 @@
-//! 连接过程中需要用户回答的问题：密码、主机密钥确认、keyboard-interactive。
+//! 连接过程中需要用户回答的问题：密码、私钥口令、OpenPGP 卡的 PIN、主机密钥确认、
+//! keyboard-interactive。
 //!
-//! 主机密钥与 keyboard-interactive 来自上游的 `InteractionBroker`；密码是 hub 自己问的
-//! （连接没存密码，或钥匙串里读不到）。一次只问一个，Dart 回答后才会有下一个。
+//! 主机密钥与 keyboard-interactive 来自上游的 `InteractionBroker`；其余是 hub 自己问的
+//! （连接没存密码、私钥口令没存、卡要验证 PIN）。一次只问一个，Dart 回答后才会有下一个。
 
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,8 @@ pub enum PromptKind {
     Passphrase,
     HostKey,
     KeyboardInteractive,
+    /// OpenPGP 卡的用户 PIN（`name` 是这把卡密钥的名称，`tries_left` 是剩余次数）。
+    CardPin,
 }
 
 /// keyboard-interactive 的一个输入项。
@@ -44,10 +47,13 @@ pub struct InteractionPrompt {
     pub name: String,
     pub instruction: String,
     pub fields: Vec<PromptField>,
-    /// Password / Passphrase：回答可以存进钥匙串（快速连接的密码不行）。
+    /// Password / Passphrase：回答可以存进钥匙串（快速连接的密码不行）；
+    /// CardPin：可以记住到退出 App（只在内存里）。
     pub can_remember: bool,
-    /// 上一次的回答不对，再问一次（Passphrase：口令错了）。
+    /// 上一次的回答不对，再问一次（口令或 PIN 错了）。
     pub retry: bool,
+    /// CardPin：PIN 还能试几次；-1 = 还不知道（NFC 读卡，卡还没靠近）。
+    pub tries_left: i32,
 }
 
 /// 对 `prompt_id` 的回答。`accept = false` 是取消 / 拒绝。
@@ -60,6 +66,7 @@ pub struct InteractionReply {
     pub prompt_id: u32,
     pub accept: bool,
     pub answers: Vec<String>,
-    /// Password：连接成功后把这个密码存进钥匙串（仅目录里的连接）。
+    /// Password：连接成功后把这个密码存进钥匙串（仅目录里的连接）；
+    /// Passphrase：存进钥匙串；CardPin：记住到退出 App。
     pub remember: bool,
 }

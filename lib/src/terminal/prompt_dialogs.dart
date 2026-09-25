@@ -34,6 +34,7 @@ Future<PromptAnswer> showPromptDialog(
         PromptKind.password || PromptKind.passphrase => _PasswordDialog(prompt: prompt),
         PromptKind.hostKey => _HostKeyDialog(prompt: prompt),
         PromptKind.keyboardInteractive => _KeyboardInteractiveDialog(prompt: prompt),
+        PromptKind.cardPin => _CardPinDialog(prompt: prompt),
       },
     ),
   );
@@ -134,6 +135,79 @@ class _PasswordDialogState extends State<_PasswordDialog> {
               value: _remember,
               onChanged: (value) => setState(() => _remember = value ?? false),
             ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(const PromptAnswer.declined()),
+          child: const Text('取消'),
+        ),
+        FilledButton(onPressed: _submit, child: const Text('连接')),
+      ],
+    );
+  }
+}
+
+/// OpenPGP 卡的 PIN。可以记住到退出 App（只在内存里，不进钥匙串）。
+class _CardPinDialog extends StatefulWidget {
+  final InteractionPrompt prompt;
+  const _CardPinDialog({required this.prompt});
+
+  @override
+  State<_CardPinDialog> createState() => _CardPinDialogState();
+}
+
+class _CardPinDialogState extends State<_CardPinDialog> {
+  final _pin = TextEditingController();
+  bool _remember = false;
+
+  @override
+  void dispose() {
+    _pin.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    Navigator.of(context).pop(PromptAnswer.accepted([_pin.text], remember: _remember));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final prompt = widget.prompt;
+    final tries = prompt.triesLeft;
+    final left = switch (tries) {
+      < 0 => null,
+      1 => '只剩最后 1 次，再错卡会锁定',
+      _ => '还可以试 $tries 次，用完卡会锁定',
+    };
+    return AlertDialog(
+      title: const Text('输入卡的 PIN'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('OpenPGP 卡「${prompt.name}」 · ${_target(prompt)}'),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _pin,
+            autofocus: true,
+            obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: InputDecoration(
+              labelText: 'PIN',
+              errorText: prompt.retry ? 'PIN 不正确。${left ?? ''}' : null,
+              helperText: prompt.retry ? null : left,
+            ),
+            onSubmitted: (_) => _submit(),
+          ),
+          CheckboxListTile(
+            contentPadding: EdgeInsets.zero,
+            controlAffinity: ListTileControlAffinity.leading,
+            title: const Text('记住 PIN，直到退出 App'),
+            value: _remember,
+            onChanged: (value) => setState(() => _remember = value ?? false),
+          ),
         ],
       ),
       actions: [

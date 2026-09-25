@@ -10,6 +10,7 @@ InteractionPrompt _prompt(
   bool retry = false,
   String name = '',
   List<PromptField> fields = const [],
+  int triesLeft = -1,
 }) =>
     InteractionPrompt(
       sessionId: 1,
@@ -27,6 +28,7 @@ InteractionPrompt _prompt(
       fields: fields,
       canRemember: canRemember,
       retry: retry,
+      triesLeft: triesLeft,
     );
 
 void main() {
@@ -113,6 +115,34 @@ void main() {
     await tester.pumpAndSettle();
     expect(answer?.answers, ['secret']);
     expect(answer?.remember, isTrue);
+  });
+
+  testWidgets('卡 PIN：错了提示剩余次数重输，可以记住到退出 App', (tester) async {
+    await open(
+      tester,
+      _prompt(PromptKind.cardPin, name: 'CanoKey', triesLeft: 2, retry: true),
+    );
+    expect(find.text('输入卡的 PIN'), findsOneWidget);
+    expect(find.textContaining('OpenPGP 卡「CanoKey」'), findsOneWidget);
+    expect(find.text('PIN 不正确。还可以试 2 次，用完卡会锁定'), findsOneWidget);
+    await tester.enterText(find.byType(TextField), '123456');
+    await tester.tap(find.text('记住 PIN，直到退出 App'));
+    await tester.pump();
+    await tester.tap(find.widgetWithText(FilledButton, '连接'));
+    await tester.pumpAndSettle();
+    expect(answer?.answers, ['123456']);
+    expect(answer?.remember, isTrue);
+  });
+
+  testWidgets('卡 PIN：只剩一次时明确警告；次数未知时不显示', (tester) async {
+    await open(tester, _prompt(PromptKind.cardPin, name: 'CanoKey', triesLeft: 1));
+    expect(find.text('只剩最后 1 次，再错卡会锁定'), findsOneWidget);
+    await tester.tap(find.text('取消'));
+    await tester.pumpAndSettle();
+    expect(answer?.accept, isFalse);
+
+    await open(tester, _prompt(PromptKind.cardPin, name: 'CanoKey'));
+    expect(find.textContaining('还可以试'), findsNothing);
   });
 
   testWidgets('keyboard-interactive：按输入项逐个回答', (tester) async {

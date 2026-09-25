@@ -102,6 +102,7 @@ class _TerminalPageState extends State<TerminalPage> {
   FailureKind _failure = FailureKind.none;
   String _detail = '';
   String _localNetworkSettingsUrl = '';
+  ConnectHint _hint = ConnectHint.none;
 
   @override
   void initState() {
@@ -173,6 +174,7 @@ class _TerminalPageState extends State<TerminalPage> {
       _failure = msg.failure;
       _detail = msg.detail;
       _localNetworkSettingsUrl = msg.localNetworkSettingsUrl;
+      _hint = msg.hint;
     });
     // 连接中视图几何可能又变了（键盘弹出、旋转）：连上即补发最新尺寸。
     if (state == SessionState.connected) _flushResize();
@@ -618,10 +620,22 @@ class _TerminalPageState extends State<TerminalPage> {
 
   Widget _buildSession(BuildContext context) {
     final banner = switch (_state) {
-      SessionState.connecting => _Banner(
-          icon: Icons.sync,
-          text: '正在连接 ${widget.target.title}…',
-        ),
+      SessionState.connecting => switch (_hint) {
+          ConnectHint.touchCard => _Banner(
+              icon: Icons.touch_app_outlined,
+              text: '请按一下 OpenPGP 卡上的按键',
+              detail: '正在连接 ${widget.target.title}',
+            ),
+          ConnectHint.tapCard => _Banner(
+              icon: Icons.contactless_outlined,
+              text: '请把 OpenPGP 卡靠近设备',
+              detail: '正在连接 ${widget.target.title}',
+            ),
+          ConnectHint.none => _Banner(
+              icon: Icons.sync,
+              text: '正在连接 ${widget.target.title}…',
+            ),
+        },
       SessionState.failed => _Banner(
           icon: Icons.error_outline,
           text: _failureText(_failure),
@@ -744,12 +758,18 @@ String _failureText(FailureKind failure) => switch (failure) {
       FailureKind.notFound => '这条连接已不存在',
       FailureKind.invalidTarget => '连接目标无效：请检查主机、端口和用户名',
       FailureKind.keyNotFound => '连接用的私钥不在钥匙串里了，请重新选择',
-      FailureKind.authentication => '认证失败：用户名或密码不正确',
+      FailureKind.authentication => '认证失败：服务器不接受这个用户名的密码或密钥',
       FailureKind.hostKeyRejected => '已拒绝服务器的主机密钥',
       FailureKind.hostKeyChanged => '主机密钥已变更，连接已中止',
       FailureKind.network => '无法连接到服务器',
       FailureKind.timeout => '连接超时',
       FailureKind.keychain => '读写钥匙串失败',
+      FailureKind.cardNotFound => '没有找到 OpenPGP 卡：请插上（或靠近）登记的那张卡后重试',
+      FailureKind.cardKeyMismatch => '卡上的密钥与登记时的不同，请检查是不是插错了卡',
+      FailureKind.cardUnsupported => '这张卡的认证密钥暂不支持（目前只支持 Ed25519）',
+      FailureKind.cardPinBlocked => 'OpenPGP 卡的 PIN 已锁定，需要用管理 PIN 解锁',
+      FailureKind.cardTouchTimeout => '没有等到卡上的按键确认',
+      FailureKind.cardError => '读卡失败',
     };
 
 class _Banner extends StatelessWidget {

@@ -1,0 +1,196 @@
+//! 卡签名接进 SSH 认证：实现上游的 `ExternalSigner`（rsHell 补丁 P5）。
+//!
+//! 服务器接受了公钥、要签名时：先确认卡在、认证槽的公钥就是登记的那把，再问 PIN
+//! （经会话的连接循环弹给用户）、让卡签名；PIN 错了带剩余次数重问。卡不在而设备能用
+//! NFC 时，先问 PIN、再弹系统的 NFC 界面一次完成（NFC 界面会盖住 App）。
+//! 失败原因留在签名器里，连接失败后由会话取回、给出具体提示。
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use rinf::{RustSignal, debug_print};
+use rshell_m0::rshell_session::{ExternalSigner, ExternalSignerError};
+use rshell_m0::russh::keys::{HashAlg, PublicKey};
+use secrecy::{ExposeSecret, SecretString};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use tokio::task::spawn_blocking;
+
+use super::{CardContext, CardFailure, lock};
+use crate::signals::{ConnectHint, FailureKind, SessionState, SessionStatus};
+
+/// 签名过程中要会话代为问用户的事。
+pub enum CardRequest {
+    /// 问 PIN。回答是 PIN 与「记住到退出 App」；取消为 `None`。
+    Pin {
+        question: PinQuestion,
+        reply: oneshot::Sender<Option<(SecretString, bool)>>,
+    },
+}
+
+pub struct PinQuestion {
+    /// 这把私钥（卡）在本 App 里的名字。
+    pub key_name: String,
+    /// PIN 还能试几次；`None` = 还不知道（NFC：卡还没靠近）。
+    pub tries_left: Option<u8>,
+    /// 上一次的 PIN 不对。
+    pub retry: bool,
+}
+
+pub struct CardSigner {
+    cards: Arc<CardContext>,
+    session_id: u32,
+    /// 连接中状态里显示的目标。
+    target: String,
+    key_name: String,
+    ident: String,
+    public_key: PublicKey,
+    requests: UnboundedSender<CardRequest>,
+    failure: Mutex<Option<CardFailure>>,
+}
+
+impl CardSigner {
+    pub fn new(
+        cards: Arc<CardContext>,
+        session_id: u32,
+        target: String,
+        key_name: String,
+        ident: String,
+        public_key: PublicKey,
+        requests: UnboundedSender<CardRequest>,
+    ) -> Self {
+        Self {
+            cards,
+            session_id,
+            target,
+            key_name,
+            ident,
+            public_key,
+            requests,
+            failure: Mutex::new(None),
+        }
+    }
+
+    /// 签名失败的原因（连接失败后取）。
+    pub fn failure(&self) -> Option<CardFailure> {
+        lock(&self.failure).clone()
+    }
+
+    async fn try_sign(&self, data: &[u8], hash: Option<HashAlg>) -> Result<Vec<u8>, CardFailure> {
+        let probe = {
+            let cards = self.cards.clone();
+            let ident = self.ident.clone();
+            let key = self.public_key.clone();
+            spawn_blocking(move || cards.probe(&ident, &key))
+                .await
+                .map_err(|error| CardFailure::Io(error.to_string()))?
+        };
+        let (nfc, mut tries_left) = match probe {
+            Ok(info) => (false, Some(info.pin_tries_left)),
+            Err(CardFailure::NotFound) if self.cards.reader.nfc_supported() => (true, None),
+            Err(failure) => return Err(failure),
+        };
+        if tries_left == Some(0) {
+            return Err(CardFailure::PinBlocked);
+        }
+
+        let mut retry = false;
+        loop {
+            let remembered = if retry {
+                None
+            } else {
+                self.cards.remembered_pin(&self.ident)
+            };
+            let (pin, remember) = match remembered {
+                Some(pin) => (pin, false),
+                None => self.ask_pin(tries_left, retry).await?,
+            };
+            if nfc {
+                send_hint(self.session_id, &self.target, ConnectHint::TapCard);
+            }
+            let result = {
+                let cards = self.cards.clone();
+                let ident = self.ident.clone();
+                let key = self.public_key.clone();
+                let pin = SecretString::from(pin.expose_secret().to_owned());
+                let data = data.to_vec();
+                let session_id = self.session_id;
+                let target = self.target.clone();
+                spawn_blocking(move || {
+                    cards.sign(&ident, &key, pin, &data, hash, nfc, &|touch| {
+                        if touch {
+                            send_hint(session_id, &target, ConnectHint::TouchCard);
+                        }
+                    })
+                })
+                .await
+                .map_err(|error| CardFailure::Io(error.to_string()))?
+            };
+            send_hint(self.session_id, &self.target, ConnectHint::None);
+            match result {
+                Ok(blob) => {
+                    if remember {
+                        self.cards.remember_pin(&self.ident, pin);
+                    }
+                    return Ok(blob);
+                }
+                Err(CardFailure::PinWrong { tries_left: left }) => {
+                    self.cards.forget_pin(&self.ident);
+                    tries_left = Some(left);
+                    retry = true;
+                }
+                Err(failure) => {
+                    if failure == CardFailure::PinBlocked {
+                        self.cards.forget_pin(&self.ident);
+                    }
+                    return Err(failure);
+                }
+            }
+        }
+    }
+
+    async fn ask_pin(
+        &self,
+        tries_left: Option<u8>,
+        retry: bool,
+    ) -> Result<(SecretString, bool), CardFailure> {
+        let (reply, answer) = oneshot::channel();
+        let question = PinQuestion {
+            key_name: self.key_name.clone(),
+            tries_left,
+            retry,
+        };
+        self.requests
+            .send(CardRequest::Pin { question, reply })
+            .map_err(|_| CardFailure::Cancelled)?;
+        answer.await.ok().flatten().ok_or(CardFailure::Cancelled)
+    }
+}
+
+#[async_trait]
+impl ExternalSigner for CardSigner {
+    async fn sign(
+        &self,
+        data: &[u8],
+        hash: Option<HashAlg>,
+    ) -> Result<Vec<u8>, ExternalSignerError> {
+        self.try_sign(data, hash).await.map_err(|failure| {
+            debug_print!("[card] sign: {failure:?}");
+            *lock(&self.failure) = Some(failure);
+            ExternalSignerError
+        })
+    }
+}
+
+/// 连接中状态附带的提示（按卡上的按键、把卡靠近设备）。
+fn send_hint(session_id: u32, target: &str, hint: ConnectHint) {
+    SessionStatus {
+        session_id,
+        state: SessionState::Connecting,
+        failure: FailureKind::None,
+        detail: target.to_owned(),
+        local_network_settings_url: String::new(),
+        hint,
+    }
+    .send_signal_to_dart();
+}

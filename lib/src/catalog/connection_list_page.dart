@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import '../bindings/bindings.dart';
 import '../settings/settings_page.dart';
 import '../terminal/session_target.dart';
-import '../terminal/terminal_page.dart';
+import '../workspace/workspace_page.dart';
 import 'catalog_requests.dart';
 import 'connection_editor_page.dart';
 
@@ -49,8 +49,8 @@ class _ConnectionListPageState extends State<ConnectionListPage> {
 
   void _open(ConnectionSummary connection) {
     Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => TerminalPage(
-        target: SessionTarget.saved(
+      builder: (_) => WorkspacePage(
+        initial: SessionTarget.saved(
           connectionId: connection.id,
           title: connectionTitle(connection),
         ),

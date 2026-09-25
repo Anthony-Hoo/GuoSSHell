@@ -30,7 +30,6 @@ import 'frame.dart';
 import 'frame_terminal.dart';
 import 'prompt_dialogs.dart';
 import 'session_target.dart';
-import 'terminal_key_bar.dart';
 
 /// 本进程内会话编号（rinf 信号按类型全局广播，靠它分流）。
 int _nextSessionId = 1;
@@ -55,23 +54,94 @@ final Map<ShortcutActivator, Intent> _terminalShortcuts = {
     },
 };
 
-/// 一次 SSH 会话的页面：终端（fork 渲染 + 帧驱动适配器 + 键位条）。
-/// 会话在页面打开后、终端完成首次布局时发起（几何随连接请求一起带上）。
-class TerminalPage extends StatefulWidget {
+/// 窗格对外的一面：工作区（标签条、键位条、快捷键）经它操作窗格里的会话。终端适配器、
+/// 选区控制器与焦点归它所有，窗格在分屏、换标签时重新布局也不受影响。
+class TerminalPaneController extends ChangeNotifier {
+  TerminalPaneController(this.target);
+
   final SessionTarget target;
-
-  const TerminalPage({super.key, required this.target});
-
-  @override
-  State<TerminalPage> createState() => _TerminalPageState();
-}
-
-class _TerminalPageState extends State<TerminalPage> {
-  final FrameTerminal _terminal = FrameTerminal();
-  final TerminalController _terminalController =
+  final FrameTerminal terminal = FrameTerminal();
+  final TerminalController selection =
       TerminalController(pointerInputs: const PointerInputs.all());
   /// 软键盘的开关靠它：焦点在终端上 = 键盘起，unfocus = 收起。
-  final FocusNode _terminalFocus = FocusNode();
+  final FocusNode focusNode = FocusNode();
+
+  _TerminalPaneState? _pane;
+  SessionState? _state;
+  String _remoteTitle = '';
+
+  /// 标签上的名字：远端设置的窗口标题，没有就用连接的名字。
+  String get title => _remoteTitle.isNotEmpty ? _remoteTitle : target.title;
+
+  SessionState? get state => _state;
+  bool get connected => _state == SessionState.connected;
+  bool get canCopy => selection.selection != null;
+
+  /// 复制选区（取文在引擎里）。
+  void copy() => _pane?._copySelection();
+
+  /// 系统剪贴板 → 远端。
+  Future<void> paste() async => _pane?._pasteClipboard();
+
+  /// 软键盘开关：焦点在终端 = 键盘起，否则收起。
+  void toggleKeyboard() {
+    if (focusNode.hasFocus) {
+      focusNode.unfocus();
+    } else {
+      focusNode.requestFocus();
+    }
+  }
+
+  void _report({SessionState? state, String? title}) {
+    final changed = (state != null && state != _state) || (title != null && title != _remoteTitle);
+    if (state != null) _state = state;
+    if (title != null) _remoteTitle = title;
+    if (changed) notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    selection.dispose();
+    focusNode.dispose();
+    super.dispose();
+  }
+}
+
+/// 一个窗格：一条 SSH 会话的终端（fork 渲染 + 帧驱动适配器）与连接提示。会话在窗格首次
+/// 布局完成时发起（几何随连接请求一起带上），窗格从界面上移除即断开。
+class TerminalPane extends StatefulWidget {
+  final TerminalPaneController controller;
+
+  /// 一个标签里有多个窗格时，活动窗格描一圈边。
+  final bool highlighted;
+
+  /// 在窗格里按下（点、拖、选）：它成为活动窗格。
+  final VoidCallback onActivate;
+
+  /// 关掉这个窗格：会话结束后点「关闭」，或连接前取消了。
+  final VoidCallback onClose;
+
+  /// 硬件键盘的按键先交给工作区（标签、分屏的快捷键）。
+  final KeyEventResult Function(FocusNode node, KeyEvent event)? onKeyEvent;
+
+  const TerminalPane({
+    super.key,
+    required this.controller,
+    this.highlighted = false,
+    required this.onActivate,
+    required this.onClose,
+    this.onKeyEvent,
+  });
+
+  @override
+  State<TerminalPane> createState() => _TerminalPaneState();
+}
+
+class _TerminalPaneState extends State<TerminalPane> {
+  TerminalPaneController get _controller => widget.controller;
+  FrameTerminal get _terminal => widget.controller.terminal;
+  TerminalController get _terminalController => widget.controller.selection;
+  FocusNode get _terminalFocus => widget.controller.focusNode;
   /// 滚回的滚动位置（fork 的 Scrollable 用它）；滚动时按位置向 Rust 要窗口。
   final ScrollController _scroll = ScrollController();
   /// 跟着屏幕（随输出滚动）；滚进滚回后为 false，[_window] 是已请求的窗口。
@@ -128,13 +198,15 @@ class _TerminalPageState extends State<TerminalPage> {
       ..addListener(_onSelectionChanged)
       ..onSelectionIntent = _onSelectionIntent;
     _scroll.addListener(_onScroll);
+    _controller._pane = this;
     _startSession();
   }
 
   @override
   void dispose() {
-    // 任何方式离开页面都结束会话（连接中的也一并取消）。
+    // 窗格从界面上移除（关窗格、关标签、离开工作区）即结束会话（连接中的也一并取消）。
     if (_sessionId != 0 && !_ended) DisconnectRequest(sessionId: _sessionId).sendSignalToRust();
+    if (_controller._pane == this) _controller._pane = null;
     _statusSub?.cancel();
     _frameSub?.cancel();
     _selectionSub?.cancel();
@@ -147,8 +219,6 @@ class _TerminalPageState extends State<TerminalPage> {
       ..onSelectionIntent = null;
     _selectionMenu.remove();
     _resizeTimer?.cancel();
-    _terminalController.dispose();
-    _terminalFocus.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -162,10 +232,11 @@ class _TerminalPageState extends State<TerminalPage> {
     final msg = pack.message;
     if (!mounted || msg.sessionId != _sessionId) return;
     final state = msg.state;
-    // 连接前被取消（关了密码框等）：回到上一页。
+    _controller._report(state: state);
+    // 连接前被取消（关了密码框等）：关掉这个窗格。
     if (state == SessionState.cancelled) {
       _state = state;
-      Navigator.of(context).maybePop();
+      widget.onClose();
       return;
     }
     // 会话结束（失败/断开）：引擎那边选区没了，别再留着高亮/耳朵；
@@ -222,6 +293,7 @@ class _TerminalPageState extends State<TerminalPage> {
         ..mouseReporting = msg.mouseReporting
         ..alternateScreen = msg.alternateScreen;
       _terminal.applyFrame(frame);
+      _controller._report(title: _terminal.title);
       _keepScrollPosition();
       // 最早一行变了（滚回裁掉旧行、清空、重排）行号就整体平移；重新投影选区，
       // 高亮和耳朵才会跟着内容走（拖动进行中映射不变，不会被顶掉）。
@@ -513,7 +585,7 @@ class _TerminalPageState extends State<TerminalPage> {
     if (!_connectPending || geometry == null || !mounted) return;
     _connectPending = false;
     _sentGeometry = geometry;
-    final target = widget.target;
+    final target = _controller.target;
     ConnectRequest(
       sessionId: _sessionId,
       connectionId: target.connectionId,
@@ -535,15 +607,6 @@ class _TerminalPageState extends State<TerminalPage> {
   /// 已随 ConnectRequest / ResizeRequest 发给当前会话的几何。
   TerminalGeometry? _sentGeometry;
   Timer? _resizeTimer;
-
-  /// 软键盘开关（键位条「⌨」键）：焦点在终端 = 键盘起，否则收起。
-  void _toggleKeyboard() {
-    if (_terminalFocus.hasFocus) {
-      _terminalFocus.unfocus();
-    } else {
-      _terminalFocus.requestFocus();
-    }
-  }
 
   /// 选区变化 → 系统风格的选区菜单（Flutter 自带，iOS 上渲染成气垫）。
   /// 选区清空时收起。
@@ -655,67 +718,33 @@ class _TerminalPageState extends State<TerminalPage> {
 
   bool _connectPending = false;
 
-  /// 离开会话。连着的先确认，确认后断开并返回列表。
-  Future<void> _leave() async {
-    if (_state == SessionState.connected) {
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: Text('断开与「${widget.target.title}」的连接？'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('断开'),
-            ),
-          ],
-        ),
-      );
-      if (confirmed != true || !mounted) return;
-    }
-    Navigator.of(context).pop();
-  }
-
   Future<void> _openSettings(String url) async {
     await launchUrl(Uri.parse(url));
   }
 
   @override
   Widget build(BuildContext context) {
-    // 连着的时候，系统返回（iOS 边缘右滑等）也走「确认后断开」。
-    return PopScope(
-      canPop: _state != SessionState.connected,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _leave();
-      },
-      child: _buildSession(context),
-    );
-  }
-
-  Widget _buildSession(BuildContext context) {
+    final title = _controller.target.title;
     final banner = switch (_state) {
       SessionState.connecting => switch (_hint) {
           ConnectHint.touchCard => _Banner(
               icon: Icons.touch_app_outlined,
               text: '请按一下 OpenPGP 卡上的按键',
-              detail: '正在连接 ${widget.target.title}',
+              detail: '正在连接 $title',
             ),
           ConnectHint.tapCard => _Banner(
               icon: Icons.contactless_outlined,
               text: '请把 OpenPGP 卡靠近设备',
-              detail: '正在连接 ${widget.target.title}',
+              detail: '正在连接 $title',
             ),
           ConnectHint.securityKey => _Banner(
               icon: Icons.usb,
               text: '请按系统提示插上（或靠近）安全密钥，并触摸它',
-              detail: '正在连接 ${widget.target.title}',
+              detail: '正在连接 $title',
             ),
           ConnectHint.none => _Banner(
               icon: Icons.sync,
-              text: '正在连接 ${widget.target.title}…',
+              text: '正在连接 $title…',
             ),
         },
       SessionState.failed => _Banner(
@@ -730,7 +759,7 @@ class _TerminalPageState extends State<TerminalPage> {
                 child: const Text('打开设置'),
               ),
             TextButton(onPressed: _startSession, child: const Text('重试')),
-            TextButton(onPressed: _leave, child: const Text('返回')),
+            TextButton(onPressed: widget.onClose, child: const Text('关闭')),
           ],
           hint: _localNetworkSettingsUrl.isEmpty
               ? null
@@ -742,58 +771,51 @@ class _TerminalPageState extends State<TerminalPage> {
           detail: _detail,
           actions: [
             TextButton(onPressed: _startSession, child: const Text('重新连接')),
-            TextButton(onPressed: _leave, child: const Text('返回')),
+            TextButton(onPressed: widget.onClose, child: const Text('关闭')),
           ],
         ),
       _ => null,
     };
 
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Expanded(
-              child: Stack(
-                children: [
-                  Positioned.fill(
-                    child: Actions(
-                      actions: {
-                        _EngineCopyIntent: CallbackAction<_EngineCopyIntent>(
-                          onInvoke: (_) => _copySelection(),
-                        ),
-                        _EngineSelectAllIntent: CallbackAction<_EngineSelectAllIntent>(
-                          onInvoke: (_) => _selectAll(),
-                        ),
-                      },
-                      child: _TerminalSurface(
-                        key: _terminalSurfaceKey,
-                        terminal: _terminal,
-                        controller: _terminalController,
-                        scrollController: _scroll,
-                        focusNode: _terminalFocus,
-                        style: _style,
-                      ),
+    // 按下即成为活动窗格（不参与手势竞争，选区、滚动照常）。
+    return Listener(
+      onPointerDown: (_) => widget.onActivate(),
+      child: DecoratedBox(
+        position: DecorationPosition.foreground,
+        decoration: BoxDecoration(
+          border: widget.highlighted
+              ? Border.all(color: Theme.of(context).colorScheme.primary, width: 1.5)
+              : null,
+        ),
+        child: ColoredBox(
+          color: Colors.black,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: Actions(
+                  actions: {
+                    _EngineCopyIntent: CallbackAction<_EngineCopyIntent>(
+                      onInvoke: (_) => _copySelection(),
                     ),
+                    _EngineSelectAllIntent: CallbackAction<_EngineSelectAllIntent>(
+                      onInvoke: (_) => _selectAll(),
+                    ),
+                  },
+                  child: _TerminalSurface(
+                    key: _terminalSurfaceKey,
+                    terminal: _terminal,
+                    controller: _terminalController,
+                    scrollController: _scroll,
+                    focusNode: _terminalFocus,
+                    style: _style,
+                    onKeyEvent: widget.onKeyEvent,
                   ),
-                  // 诊断浮层与右上角关闭键已移除：它们悬在终端上方，
-                  // 拖选区（尤其长选区）经过时会干扰触摸。
-                  if (banner != null)
-                    Positioned(top: 0, left: 0, right: 0, child: banner),
-                ],
+                ),
               ),
-            ),
-            TerminalKeyBar(
-              terminal: _terminal,
-              extraListen: _terminalController,
-              canCopy: () => _terminalController.selection != null,
-              onCopy: _copySelection,
-              onPaste: _pasteClipboard,
-              onToggleKeyboard: _toggleKeyboard,
-              onDisconnect: _leave,
-            ),
-          ],
+              // 不在终端上方悬浮控件：拖选区（尤其长选区）经过时会干扰触摸。
+              if (banner != null) Positioned(top: 0, left: 0, right: 0, child: banner),
+            ],
+          ),
         ),
       ),
     );
@@ -808,6 +830,7 @@ class _TerminalSurface extends StatelessWidget {
   final ScrollController scrollController;
   final FocusNode focusNode;
   final TerminalStyle style;
+  final KeyEventResult Function(FocusNode node, KeyEvent event)? onKeyEvent;
 
   const _TerminalSurface({
     super.key,
@@ -816,6 +839,7 @@ class _TerminalSurface extends StatelessWidget {
     required this.scrollController,
     required this.focusNode,
     required this.style,
+    this.onKeyEvent,
   });
 
   @override
@@ -833,6 +857,7 @@ class _TerminalSurface extends StatelessWidget {
       controller: controller,
       scrollController: scrollController,
       focusNode: focusNode,
+      onKeyEvent: onKeyEvent,
       autoResize: true,
       shortcuts: _terminalShortcuts,
       // iOS 软键盘的退格不产生硬件按键事件，必须靠编辑增量探测

@@ -6,7 +6,7 @@ import '../bindings/bindings.dart';
 import '../keys/card_scan_page.dart';
 import '../keys/key_import_page.dart';
 import '../terminal/session_target.dart';
-import '../terminal/terminal_page.dart';
+import '../workspace/workspace_page.dart';
 import 'catalog_requests.dart';
 
 /// 新建 / 编辑一条连接；`quick` 时是快速连接（不存目录，按钮是「连接」）。
@@ -15,7 +15,15 @@ class ConnectionEditorPage extends StatefulWidget {
   final ConnectionSummary? existing;
   final bool quick;
 
-  const ConnectionEditorPage({super.key, this.existing, this.quick = false});
+  /// 快速连接时把目标交回调用方（工作区开新标签、分屏），而不是自己开工作区。
+  final bool returnTarget;
+
+  const ConnectionEditorPage({
+    super.key,
+    this.existing,
+    this.quick = false,
+    this.returnTarget = false,
+  });
 
   @override
   State<ConnectionEditorPage> createState() => _ConnectionEditorPageState();
@@ -117,16 +125,19 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
   }
 
   void _connectQuick() {
+    final target = SessionTarget.quick(
+      host: _host.text.trim(),
+      port: _portValue,
+      username: _username.text.trim(),
+      password: _password.text,
+      command: _command.text.trim(),
+    );
+    if (widget.returnTarget) {
+      Navigator.of(context).pop(target);
+      return;
+    }
     Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => TerminalPage(
-        target: SessionTarget.quick(
-          host: _host.text.trim(),
-          port: _portValue,
-          username: _username.text.trim(),
-          password: _password.text,
-          command: _command.text.trim(),
-        ),
-      ),
+      builder: (_) => WorkspacePage(initial: target),
     ));
   }
 

@@ -13,7 +13,7 @@ import 'frame_terminal.dart';
 ///   先发一个、之后按 [_keyRepeatInterval] 自动重复，抬起即停。
 /// * 复制/粘贴：动作键，不参与自动重复；复制键在无选区时置灰
 ///   （[canCopy] 由页面的 TerminalController 驱动，[extraListen] 带它重建）。
-/// * 断开：离开会话（连着时页面先确认）。
+/// * 断开：关掉活动窗格（连着时先确认）。
 /// 用户自定义排布留给设置体系（M3+）。
 class TerminalKeyBar extends StatefulWidget {
   final FrameTerminal terminal;

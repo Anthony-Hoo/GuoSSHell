@@ -7,7 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'bindings/bindings.dart';
 import 'catalog/connection_list_page.dart';
 import 'terminal/session_target.dart';
-import 'terminal/terminal_page.dart';
+import 'workspace/workspace_page.dart';
 
 /// 调试用的自动连接（debug 构建 + --dart-define 注入，见 README）：
 /// 启动后直接以快速连接打开终端。
@@ -84,8 +84,8 @@ class _StartupGateState extends State<_StartupGate> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       Navigator.of(context).push(MaterialPageRoute<void>(
-        builder: (_) => TerminalPage(
-          target: SessionTarget.quick(
+        builder: (_) => WorkspacePage(
+          initial: SessionTarget.quick(
             host: _autoHost,
             port: _autoPort,
             username: _autoUser,

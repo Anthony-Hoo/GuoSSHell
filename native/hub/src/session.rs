@@ -17,10 +17,11 @@ use tokio::time::{Instant, sleep_until};
 
 use rshell_m0::rshell_core::{
     CellPosition, KeyCode, KeyModifiers, MouseButton, MouseEventKind, RenderFrame, SelectionRange,
-    TerminalInput, TerminalMouseEvent, TerminalSize, Viewport,
+    SessionFailure, TerminalInput, TerminalMouseEvent, TerminalSize, Viewport,
 };
 use rshell_m0::rshell_session::{
-    DefaultTerminalEngine, SessionTransport, TerminalEngine, TransportEvent, ViewportBounds,
+    DefaultTerminalEngine, NativeSshTransport, SessionTransport, TerminalEngine, TransportEvent,
+    ViewportBounds,
 };
 
 use crate::app::AppContext;
@@ -31,8 +32,8 @@ use crate::settings;
 use crate::signals::interaction::InteractionReply;
 use crate::signals::{
     ClipboardText, ConnectHint, ConnectRequest, CopyRequest, DisconnectRequest, FailureKind,
-    FrameAck, FrameUpdate, InputRequest, MouseRequest, PasteRequest, PerfStats, ResizeRequest,
-    SelectionRequest, SelectionState, SessionState, SessionStatus, ViewportRequest,
+    FrameAck, FrameUpdate, InputRequest, MouseRequest, PasteRequest, PerfStats, ReconnectRequest,
+    ResizeRequest, SelectionRequest, SelectionState, SessionState, SessionStatus, ViewportRequest,
 };
 
 const NO_CURSOR: i32 = -1;
@@ -44,6 +45,8 @@ pub enum SessionCommand {
     Resize(TerminalSize),
     Viewport(Window),
     Disconnect,
+    /// 断开之后再连一次（画面与滚回保留）。
+    Reconnect,
     Input(TerminalInput),
     Mouse(TerminalMouseEvent),
     Selection(SelectionRequest),
@@ -118,6 +121,7 @@ pub async fn supervisor(context: Arc<AppContext>) {
     let resize_rx = ResizeRequest::get_dart_signal_receiver();
     let disconnect_rx = DisconnectRequest::get_dart_signal_receiver();
     let viewport_rx = ViewportRequest::get_dart_signal_receiver();
+    let reconnect_rx = ReconnectRequest::get_dart_signal_receiver();
     let input_rx = InputRequest::get_dart_signal_receiver();
     let mouse_rx = MouseRequest::get_dart_signal_receiver();
     let selection_rx = SelectionRequest::get_dart_signal_receiver();
@@ -185,6 +189,10 @@ pub async fn supervisor(context: Arc<AppContext>) {
                 let Some(pack) = pack else { break };
                 send(&sessions, pack.message.session_id, SessionCommand::Disconnect);
             }
+            pack = reconnect_rx.recv() => {
+                let Some(pack) = pack else { break };
+                send(&sessions, pack.message.session_id, SessionCommand::Reconnect);
+            }
             pack = viewport_rx.recv() => {
                 let Some(pack) = pack else { break };
                 let request = pack.message;
@@ -235,6 +243,116 @@ pub async fn supervisor(context: Arc<AppContext>) {
     }
 }
 
+/// 终端：引擎（网格与滚回）与显示状态。第一次连上时建立，断线重连时保留——重连后画面与
+/// 滚回都还在，新的输出接在后面。
+struct Screen {
+    engine: DefaultTerminalEngine,
+    /// 显示的窗口由 Dart 按滚动位置请求；打字、粘贴时回到屏幕。
+    window: Window,
+    rows: u16,
+    stats: PerfWindow,
+    pacer: FramePacer,
+    mouse_motion: MouseMotion,
+    /// 选区权威在引擎（M2a 方案 A）：一直持有当前选区，每次 render 都带上它——内容重排、
+    /// 滚动时高亮跟着引擎走，不是 Dart 侧自己维护一套坐标。
+    selection: Option<SelectionRange>,
+}
+
+impl Screen {
+    fn new(engine: DefaultTerminalEngine, size: TerminalSize) -> Self {
+        Self {
+            engine,
+            window: Window::Bottom,
+            rows: size.rows,
+            stats: PerfWindow::new(),
+            pacer: FramePacer::new(),
+            mouse_motion: MouseMotion::default(),
+            selection: None,
+        }
+    }
+
+    /// 立即出帧。
+    fn present(&mut self, session_id: u32) -> Result<(), String> {
+        present(
+            session_id,
+            &mut self.engine,
+            self.window.viewport(self.rows),
+            self.selection,
+            &mut self.stats,
+            &mut self.pacer,
+        )
+    }
+
+    /// 内容或窗口变了：节拍允许就出帧，否则记为待发。
+    fn changed(&mut self, session_id: u32) -> Result<(), String> {
+        if self.pacer.mark_dirty(Instant::now()) {
+            self.present(session_id)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 攒着的变化：节拍允许了就画出来。
+    fn flush(&mut self, session_id: u32) -> Result<(), String> {
+        if self.pacer.ready_for_pending(Instant::now()) {
+            self.present(session_id)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn resize(&mut self, session_id: u32, size: TerminalSize) -> Result<(), String> {
+        self.engine
+            .resize(size)
+            .map_err(|error| format!("engine resize: {error:?}"))?;
+        self.rows = size.rows;
+        self.present(session_id)
+    }
+
+    /// 与连接无关的命令（滚回、选区、复制、帧确认）：处理掉返回 `None`，其余原样交回。
+    fn handle_local(
+        &mut self,
+        session_id: u32,
+        command: SessionCommand,
+    ) -> Result<Option<SessionCommand>, String> {
+        match command {
+            SessionCommand::Viewport(window) => {
+                self.window = window;
+                self.changed(session_id)?;
+            }
+            SessionCommand::Selection(request) => {
+                // 选区变化：更新引擎持有的选区 → 重渲染发帧（高亮跟着内容走）→ 把引擎的
+                // 选区原样回显（Dart 用它对耳朵/气泡定位）。
+                self.selection = selection_range_from_request(request);
+                self.present(session_id)?;
+                send_selection_state(session_id, self.selection);
+            }
+            SessionCommand::Copy => {
+                // 取文在引擎里（跨行拼接、裁行尾空格都由它负责）。
+                let text = match self.selection {
+                    Some(range) => self.engine.selected_text(range).unwrap_or_default(),
+                    None => String::new(),
+                };
+                ClipboardText { session_id, text }.send_signal_to_dart();
+            }
+            SessionCommand::FrameAck(seq) => {
+                // 上一帧 Dart 已处理完：攒着的变化现在可以画了（节拍允许的话）。
+                self.pacer.acked(seq);
+                self.flush(session_id)?;
+            }
+            other => return Ok(Some(other)),
+        }
+        Ok(None)
+    }
+}
+
+/// 断开之后怎么办。
+enum Next {
+    Reconnect,
+    /// 窗格关了（或 App 退出）：会话结束。
+    Quit,
+}
+
 async fn run_session(
     context: Arc<AppContext>,
     mut request: ConnectRequest,
@@ -243,251 +361,321 @@ async fn run_session(
 ) {
     let session_id = request.session_id;
     // 快速连接的密码：所有权直接移进 SecretString（drop 时清零），请求里不留明文副本
-    // （PLAN.md §2.2：secret 不可序列化，边界上手写转换）。
-    let quick_password = SecretString::from(std::mem::take(&mut request.password));
-    // 首个 PTY 尺寸就是连接请求带来的几何（Dart 在布局完成后才发请求）。
-    let size = clamped_size(TerminalSize {
+    // （PLAN.md §2.2：secret 不可序列化，边界上手写转换）。只用于第一次连接，重连时再问。
+    let mut quick_password = Some(SecretString::from(std::mem::take(&mut request.password)));
+    // 首个 PTY 尺寸就是连接请求带来的几何（Dart 在布局完成后才发请求）；之后跟着改尺寸走。
+    let mut size = clamped_size(TerminalSize {
         cols: request.cols,
         rows: request.rows,
         pixel_width: request.pixel_width,
         pixel_height: request.pixel_height,
         dpi: request.dpi,
     });
-
-    let target = match connect::resolve_target(&context, &request).await {
-        Ok(target) => target,
-        Err(abort) => {
-            report_abort(session_id, abort, "", 0).await;
-            return;
-        }
-    };
-    let described = target.describe();
-    let (host, port) = (target.profile.host.clone(), target.profile.port);
-    report(session_id, SessionState::Connecting, described.clone());
-
+    // 终端在第一次连上时建立，重连时保留。
+    let mut terminal: Option<Screen> = None;
     // 连接期间收到的输入 / 尺寸变化：连上后先按原顺序处理。
     let mut backlog = VecDeque::new();
-    let channels = Channels {
-        commands: &mut commands,
-        replies: &mut replies,
-        backlog: &mut backlog,
-    };
-    let established =
-        connect::establish(&context, session_id, target, quick_password, size, channels).await;
-    drop(replies);
-    let Connected {
-        mut transport,
-        profile,
-    } = match established {
-        Ok(connected) => connected,
-        Err(abort) => {
-            report_abort(session_id, abort, &host, port).await;
-            return;
-        }
-    };
-    debug_print!("[session {session_id}] connected");
-    report(session_id, SessionState::Connected, described);
 
-    let terminal = settings::terminal_settings(&context)
-        .await
-        .resolve(&profile.terminal_overrides);
-    let mut engine = match DefaultTerminalEngine::new(&terminal, size) {
-        Ok(engine) => engine,
-        Err(error) => {
-            report_end(
-                session_id,
-                SessionEnd::failed(FailureKind::Other, format!("engine: {error:?}")),
-            );
-            let _ = transport.shutdown().await;
-            return;
-        }
-    };
-    // 显示的窗口由 Dart 按滚动位置请求；打字、粘贴时回到屏幕。
-    let mut window = Window::Bottom;
-    let mut screen_rows = size.rows;
-    let mut stats = PerfWindow::new();
-    let mut pacer = FramePacer::new();
-    let mut mouse_motion = MouseMotion::default();
-    // 选区权威在引擎（M2a 方案 A）：连接的整个生命周期里持有当前选区，
-    // 每次 render 都带上它——内容重排/滚动时高亮跟着引擎走，不是 Dart 侧
-    // 自己维护一套坐标。
-    let mut selection: Option<SelectionRange> = None;
+    loop {
+        let first_attempt = quick_password.is_some();
+        let password = quick_password
+            .take()
+            .unwrap_or_else(|| SecretString::from(String::new()));
+        let attempt = async {
+            let target = connect::resolve_target(&context, &request)
+                .await
+                .map_err(|abort| (abort, String::new(), 0))?;
+            let described = target.describe();
+            let (host, port) = (target.profile.host.clone(), target.profile.port);
+            report(session_id, SessionState::Connecting, described.clone());
+            let channels = Channels {
+                commands: &mut commands,
+                replies: &mut replies,
+                backlog: &mut backlog,
+            };
+            connect::establish(&context, session_id, target, password, size, channels)
+                .await
+                .map(|connected| (connected, described))
+                .map_err(|abort| (abort, host, port))
+        };
+        let (
+            Connected {
+                mut transport,
+                profile,
+            },
+            described,
+        ) = match attempt.await {
+            Ok(connected) => connected,
+            Err((abort, host, port)) => {
+                // 第一次连接就被取消（关了密码框等）：会话就此结束（Dart 关掉窗格）。
+                // 其余情况留在断开状态，等用户重试或关掉窗格。
+                if first_attempt && matches!(abort, Abort::Cancelled) {
+                    report(session_id, SessionState::Cancelled, String::new());
+                    return;
+                }
+                match abort {
+                    Abort::Cancelled => {
+                        report(session_id, SessionState::Closed, "cancelled".into())
+                    }
+                    abort => report_abort(session_id, abort, &host, port).await,
+                }
+                match wait_offline(
+                    session_id,
+                    &mut terminal,
+                    &mut size,
+                    &mut commands,
+                    &mut backlog,
+                )
+                .await
+                {
+                    Next::Reconnect => continue,
+                    Next::Quit => return,
+                }
+            }
+        };
+        debug_print!("[session {session_id}] connected");
+        report(session_id, SessionState::Connected, described);
 
-    let end = 'session: {
-        // 连接建立即送第一帧（欢迎横幅可能已经进了引擎）。
-        if let Err(detail) = present(
-            session_id,
-            &mut engine,
-            window.viewport(screen_rows),
-            selection,
-            &mut stats,
-            &mut pacer,
-        ) {
-            break 'session SessionEnd::failed(FailureKind::Other, detail);
-        }
-        send_selection_state(session_id, None);
-
-        loop {
-            let frame_deadline = pacer.deadline();
-            tokio::select! {
-                event = transport.next_event() => match event {
-                    Ok(TransportEvent::Output(bytes)) => {
-                        match engine.advance(&bytes) {
-                            Ok(delta) => {
-                                // 引擎对远端查询的应答（DA / 光标位置报告…）必须回写，
-                                // 否则对端会一直等（m0 探针忽略它只是因为探针不需要应答）。
-                                if !delta.outbound.is_empty() {
-                                    let _ = transport.write(&delta.outbound).await;
-                                }
-                                if delta.dirty
-                                    && pacer.mark_dirty(Instant::now())
-                                    && let Err(detail) =
-                                        present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer)
-                                {
-                                    break SessionEnd::failed(FailureKind::Other, detail);
-                                }
-                            }
-                            Err(error) => {
-                                break SessionEnd::failed(FailureKind::Other, format!("advance: {error:?}"));
-                            }
-                        }
-                    }
-                    Ok(TransportEvent::Failure(failure)) => {
-                        break SessionEnd::failed(connect::failure_kind(failure.failure()), format!("session: {failure:?}"));
-                    }
-                    Ok(TransportEvent::Eof) => {
-                        break SessionEnd::closed("eof");
-                    }
-                    Ok(TransportEvent::Exit(status)) => {
-                        break SessionEnd::closed(format!(
-                            "exit code={:?} success={}",
-                            status.code, status.success
-                        ));
-                    }
-                    Ok(_) => {}
+        let screen = match &mut terminal {
+            // 重连：回到主屏、复位上一个远端留下的模式（滚回不动），另起一行接新的输出。
+            Some(screen) => {
+                let _ = screen.engine.recover_display();
+                let _ = screen.engine.advance(b"\r\n");
+                screen.window = Window::Bottom;
+                screen
+            }
+            None => {
+                let resolved = settings::terminal_settings(&context)
+                    .await
+                    .resolve(&profile.terminal_overrides);
+                match DefaultTerminalEngine::new(&resolved, size) {
+                    Ok(engine) => terminal.insert(Screen::new(engine, size)),
                     Err(error) => {
-                        break SessionEnd::failed(connect::failure_kind(error.failure()), format!("transport: {error:?}"));
-                    }
-                },
-                // 合帧：高输出期间攒下的内容到点一次性画出。
-                () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
-                    if pacer.ready_for_pending(Instant::now())
-                        && let Err(detail) =
-                            present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer)
-                    {
-                        break SessionEnd::failed(FailureKind::Other, detail);
+                        report_end(
+                            session_id,
+                            SessionEnd::failed(FailureKind::Other, format!("engine: {error:?}")),
+                        );
+                        let _ = transport.shutdown().await;
+                        return;
                     }
                 }
-                command = next_command(&mut backlog, &mut commands) => match command {
-                    Some(SessionCommand::Resize(new_size)) => {
-                        if let Err(error) = engine.resize(new_size) {
-                            break SessionEnd::failed(FailureKind::Other, format!("engine resize: {error:?}"));
+            }
+        };
+        let (end, quit) = run_connected(
+            session_id,
+            screen,
+            &mut transport,
+            &mut size,
+            &mut commands,
+            &mut backlog,
+        )
+        .await;
+        // 会话结束：先把合帧里攒着的变化画出来（最后一屏输出不能丢），再报状态。
+        if screen.pacer.has_pending() {
+            let _ = screen.present(session_id);
+        }
+        report_end(session_id, end);
+        let _ = transport.shutdown().await;
+        if quit {
+            return;
+        }
+        match wait_offline(
+            session_id,
+            &mut terminal,
+            &mut size,
+            &mut commands,
+            &mut backlog,
+        )
+        .await
+        {
+            Next::Reconnect => {}
+            Next::Quit => return,
+        }
+    }
+}
+
+/// 连着的时候：远端输出进引擎、Dart 的命令转给引擎与远端。返回会话怎么结束的，以及是不是
+/// 窗格关了（此时不再等重连）。
+async fn run_connected(
+    session_id: u32,
+    screen: &mut Screen,
+    transport: &mut NativeSshTransport,
+    size: &mut TerminalSize,
+    commands: &mut UnboundedReceiver<SessionCommand>,
+    backlog: &mut VecDeque<SessionCommand>,
+) -> (SessionEnd, bool) {
+    // 连接建立即送第一帧（欢迎横幅可能已经进了引擎）。
+    if let Err(detail) = screen.present(session_id) {
+        return (SessionEnd::failed(FailureKind::Other, detail), false);
+    }
+    send_selection_state(session_id, screen.selection);
+
+    loop {
+        let frame_deadline = screen.pacer.deadline();
+        tokio::select! {
+            event = transport.next_event() => match event {
+                Ok(TransportEvent::Output(bytes)) => match screen.engine.advance(&bytes) {
+                    Ok(delta) => {
+                        // 引擎对远端查询的应答（DA / 光标位置报告…）必须回写，
+                        // 否则对端会一直等。
+                        if !delta.outbound.is_empty() {
+                            let _ = transport.write(&delta.outbound).await;
                         }
-                        screen_rows = new_size.rows;
+                        if delta.dirty
+                            && let Err(detail) = screen.changed(session_id)
+                        {
+                            return (SessionEnd::failed(FailureKind::Other, detail), false);
+                        }
+                    }
+                    Err(error) => {
+                        return (SessionEnd::failed(FailureKind::Other, format!("advance: {error:?}")), false);
+                    }
+                },
+                Ok(TransportEvent::Failure(failure)) => {
+                    return (SessionEnd::failed(lost(failure.failure()), format!("session: {failure:?}")), false);
+                }
+                Ok(TransportEvent::Eof) => return (SessionEnd::closed("eof"), false),
+                Ok(TransportEvent::Exit(status)) => {
+                    return (
+                        SessionEnd::closed(format!("exit code={:?} success={}", status.code, status.success)),
+                        false,
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return (SessionEnd::failed(lost(error.failure()), format!("transport: {error:?}")), false);
+                }
+            },
+            // 合帧：高输出期间攒下的内容到点一次性画出。
+            () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
+                if let Err(detail) = screen.flush(session_id) {
+                    return (SessionEnd::failed(FailureKind::Other, detail), false);
+                }
+            }
+            command = next_command(backlog, commands) => {
+                let command = match command {
+                    Some(command) => command,
+                    None => return (SessionEnd::closed("disconnect"), true),
+                };
+                let command = match screen.handle_local(session_id, command) {
+                    Ok(Some(command)) => command,
+                    Ok(None) => continue,
+                    Err(detail) => return (SessionEnd::failed(FailureKind::Other, detail), false),
+                };
+                match command {
+                    SessionCommand::Resize(new_size) => {
+                        *size = new_size;
+                        if let Err(detail) = screen.resize(session_id, new_size) {
+                            return (SessionEnd::failed(FailureKind::Other, detail), false);
+                        }
                         if let Err(error) = transport.resize(new_size).await {
                             // window-change 失败不立刻判死；远端布局暂旧，后续 resize 可再试。
-                            rinf::debug_print!("window-change failed: {error:?}");
-                        }
-                        if let Err(detail) = present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer) {
-                            break SessionEnd::failed(FailureKind::Other, detail);
+                            debug_print!("window-change failed: {error:?}");
                         }
                     }
-                    Some(SessionCommand::Viewport(requested)) => {
-                        window = requested;
-                        if pacer.mark_dirty(Instant::now())
-                            && let Err(detail) = present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer)
-                        {
-                            break SessionEnd::failed(FailureKind::Other, detail);
-                        }
-                    }
-                    Some(SessionCommand::Input(input)) => {
-                        // M2 输入闭环：键编码（ETX/Kitty/CSI-u）在引擎里，
-                        // 这里只负责把编码结果写进 transport。打字回到屏幕（Dart 同时滚到底）。
-                        window = Window::Bottom;
-                        match engine.encode_input(input) {
+                    SessionCommand::Input(input) => {
+                        // 键编码（ETX/Kitty/CSI-u）在引擎里，这里只负责把编码结果写进
+                        // transport。打字回到屏幕（Dart 同时滚到底）。
+                        screen.window = Window::Bottom;
+                        match screen.engine.encode_input(input) {
                             Ok(bytes) if !bytes.is_empty() => {
                                 if let Err(error) = transport.write(&bytes).await {
-                                    break SessionEnd::failed(FailureKind::Other, format!("input write: {error:?}"));
+                                    return (SessionEnd::failed(lost(error.failure()), format!("input write: {error:?}")), false);
                                 }
                             }
                             Ok(_) => {}
                             Err(error) => {
-                                break SessionEnd::failed(FailureKind::Other, format!("encode_input: {error:?}"));
+                                return (SessionEnd::failed(FailureKind::Other, format!("encode_input: {error:?}")), false);
                             }
                         }
                     }
-                    Some(SessionCommand::Mouse(event)) => {
+                    SessionCommand::Mouse(event) => {
                         // 远端没开对应的鼠标上报（shell 等）时 encode 返回 Err——
                         // 远端不要这类事件，静默忽略（M2a）。
-                        if mouse_motion.admit(&event) {
-                            match engine.encode_mouse(event) {
-                                Ok(bytes) if !bytes.is_empty() => {
-                                    if let Err(error) = transport.write(&bytes).await {
-                                        break SessionEnd::failed(FailureKind::Other, format!("mouse write: {error:?}"));
-                                    }
-                                }
-                                Ok(_) | Err(_) => {}
-                            }
+                        if screen.mouse_motion.admit(&event)
+                            && let Ok(bytes) = screen.engine.encode_mouse(event)
+                            && !bytes.is_empty()
+                            && let Err(error) = transport.write(&bytes).await
+                        {
+                            return (SessionEnd::failed(lost(error.failure()), format!("mouse write: {error:?}")), false);
                         }
                     }
-                    Some(SessionCommand::Selection(request)) => {
-                        // 选区变化：更新引擎持有的选区 → 重渲染发帧（高亮跟着
-                        // 内容走）→ 把引擎的选区原样回显（Dart 用它对耳朵/气泡定位）。
-                        selection = selection_range_from_request(request);
-                        if let Err(detail) = present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer) {
-                            break SessionEnd::failed(FailureKind::Other, detail);
-                        }
-                        send_selection_state(session_id, selection);
-                    }
-                    Some(SessionCommand::Copy) => {
-                        // 取文在引擎里（跨行拼接、裁行尾空格都由它负责）。
-                        let text = match selection {
-                            Some(range) => engine.selected_text(range).unwrap_or_default(),
-                            None => String::new(),
-                        };
-                        ClipboardText { session_id, text }.send_signal_to_dart();
-                    }
-                    Some(SessionCommand::Paste(text)) => {
-                        window = Window::Bottom;
-                        let bytes = paste_bytes(&text, engine.display_modes().bracketed_paste);
+                    SessionCommand::Paste(text) => {
+                        screen.window = Window::Bottom;
+                        let bytes = paste_bytes(&text, screen.engine.display_modes().bracketed_paste);
                         if !bytes.is_empty()
                             && let Err(error) = transport.write(&bytes).await
                         {
-                            break SessionEnd::failed(FailureKind::Other, format!("paste write: {error:?}"));
+                            return (SessionEnd::failed(lost(error.failure()), format!("paste write: {error:?}")), false);
                         }
                     }
-                    Some(SessionCommand::FrameAck(seq)) => {
-                        // 上一帧 Dart 已处理完：攒着的变化现在可以画了（节拍允许的话）。
-                        pacer.acked(seq);
-                        if pacer.ready_for_pending(Instant::now())
-                            && let Err(detail) =
-                                present(session_id, &mut engine, window.viewport(screen_rows), selection, &mut stats, &mut pacer)
-                        {
-                            break SessionEnd::failed(FailureKind::Other, detail);
-                        }
-                    }
-                    Some(SessionCommand::Disconnect) | None => {
-                        break SessionEnd::closed("disconnect");
-                    }
-                },
+                    SessionCommand::Disconnect => return (SessionEnd::closed("disconnect"), true),
+                    // 连着的时候重连无意义。
+                    SessionCommand::Reconnect => {}
+                    SessionCommand::Viewport(_)
+                    | SessionCommand::Selection(_)
+                    | SessionCommand::Copy
+                    | SessionCommand::FrameAck(_) => {}
+                }
             }
         }
-    };
-
-    // 会话结束：先把合帧里攒着的变化画出来（最后一屏输出不能丢），再报状态。
-    if pacer.has_pending() {
-        let _ = present(
-            session_id,
-            &mut engine,
-            window.viewport(screen_rows),
-            selection,
-            &mut stats,
-            &mut pacer,
-        );
     }
-    report_end(session_id, end);
+}
 
-    let _ = transport.shutdown().await;
+/// 断开之后：滚回、选区、复制照常（引擎还在），尺寸变化记下来留给重连；等用户重连或关掉
+/// 窗格。连接期间攒下的输入已经没有去处，丢掉。
+async fn wait_offline(
+    session_id: u32,
+    screen: &mut Option<Screen>,
+    size: &mut TerminalSize,
+    commands: &mut UnboundedReceiver<SessionCommand>,
+    backlog: &mut VecDeque<SessionCommand>,
+) -> Next {
+    for command in backlog.drain(..) {
+        if let SessionCommand::Resize(new_size) = command {
+            *size = new_size;
+        }
+    }
+    loop {
+        let frame_deadline = screen.as_ref().and_then(|screen| screen.pacer.deadline());
+        tokio::select! {
+            () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
+                if let Some(screen) = screen.as_mut()
+                    && let Err(detail) = screen.flush(session_id)
+                {
+                    debug_print!("[session {session_id}] offline frame: {detail}");
+                }
+            }
+            command = commands.recv() => match command {
+                Some(SessionCommand::Reconnect) => return Next::Reconnect,
+                Some(SessionCommand::Disconnect) | None => return Next::Quit,
+                Some(SessionCommand::Resize(new_size)) => {
+                    *size = new_size;
+                    if let Some(screen) = screen.as_mut()
+                        && let Err(detail) = screen.resize(session_id, new_size)
+                    {
+                        debug_print!("[session {session_id}] offline resize: {detail}");
+                    }
+                }
+                // 没有连接可写：输入、鼠标、粘贴都丢掉。
+                Some(command) => {
+                    if let Some(screen) = screen.as_mut()
+                        && let Err(detail) = screen.handle_local(session_id, command)
+                    {
+                        debug_print!("[session {session_id}] offline: {detail}");
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// 连上之后的网络失败与超时：连接断了（区别于连不上）。
+fn lost(failure: SessionFailure) -> FailureKind {
+    match failure {
+        SessionFailure::Network | SessionFailure::Timeout => FailureKind::ConnectionLost,
+        failure => connect::failure_kind(failure),
+    }
 }
 
 /// 下一条命令：连接期间攒下的先出。
@@ -977,10 +1165,12 @@ fn send_frame(
 mod tests {
     #![allow(clippy::expect_used)]
     use super::{
-        FramePacer, MouseMotion, Window, mouse_event_from_request, paste_bytes,
+        FramePacer, MouseMotion, Window, lost, mouse_event_from_request, paste_bytes,
         terminal_input_from_request,
     };
+    use crate::signals::FailureKind;
     use crate::signals::{InputRequest, MouseRequest};
+    use rshell_m0::rshell_core::SessionFailure;
     use rshell_m0::rshell_core::{
         KeyCode, MouseButton, MouseEventKind, TerminalInput, TerminalOverrides, TerminalSettingsV1,
         TerminalSize,
@@ -1310,5 +1500,15 @@ mod tests {
             )
             .expect("tail");
         assert_eq!(tail.rows.len(), 5);
+    }
+
+    #[test]
+    fn network_failures_after_connecting_mean_the_connection_was_lost() {
+        assert_eq!(lost(SessionFailure::Network), FailureKind::ConnectionLost);
+        assert_eq!(lost(SessionFailure::Timeout), FailureKind::ConnectionLost);
+        assert_eq!(
+            lost(SessionFailure::Authentication),
+            FailureKind::Authentication
+        );
     }
 }

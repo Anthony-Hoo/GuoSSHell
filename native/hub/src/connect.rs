@@ -45,6 +45,10 @@ use crate::signals::{ConnectRequest, FailureKind};
 const CONNECT_BUDGET: Duration = Duration::from_secs(60);
 /// 交给传输层的连接上限（含等用户的时间），只防一直没人回答。
 const CONNECT_LIMIT: Duration = Duration::from_secs(30 * 60);
+/// 连上之后：这么久收不到服务器的任何东西就发 keepalive，连续这么多个没有回音就算断了
+/// （对端悄悄没了——休眠、换网络——一分钟内结束会话，可以重连）。空闲时才发，挂起时不发。
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_MAX: usize = 3;
 
 pub struct Connected {
     pub transport: NativeSshTransport,
@@ -247,6 +251,7 @@ pub async fn establish(
         .with_timeout(CONNECT_LIMIT);
     let mut transport = NativeSshTransport::new(profile.clone(), auth, verifier)
         .and_then(|transport| transport.with_connect_timeout(CONNECT_LIMIT))
+        .and_then(|transport| transport.with_keepalive(KEEPALIVE_INTERVAL, KEEPALIVE_MAX))
         .map_err(|error| {
             Abort::failed(
                 failure_kind(error.failure()),

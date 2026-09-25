@@ -26,6 +26,13 @@ pub struct AppStart {
     pub support_dir: String,
 }
 
+/// App 进入后台 / 回到前台（Flutter 的 AppLifecycleState）。进后台时向系统申请一小段后台
+/// 运行时间，刚切出去的连接不会立刻被挂起。
+#[derive(Deserialize, DartSignal)]
+pub struct AppLifecycle {
+    pub foreground: bool,
+}
+
 /// 启动结果。`ok = false` 时存储不可用（`detail` 说明原因），目录与连接都不能用。
 #[derive(Serialize, RustSignal)]
 pub struct AppReady {
@@ -72,6 +79,12 @@ pub struct ResizeRequest {
 
 #[derive(Deserialize, DartSignal)]
 pub struct DisconnectRequest {
+    pub session_id: u32,
+}
+
+/// 断开之后再连一次（同一会话：画面与滚回都保留，新的输出接在后面）。
+#[derive(Deserialize, DartSignal)]
+pub struct ReconnectRequest {
     pub session_id: u32,
 }
 
@@ -189,6 +202,8 @@ pub enum FailureKind {
     HostKeyChanged,
     Network,
     Timeout,
+    /// 连上之后断了：网络中断，或服务器不再响应（keepalive 没有回音）。
+    ConnectionLost,
     /// 钥匙串读写失败。
     Keychain,
     /// OpenPGP 卡：没有找到这张卡（没插上、没靠近）。

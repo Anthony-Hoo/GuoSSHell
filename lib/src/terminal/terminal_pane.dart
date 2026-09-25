@@ -204,8 +204,11 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   @override
   void dispose() {
-    // 窗格从界面上移除（关窗格、关标签、离开工作区）即结束会话（连接中的也一并取消）。
-    if (_sessionId != 0 && !_ended) DisconnectRequest(sessionId: _sessionId).sendSignalToRust();
+    // 窗格从界面上移除（关窗格、关标签、离开工作区）即结束会话：连接中的一并取消，断开后
+    // 还在等重连的也结束；只有连接前被取消的会话 Rust 那边已经收掉了。
+    if (_sessionId != 0 && _state != SessionState.cancelled) {
+      DisconnectRequest(sessionId: _sessionId).sendSignalToRust();
+    }
     if (_controller._pane == this) _controller._pane = null;
     _statusSub?.cancel();
     _frameSub?.cancel();
@@ -222,11 +225,6 @@ class _TerminalPaneState extends State<TerminalPane> {
     _scroll.dispose();
     super.dispose();
   }
-
-  bool get _ended =>
-      _state == SessionState.failed ||
-      _state == SessionState.closed ||
-      _state == SessionState.cancelled;
 
   void _onStatus(RustSignalPack<SessionStatus> pack) {
     final msg = pack.message;
@@ -694,7 +692,21 @@ class _TerminalPaneState extends State<TerminalPane> {
     _terminal.paste(text);
   }
 
-  /// 发起（或重新发起）会话：换新编号，等终端量好几何后发 ConnectRequest。
+  /// 断开之后再连：同一会话，画面与滚回保留，新的输出接在后面。
+  void _reconnect() {
+    _promptsDismissed.value = false;
+    _controller._report(state: SessionState.connecting);
+    setState(() {
+      _state = SessionState.connecting;
+      _failure = FailureKind.none;
+      _detail = '';
+      _localNetworkSettingsUrl = '';
+      _hint = ConnectHint.none;
+    });
+    ReconnectRequest(sessionId: _sessionId).sendSignalToRust();
+  }
+
+  /// 发起会话：分配编号，等终端量好几何后发 ConnectRequest。
   void _startSession() {
     _sessionId = _nextSessionId++;
     _promptsDismissed.value = false;
@@ -758,7 +770,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                 onPressed: () => _openSettings(_localNetworkSettingsUrl),
                 child: const Text('打开设置'),
               ),
-            TextButton(onPressed: _startSession, child: const Text('重试')),
+            TextButton(onPressed: _reconnect, child: const Text('重试')),
             TextButton(onPressed: widget.onClose, child: const Text('关闭')),
           ],
           hint: _localNetworkSettingsUrl.isEmpty
@@ -770,7 +782,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           text: '会话已结束',
           detail: _detail,
           actions: [
-            TextButton(onPressed: _startSession, child: const Text('重新连接')),
+            TextButton(onPressed: _reconnect, child: const Text('重新连接')),
             TextButton(onPressed: widget.onClose, child: const Text('关闭')),
           ],
         ),
@@ -882,6 +894,7 @@ String _failureText(FailureKind failure) => switch (failure) {
       FailureKind.hostKeyChanged => '主机密钥已变更，连接已中止',
       FailureKind.network => '无法连接到服务器',
       FailureKind.timeout => '连接超时',
+      FailureKind.connectionLost => '连接已断开：网络中断，或服务器不再响应',
       FailureKind.keychain => '读写钥匙串失败',
       FailureKind.cardNotFound => '没有找到 OpenPGP 卡：请插上（或靠近）登记的那张卡后重试',
       FailureKind.cardKeyMismatch => '卡上的密钥与登记时的不同，请检查是不是插错了卡',

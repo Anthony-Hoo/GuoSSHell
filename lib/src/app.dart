@@ -50,9 +50,16 @@ class _StartupGateState extends State<_StartupGate> {
   bool _ready = false;
   String? _error;
 
+  /// 前后台切换告诉 Rust（进后台时它向系统申请一小段后台时间，连接不会立刻挂起）。
+  late final AppLifecycleListener _lifecycle;
+
   @override
   void initState() {
     super.initState();
+    _lifecycle = AppLifecycleListener(
+      onShow: () => AppLifecycle(foreground: true).sendSignalToRust(),
+      onHide: () => AppLifecycle(foreground: false).sendSignalToRust(),
+    );
     _readySub = AppReady.rustSignalStream.listen((pack) {
       if (!mounted) return;
       if (pack.message.ok) {
@@ -99,6 +106,7 @@ class _StartupGateState extends State<_StartupGate> {
 
   @override
   void dispose() {
+    _lifecycle.dispose();
     _readySub?.cancel();
     _settingsSub?.cancel();
     super.dispose();

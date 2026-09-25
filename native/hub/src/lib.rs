@@ -20,6 +20,7 @@ mod connect;
 mod external_signer;
 mod frame_codec;
 mod keys;
+mod lifecycle;
 mod local_network;
 mod security_key;
 mod session;
@@ -38,6 +39,7 @@ write_interface!();
 async fn main() {
     // 等 Dart 给出数据目录后打开存储，再起目录、设置与会话的处理任务。
     spawn(app::run());
+    spawn(lifecycle::run());
 
     dart_shutdown().await;
 }

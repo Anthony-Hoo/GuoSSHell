@@ -1754,6 +1754,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
 dependencies = [
  "bitflags",
+ "block2",
  "objc2",
  "objc2-foundation",
 ]
@@ -2252,7 +2253,7 @@ dependencies = [
 [[package]]
 name = "rshell-core"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=bb38b1fa4debec6fac86c91b5f84668b3a75c41a#bb38b1fa4debec6fac86c91b5f84668b3a75c41a"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=4ff71e550eb027b4ae442ec51753c19e0b1b1cb1#4ff71e550eb027b4ae442ec51753c19e0b1b1cb1"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2284,7 +2285,7 @@ dependencies = [
 [[package]]
 name = "rshell-platform"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=bb38b1fa4debec6fac86c91b5f84668b3a75c41a#bb38b1fa4debec6fac86c91b5f84668b3a75c41a"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=4ff71e550eb027b4ae442ec51753c19e0b1b1cb1#4ff71e550eb027b4ae442ec51753c19e0b1b1cb1"
 dependencies = [
  "directories",
  "thiserror 2.0.20",
@@ -2294,7 +2295,7 @@ dependencies = [
 [[package]]
 name = "rshell-session"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=bb38b1fa4debec6fac86c91b5f84668b3a75c41a#bb38b1fa4debec6fac86c91b5f84668b3a75c41a"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=4ff71e550eb027b4ae442ec51753c19e0b1b1cb1#4ff71e550eb027b4ae442ec51753c19e0b1b1cb1"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
@@ -2315,7 +2316,7 @@ dependencies = [
 [[package]]
 name = "rshell-storage"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=bb38b1fa4debec6fac86c91b5f84668b3a75c41a#bb38b1fa4debec6fac86c91b5f84668b3a75c41a"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=4ff71e550eb027b4ae442ec51753c19e0b1b1cb1#4ff71e550eb027b4ae442ec51753c19e0b1b1cb1"
 dependencies = [
  "async-trait",
  "keyring",

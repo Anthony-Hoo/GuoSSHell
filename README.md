@@ -1,6 +1,6 @@
 # GuoSSHell
 
-一个 **纯 SSH 客户端**的 iOS / iPadOS 版（iPad 优先）。业务与终端语义跑在 **Rust**
+一个 **纯 SSH 客户端**，iOS / iPadOS（iPad 优先）与 macOS 共用一套代码。业务与终端语义跑在 **Rust**
 （上游 [rsHell](https://github.com/hugefiver/rsHell) 的内核，经我们的 fork 作为 pin 住 rev 的 git 依赖），
 只有渲染与交互用 **Flutter** 重写。Dart 不写业务逻辑。
 
@@ -12,23 +12,31 @@
 GuoSSHell/
 ├── PLAN.md              实现规划：铁律 / 架构 / 实测事实 / 性能预算 / M0–M5 / 复用清单 / 陷阱
 ├── docs/                调研报告（可行性 + 里程碑与 M0 交接单）
-├── lib/                 Flutter app（M1 起）
-│   ├── main.dart        入口：initializeRust + MaterialApp
+├── lib/                 Flutter app（纯展示与交互，无终端状态）
+│   ├── main.dart        入口：initializeRust + 许可登记 + MaterialApp
 │   └── src/
 │       ├── bindings/    rinf gen 生成的 Dart 绑定（**不手改**；rinf 默认不入库）
-│       └── terminal/    帧解码 + 画布 painter + 会话页（纯展示，无终端状态）
-├── native/hub/          rinf 的 Rust 侧（信号层 + 会话 actor + run 压缩编码器）
-│   └── src/             lib.rs · signals/ · frame_codec.rs · session.rs
+│       ├── catalog/     连接目录与编辑
+│       ├── keys/        私钥、OpenPGP 卡、安全密钥
+│       ├── settings/    设置与开源许可页
+│       ├── terminal/    帧解码与帧驱动的终端适配器、窗格、键位条、交互对话框
+│       └── workspace/   标签与分屏
+├── native/hub/          rinf 的 Rust 侧：信号层、会话、连接与认证、钥匙串、卡、安全密钥
+│   └── src/             lib.rs · signals/ · session.rs · connect.rs · keys.rs · card/ · security_key/ …
 ├── rust/                rshell-m0：上游内核的 pin 点（再导出 rshell-core/session）+ M0 探针与示例
 │   ├── Cargo.toml       上游走 git 依赖，rev 只在这里 pin 这一处
 │   ├── UPSTREAM.md      上游来源、为什么用 git 依赖、许可
 │   └── examples/        m0.rs · m0_loopback.rs · bench_frame.rs · demo_server.rs
 ├── Cargo.toml           根 workspace（members = native/*, rust）+ release profile
-├── ios/                 Flutter 的 iOS 宿主（Runner）
+├── ios/                 Flutter 的 iOS 宿主（Runner；PrivacyInfo.xcprivacy）
+├── macos/               Flutter 的 macOS 宿主（沙箱 entitlements）
+├── assets/              内置字体、Rust 依赖许可清单（许可页用）
+├── about.toml / .hbs    cargo-about 配置与输出模板（scripts/licenses.sh）
 └── scripts/
     ├── setup.sh         幂等环境准备
-    ├── sshd-test.sh     本地验收 SSH 服务器（Docker：vim / htop / 主机密钥变更）
-    └── m1bar.sh         60Hz 帧率自检进度条
+    ├── sshd-test.sh     本地验收 SSH 服务器（Docker：vim / htop / 主机密钥变更 / 私钥与安全密钥授权）
+    ├── m1bar.sh         60Hz 帧率自检进度条
+    └── licenses.sh      重新生成许可页里的 Rust 依赖许可
 ```
 
 整个 Rust 侧是**一个 workspace**（根 `Cargo.toml`），`native/hub` 通过 `rshell-m0`
@@ -55,11 +63,11 @@ cargo run --example demo_server -- 2222
 # 或者：真实 sshd（Docker，probe / probe，127.0.0.1:2223，带 vim / htop / m1bar）
 ../scripts/sshd-test.sh up
 
-# App（另开一个终端；iOS 模拟器可达宿主 127.0.0.1）
+# App（另开一个终端；iOS 模拟器与 macOS 都可达宿主 127.0.0.1）
 cd ..
 flutter pub get
 rinf gen                      # 改过 native/hub 的信号结构后要重跑
-flutter run -d <模拟器id> \
+flutter run -d <模拟器id 或 macos> \
   --dart-define=GUOSH_HOST=127.0.0.1 --dart-define=GUOSH_PORT=2222 \
   --dart-define=GUOSH_USER=probe --dart-define=GUOSH_PASS=probe
 # 不带 GUOSH_* 时进入连接列表；带上则（debug 构建）启动后直接以快速连接打开终端，

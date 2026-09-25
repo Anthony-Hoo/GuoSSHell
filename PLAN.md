@@ -507,7 +507,17 @@ RP ID，否则 `ssh:`）。决定见 §6.1「M3d 安全密钥决定」。
   安全密钥不在 release 里
 - 决定见 §6.1「M4 滚回与工作区决定」「M4 生命周期决定」「M4 合规决定」
 
-### M5 — 平台宽度（Android / macOS，**非阻塞，但架构上现在就别堵死**）
+### M5 — 平台宽度（Android / macOS，**非阻塞，但架构上现在就别堵死**）—— ✅ macOS 已完成（2026-09-26；Android 不做）
+
+**范围**：只做 macOS（2026-09-25 定）。Android 不做，下文关于 Android 的分析留作将来参考。
+
+**交付（macOS）**：`macos/` 工程（沙箱，entitlements：网络客户端、智能卡、用户选择的文件只读；
+debug / profile 另有 JIT 与 VM service 需要的两项）；连接、渲染、滚回、标签分屏与 iOS 同一套代码。
+私钥：带团队签名（钥匙串访问组）的构建用 protected data 钥匙串，可 iCloud 同步；本地调试的
+ad-hoc 签名构建用登录钥匙串，iCloud 同步关闭（设置里说明原因）。键位条是设置项，默认值由 Rust
+按平台给（iOS 显示、macOS 不显示）。Rust 核心用到的系统框架（AuthenticationServices、
+CryptoTokenKit、libiconv）由两个平台的 Runner 目标显式链接（陷阱 38）。
+决定见 §6.1「M5 macOS 决定」。
 
 **结论：能加，而且大部分是免费的**——因为已经定下的三条（Rust 是唯一权威、
 rinf 单向信号流、Flutter 只画不解析）本身就与平台无关。
@@ -603,6 +613,15 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 回车、方向键、Ctrl 组合等直接处理的键不得越过之前敲下、仍在平台文本输入里的字符——
 `HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
 平台不答复的键（死键等）150 ms 超时兜底。
+
+**M5 macOS 决定（2026-09-26）：**
+macOS 与 iOS 共用全部 Dart 与 Rust 代码，平台差异都在 Rust 与工程配置里：钥匙串——启动时往
+protected data 钥匙串写一个探测条目再删掉，系统回 `errSecMissingEntitlement`（没有钥匙串访问组，
+即本地调试的 ad-hoc 签名）就改用登录钥匙串、关闭 iCloud 同步（查询不会暴露这个问题，只有写入会）；
+连接密码经上游 keyring 在 macOS 上本来就用登录钥匙串。键位条默认值、本地网络设置页的 URL、
+安全密钥界面挂靠的窗口都由 Rust 按平台给。上游默认窗口标题（「rsHell」）视为没有标题，标签上
+显示连接名。rinf 的 podspec 以 `-undefined dynamic_lookup` 链接 Rust 静态库，Rust 用到的系统
+框架要由 App 目标自己链接（Runner 的 Link Binary With Libraries，SDKROOT 相对路径）。
 
 **M4 滚回与工作区决定（2026-09-26）：**
 滚回的内容只在引擎里。`FrameTerminal` 对 fork 呈现「滚回 + 屏幕」那么多行（行号 = 绝对行 −
@@ -921,6 +940,16 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
     `uptime`、关掉多余的模拟器，再量。
 37. **模拟器的系统进程也会崩**：`backboardd` 崩溃会带着 SpringBoard 与所有 App 一起重启，看起来
     像 App 闪退。先看 `~/Library/Logs/DiagnosticReports/` 里是谁的崩溃报告，再怀疑自己的代码。
+38. **rinf 以 `-undefined dynamic_lookup` 链接 Rust 静态库**：Rust 用到、而 App 又没链接的系统框架，
+    符号要等运行时在已加载的镜像里找。iOS 上 UIKit 顺带加载了 AuthenticationServices，碰巧能跑；
+    macOS 上 AppKit 不加载它，启动即 `dyld: symbol not found in flat namespace`。Rust 依赖的框架
+    （`cargo rustc --lib --crate-type staticlib -- --print native-static-libs` 列出）要由 Runner 目标
+    显式链接。
+39. **macOS 的 protected data 钥匙串要钥匙串访问组**：ad-hoc 签名的本地构建查询不报错（只说「没有」），
+    写入才回 `errSecMissingEntitlement`（-34018）。判断能不能用要试写。
+40. **不能截 macOS 的屏时用 Flutter 自己的截图**：`flutter run` 给出的 VM service 上，widget inspector 的
+    `ext.flutter.inspector.screenshot` 把界面画成 PNG，不需要系统的屏幕录制权限；`evaluate` 可以在 App 的
+    库上下文里直接调请求函数（导入私钥、存连接、发 ConnectRequest）来驱动流程。
 
 ---
 
@@ -966,6 +995,11 @@ docker unpause guosh-sshd
 
 # release 构建冒烟（不签名）
 flutter build ios --release --no-codesign
+
+# macOS：跑 debug 构建（带自动连接），release 构建
+flutter run -d macos --dart-define=GUOSH_HOST=127.0.0.1 --dart-define=GUOSH_PORT=2223 \
+  --dart-define=GUOSH_USER=probe --dart-define=GUOSH_PASS=probe
+flutter build macos --release
 
 # 本地验收 SSH 服务器（Docker；probe / probe，127.0.0.1:2223，自带 vim / htop / m1bar）
 ./scripts/sshd-test.sh up
@@ -1130,7 +1164,20 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
 - [x] release 构建（不签名）通过，39.6 MB；模拟卡与模拟安全密钥不在 release 里
 - [ ] 真机：进后台后的连接行为、release 构建在设备上跑一遍；上架前的决定
       （followup「上架前的产品与合规决定」）
-- [ ] M5
+
+**M5 —— macOS —— ✅ 已完成（2026-09-26，本机 debug 构建验收；Android 不做）**
+
+- [x] `macos/` 工程与 entitlements；debug 构建连上验收服务器，m1bar 60.0 Hz 跑完 600 帧
+- [x] 私钥：ad-hoc 签名的构建自动改用登录钥匙串（iCloud 同步显示为不可用）；导入私钥、存连接、
+      用它登录验收服务器（服务器记为 ED25519 公钥认证）
+- [x] 标签标题：远端没设置标题时显示连接名；键位条在 macOS 默认不显示，设置里可开
+- [x] iOS 回归：显式链接系统框架后模拟器构建与运行照常
+- [x] release 构建：`flutter build macos --release` 通过，85.7 MB（x86_64 + arm64 通用包），启动正常；
+      签名后的 entitlements 为沙箱、网络客户端、智能卡、用户选择的文件只读；模拟卡与模拟安全密钥
+      不在 release 里
+- [ ] 你来验：macOS 上的键盘与菜单（⌘C / ⌘V / ⌘A 在终端里、⌘T / ⌘W / ⌘D）、触控板滚动与选区、
+      窗口缩放；CanoKey 经 USB 读卡登录；带团队签名的构建上 iCloud 钥匙串同步
+      （followup「macOS 键盘菜单与签名构建待验」）
 
 **关于提交**
 

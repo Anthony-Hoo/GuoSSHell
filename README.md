@@ -62,7 +62,8 @@ rinf gen                      # 改过 native/hub 的信号结构后要重跑
 flutter run -d <模拟器id> \
   --dart-define=GUOSH_HOST=127.0.0.1 --dart-define=GUOSH_PORT=2222 \
   --dart-define=GUOSH_USER=probe --dart-define=GUOSH_PASS=probe
-# 不带 GUOSH_* 时是正常的连接表单；
+# 不带 GUOSH_* 时进入连接列表；带上则（debug 构建）启动后直接以快速连接打开终端，
+# GUOSH_PASS 可省略（连接时询问）；
 # GUOSH_CMD=top 可选——exec 模式（连上直接执行命令，M1 帧率实测用，无需键盘）。
 # 60fps 视觉自检：scp scripts/m1bar.sh 到远端后，GUOSH_CMD="bash /tmp/m1bar.sh"
 ```

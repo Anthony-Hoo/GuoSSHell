@@ -378,7 +378,7 @@ m1bar 60fps 不回退、M1 画面能力持平。
 bracketed paste；鼠标转发覆盖触摸点击、触摸拖动转滚轮、鼠标设备的按下/拖动/悬停与修饰键；
 SGR 4 下划线绘制。决定见 §6.1「M2a 粘贴与鼠标决定」。
 
-### M3 — 连接管理与凭证
+### M3 — 连接管理与凭证 —— ✅ 已完成（2026-09-25，模拟器验收；真机钥匙串与本地网络权限复验待硬件）
 
 Flutter 表单做连接编辑，凭证进 iOS Keychain。
 Rust 侧接口现成：`AuthPlan::from_profile(&profile, &vault)` + `CredentialVault`。
@@ -387,7 +387,11 @@ Rust 侧接口现成：`AuthPlan::from_profile(&profile, &vault)` + `CredentialV
 主机密钥确认走真实 UI（`HostKeyPrompt{sha256, changed}`），
 `changed=true` 时给显式警告而不是静默接受。
 
-**⚠ 还债点**：M0 用的是 TOFU 自动接受，**必须在 M3 换成真实确认**。
+**交付**：连接目录（搜索、新建、编辑、复制、删除）与快速连接；密码可存钥匙串或每次询问
+（询问时可勾选连接成功后保存）；首次连接确认主机密钥，密钥变更给出醒目警告、勾选核对后
+才能替换（拒绝即中止）；keyboard-interactive 逐项问答；认证、网络、超时等失败分类提示，
+局域网目标的网络类失败附本地网络权限说明与设置入口；设置页选字体与字号；会话信号带
+`session_id`。决定见 §6.1「M3 连接与凭证决定」。
 
 ### M3a — 私钥认证与同步（M3 之后）
 
@@ -576,6 +580,23 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 `HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
 平台不答复的键（死键等）150 ms 超时兜底。
 
+**M3 连接与凭证决定（2026-09-25）：**
+存储直接用上游：连接目录是 `rshell-storage` 的 SQLite（`SqliteRepository`），增删改一律走
+`CredentialCoordinator::apply_catalog(mutation, SecretUpdate)`——目录与钥匙串之间的两阶段提交、
+引用计数删除、崩溃后 `reconcile` 都是上游的；hub 不用 `ApplicationService`（它启动即开本地
+shell）。数据目录由 Dart 用 path_provider 取 Application Support 交给 Rust（`AppStart`），
+库与本 App 的 known_hosts 都在那里。iOS 上 keyring v1 不注册任何存储，启动时由
+`rshell_m0::register_credential_store` 把 protected data store 设为默认（不随 iCloud 同步）。
+密码每次连接从钥匙串读、不在内存缓存；没存或读不到就在连接前询问，勾选「保存」的在连接
+成功后才写入（rsHell 补丁 P2 让 Password 认证可以不存密码）。主机密钥：新主机与变更的
+密钥都问用户，变更时 `changed=true`，接受即替换该 host:port 的全部旧条目（补丁 P3）。
+交互（密码、主机密钥、keyboard-interactive）经 `InteractionPrompt` / `InteractionReply`
+一问一答；keyboard-interactive 中既无输入项也无说明的一轮直接回空答案。会话类信号都带
+`session_id`（Dart 分配），hub 按它分发；连接期间的输入与尺寸变化连上后按顺序补上。
+失败分类（认证、主机密钥、网络、超时、钥匙串…）过边界，文案在 Dart；目标在局域网且
+失败属网络或超时类时，Rust 给出系统设置 URL（iOS `app-settings:`），Dart 用 url_launcher 打开。
+字体：内置 MesloLGS NF（常规与粗体，斜体由引擎合成），可选系统 Menlo；缺字回退内置字体。
+
 **M2a 粘贴与鼠标决定（2026-09-25）：**
 粘贴走 `PasteRequest`，由 Rust 处理：换行统一成 CR，剔除 Tab 以外的控制字符（防
 `ESC[201~` 注入），远端开了 bracketed paste（DECSET 2004，模式由 rsHell fork 补丁 P1 暴露）
@@ -597,7 +618,6 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 
 ### 6.3 还没找的（做之前必须先找）
 
-- iOS 侧「跳转到系统设置页」的现成实现（本地网络权限被拒后的引导）
 - Flutter 侧的键位条 / 快捷键行（有大量现成实现，如终端类 App 的开源方案）
 - 连接导入（`ssh_config` / 其他客户端迁移）——上游 `rshell-core::protocol::imports` 已有 Rust 侧逻辑
 
@@ -664,10 +684,10 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 
 1. **iPad 上的字号与列数默认值**：`TerminalSize` 由 Flutter 量完回传（§8），
    但 120×40 只是基准值。真实 iPad 上的默认字号/行列数要等 M1 画出来才好定。
-2. **M3 的凭证 UI 形态**：钥匙串存密码「每次连接都读」还是「读一次缓存在内存」，
-   影响 Face ID / 自动填充的介入点。等 M3 再定。
-3. **上游 fork 的边界。** 已经 fork（bracketed paste，UPSTREAM.md 的 P1）。还有两个已知的
-   可能再改上游的需求，都不急：
+2. **M3 的凭证 UI 形态**：已定——每次连接都读钥匙串，不在内存缓存（§6.1 M3 决定）。
+   Face ID 保护（钥匙串条目的访问控制）留到需要时再加。
+3. **上游 fork 的边界。** 已经 fork（UPSTREAM.md 的 P1 bracketed paste、P2 密码可不存、
+   P3 主机密钥变更提示）。还有两个已知的可能再改上游的需求，都不急：
    - **把 iOS 不可用的三个传输（`local` / `pty` / `system_ssh`）从编译图里摘掉**，
      而不是靠链接器裁符号。现在靠 `-Wl,-dead_strip` 能压到 0（§3.2），所以**不急**；
      但如果哪天想做 App Store 的静态审查友好度，或者要减 `.a` 的 65 MB，就得 fork 加 feature gate。
@@ -778,6 +798,18 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
     粘贴验收先在 App 内复制；真机读其他 App 的剪贴板会弹授权提示（见 followup）。
 26. **增删 `pubspec_overrides.yaml` 后要手动 `flutter pub get`**；`flutter run` 不重新解析依赖，
     会继续用 `pubspec.lock` 里的旧来源。
+27. **keyring v1 在 iOS 上不注册任何凭证存储**（macOS / Windows / Linux 才自动注册），
+    `Entry::new` 直接报 NoDefaultStore。启动时自己 `keyring_core::set_default_store`
+    （`rshell_m0::register_credential_store`）。
+28. **rinf 的两个方向语义不同**：Rust 收 Dart 信号有队列（先发后收不丢），但同一信号类型只有
+    最后一个 `get_dart_signal_receiver()` 有效；Dart 收 Rust 信号是广播流，没人订阅时发来的就
+    丢了——要先订阅再发请求（请求号配对的回答同理）。
+29. **PAM 的 keyboard-interactive 在认证通过后还会发一轮「零输入项」请求**，要回空答案；
+    弹给用户就是一个空对话框。
+30. **对话框「自己关掉自己」要移除自己的 route，不能 `pop`**：它可能正在退场动画里，这时
+    `Navigator.pop` 弹掉的是下面的页面（实测：拒绝主机密钥后终端页被一起关掉）。
+31. **`PopScope(canPop: false)` 会直接禁用 iOS 的边缘右滑返回**，`onPopInvoked` 不会被调用；
+    连接中的会话只能从页面上的「断开」离开。
 
 ---
 
@@ -902,7 +934,19 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
       上报（fork 组件测试 + 引擎编码测试；iPad 触控板与 macOS 上实测随 M5）；中键修正
 - [x] SGR 4 下划线绘制
 - [x] 小屏布局：13 mini 模拟器竖屏；mini 真机复验待硬件
-- [ ] M3 / M3a / M3b / M3c(不急) / M3d(不急) / M4 / M5
+
+**M3 —— 连接管理与凭证 —— ✅ 已完成（2026-09-25，模拟器验收）**
+
+- [x] 连接目录：新建、编辑、复制、删除、搜索；杀进程重启仍在；快速连接（debug 自动连接走它）
+- [x] 钥匙串：保存的密码连接时读取；每次询问并可勾选保存；清除密码即删钥匙串条目；
+      复制出的连接共用已存密码，删到最后一个才删条目
+- [x] 主机密钥：首次确认指纹；容器 `sshd-test.sh rekey` 后给出变更警告，拒绝即中止、
+      勾选核对后替换旧条目（rsHell 补丁 P3）
+- [x] keyboard-interactive（容器开启 PAM 问答）；认证失败、网络失败、目标无效的分类提示；
+      局域网目标的本地网络提示与设置入口
+- [x] 设置：内置 MesloLGS NF / 系统 Menlo、字号；新会话生效
+- [ ] 真机：钥匙串读写、本地网络权限弹窗与被拒后的提示（待硬件）
+- [ ] M3a / M3b / M3c(不急) / M3d(不急) / M4 / M5
 
 **关于提交**
 

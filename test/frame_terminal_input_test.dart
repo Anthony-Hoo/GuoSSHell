@@ -104,4 +104,50 @@ void main() {
           const TerminalGeometry(cols: 100, rows: 30, pixelWidth: 900, pixelHeight: 540));
     });
   });
+
+  group('鼠标', () {
+    late List<TerminalInputEvent> events;
+    late FrameTerminal terminal;
+
+    setUp(() {
+      events = [];
+      terminal = FrameTerminal(onInput: (event) {
+        events.add(event);
+        return true;
+      });
+    });
+
+    test('远端没开鼠标上报：不消费，交回本地行为', () {
+      expect(
+        terminal.mouseInput(
+            TerminalMouseButton.left, TerminalMouseButtonState.down, const CellOffset(1, 1)),
+        isFalse,
+      );
+      expect(terminal.mouseMotion(TerminalMouseButton.left, const CellOffset(2, 1)), isFalse);
+      expect(events, isEmpty);
+    });
+
+    test('拖动与悬停带着键和修饰键发出，越界坐标夹到网格内', () {
+      terminal.mouseReporting = true;
+
+      expect(
+        terminal.mouseInput(
+            TerminalMouseButton.left, TerminalMouseButtonState.down, const CellOffset(1, 1),
+            ctrl: true),
+        isTrue,
+      );
+      expect(terminal.mouseMotion(TerminalMouseButton.left, const CellOffset(200, 1)), isTrue);
+      expect(terminal.mouseMotion(null, const CellOffset(3, 2), alt: true), isTrue);
+
+      final mouse = events.cast<MouseInputEvent>();
+      expect(
+        mouse.map((e) => (e.button, e.action, e.position, e.ctrl, e.alt)),
+        [
+          (TerminalMouseButton.left, MouseAction.press, const CellOffset(1, 1), true, false),
+          (TerminalMouseButton.left, MouseAction.move, const CellOffset(79, 1), false, false),
+          (null, MouseAction.move, const CellOffset(3, 2), false, true),
+        ],
+      );
+    });
+  });
 }

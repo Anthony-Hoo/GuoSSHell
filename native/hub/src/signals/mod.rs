@@ -62,16 +62,16 @@ pub struct InputRequest {
     pub alt: bool,
 }
 
-/// 触摸鼠标事件（M2a 鼠标转发的边界）。
+/// 鼠标事件（M2a 鼠标转发的边界）。
 ///
 /// Rust 组装成 `TerminalMouseEvent` 交给 `engine.encode_mouse`；远端没开
-/// 鼠标上报时 encode 返回 Err，静默忽略（触摸行为完全不变）。
+/// 对应的鼠标上报（点击 / 拖动 / 任意移动）时 encode 返回 Err，静默忽略。
 /// 滚轮必须用 `kind: "scroll"`（上游 validate 会拒绝「滚轮走 press」）。
 #[derive(Deserialize, DartSignal)]
 pub struct MouseRequest {
-    /// press / release / scroll
+    /// press / release / move / scroll
     pub kind: String,
-    /// left / middle / right / wheel_up / wheel_down
+    /// left / middle / right / wheel_up / wheel_down；无键移动（悬停）为空
     pub button: String,
     pub col: u16,
     pub row: u16,
@@ -99,6 +99,13 @@ pub struct SelectionRequest {
 /// 复制当前选区（取文在引擎里，见 `TerminalEngine::selected_text`）。
 #[derive(Deserialize, DartSignal)]
 pub struct CopyRequest {}
+
+/// 粘贴一段文本。换行规范化、控制字符过滤、按远端模式包 bracketed paste
+/// 都是 Rust 的事（`session::paste_bytes`），Dart 只转发剪贴板原文。
+#[derive(Deserialize, DartSignal)]
+pub struct PasteRequest {
+    pub text: String,
+}
 
 /// Dart 已处理完 `seq` 这一帧（流控：同一时刻最多一帧在途，Dart 跟不上时
 /// Rust 只保留最新状态，不在 rinf 的无界队列里积压）。

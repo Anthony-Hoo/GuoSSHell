@@ -27,12 +27,31 @@ class TextInputEvent extends TerminalInputEvent {
   const TextInputEvent(this.text);
 }
 
-/// 触摸鼠标事件（M2a）。仅在远端开启鼠标上报时产生。
+/// 粘贴（剪贴板原文）。换行规范化与 bracketed paste 由 Rust 按远端模式处理。
+class PasteInputEvent extends TerminalInputEvent {
+  final String text;
+  const PasteInputEvent(this.text);
+}
+
+enum MouseAction { press, release, move }
+
+/// 鼠标事件（M2a）。仅在远端开启鼠标上报时产生。[button] 为 null 是无键移动
+/// （悬停）；远端是否要这类事件、同格移动是否重复，都由 Rust 判断。
 class MouseInputEvent extends TerminalInputEvent {
-  final TerminalMouseButton button;
-  final TerminalMouseButtonState buttonState;
+  final TerminalMouseButton? button;
+  final MouseAction action;
   final CellOffset position;
-  const MouseInputEvent(this.button, this.buttonState, this.position);
+  final bool shift;
+  final bool alt;
+  final bool ctrl;
+  const MouseInputEvent(
+    this.button,
+    this.action,
+    this.position, {
+    this.shift = false,
+    this.alt = false,
+    this.ctrl = false,
+  });
 }
 
 /// 终端视口几何（度量权威在 Flutter，PLAN §8）。像素是整个终端的尺寸。
@@ -543,25 +562,56 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
 
   @override
   void paste(String text) {
-    // 粘贴按提交文本转发；bracketed paste 由 M2a 决定。
-    _emit(TextInputEvent(text));
+    _emit(PasteInputEvent(text));
   }
 
   @override
   bool mouseInput(
     TerminalMouseButton button,
     TerminalMouseButtonState buttonState,
-    CellOffset position,
-  ) {
-    // 鼠标上报没开：不消费，fork 回退到本地行为（聚焦/滚动）。
+    CellOffset position, {
+    bool shift = false,
+    bool alt = false,
+    bool ctrl = false,
+  }) {
+    // 鼠标上报没开：不消费，fork 回退到本地行为（聚焦/选区/滚动/菜单）。
     if (!_mouseReporting) return false;
     _emit(MouseInputEvent(
       button,
-      buttonState,
-      CellOffset(position.x.clamp(0, _cols - 1), position.y.clamp(0, _rows - 1)),
+      switch (buttonState) {
+        TerminalMouseButtonState.down => MouseAction.press,
+        TerminalMouseButtonState.up => MouseAction.release,
+      },
+      _clampToGrid(position),
+      shift: shift,
+      alt: alt,
+      ctrl: ctrl,
     ));
     return true;
   }
+
+  @override
+  bool mouseMotion(
+    TerminalMouseButton? button,
+    CellOffset position, {
+    bool shift = false,
+    bool alt = false,
+    bool ctrl = false,
+  }) {
+    if (!_mouseReporting) return false;
+    _emit(MouseInputEvent(
+      button,
+      MouseAction.move,
+      _clampToGrid(position),
+      shift: shift,
+      alt: alt,
+      ctrl: ctrl,
+    ));
+    return true;
+  }
+
+  CellOffset _clampToGrid(CellOffset position) =>
+      CellOffset(position.x.clamp(0, _cols - 1), position.y.clamp(0, _rows - 1));
 
   bool _emit(TerminalInputEvent event) {
     final callback = onInput;

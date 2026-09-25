@@ -34,12 +34,11 @@ apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
 
 [dependencies]
 # 上游内核走 **git 依赖**，精确 pin 到一个 commit，而不是把源码 vendor 进本仓库。
-# 好处：本仓库真的只是「基于 rsHell 改出来的独立仓库」，不含上游源码；
-#       provenance 就写在 Cargo.toml 这一行，升级就是改这一个 rev。
-# 代价：a) 全新环境首次构建需要网络；b) 上游代码只读 —— 真要改上游就必须先 fork。
-# 现在能这么做，是因为上游源码已经是**零改动**（见上面 keyring 那段注释）。
-rshell-core = { git = "https://github.com/hugefiver/rsHell", rev = "b2ab8656079225dc2c920c24f5d9e0124f4f83e1" }
-rshell-session = { git = "https://github.com/hugefiver/rsHell", rev = "b2ab8656079225dc2c920c24f5d9e0124f4f83e1" }
+# 源是我们的 fork（Anthony-Hoo/rsHell 的 guosh 分支）：上游基线之上只叠了几个小补丁，
+# 每一个改了哪几行、为什么，记在 UPSTREAM.md。升级 = 在 fork 里 rebase 到新基线、换这个 rev。
+# 代价：全新环境首次构建需要网络。
+rshell-core = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "103a00b6165670d9d433bd3a4058a8f18ea6d1ff" }
+rshell-session = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "103a00b6165670d9d433bd3a4058a8f18ea6d1ff" }
 # 与 rshell-session 保持完全相同的版本与 feature，避免同一个 crate 出现两份不同类型。
 russh = { version = "=0.62.5", default-features = false, features = ["flate2", "ring", "rsa"] }
 secrecy = "0.10.3"

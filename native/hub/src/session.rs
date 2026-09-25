@@ -27,8 +27,8 @@ use rshell_m0::rshell_session::{
 use crate::frame_codec::pack_runs;
 use crate::signals::{
     ClipboardText, ConnectRequest, CopyRequest, DisconnectRequest, FrameAck, FrameUpdate,
-    InputRequest, MouseRequest, PerfStats, ResizeRequest, SelectionRequest, SelectionState,
-    SessionState, SessionStatus,
+    InputRequest, MouseRequest, PasteRequest, PerfStats, ResizeRequest, SelectionRequest,
+    SelectionState, SessionState, SessionStatus,
 };
 
 const NO_CURSOR: i32 = -1;
@@ -43,6 +43,7 @@ enum SessionCommand {
     Mouse(TerminalMouseEvent),
     Selection(SelectionRequest),
     Copy,
+    Paste(String),
     FrameAck(u32),
 }
 
@@ -57,6 +58,7 @@ pub async fn supervisor() {
     let selection_rx = SelectionRequest::get_dart_signal_receiver();
     let copy_rx = CopyRequest::get_dart_signal_receiver();
     let ack_rx = FrameAck::get_dart_signal_receiver();
+    let paste_rx = PasteRequest::get_dart_signal_receiver();
     let mut session_tx: Option<UnboundedSender<SessionCommand>> = None;
 
     loop {
@@ -119,6 +121,12 @@ pub async fn supervisor() {
                 let Some(_pack) = pack else { break };
                 if let Some(tx) = &session_tx {
                     let _ = tx.send(SessionCommand::Copy);
+                }
+            }
+            pack = paste_rx.recv() => {
+                let Some(pack) = pack else { break };
+                if let Some(tx) = &session_tx {
+                    let _ = tx.send(SessionCommand::Paste(pack.message.text));
                 }
             }
             pack = ack_rx.recv() => {
@@ -234,6 +242,7 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
     };
     let mut stats = PerfWindow::new();
     let mut pacer = FramePacer::new();
+    let mut mouse_motion = MouseMotion::default();
     // 选区权威在引擎（M2a 方案 A）：连接的整个生命周期里持有当前选区，
     // 每次 render 都带上它——内容重排/滚动时高亮跟着引擎走，不是 Dart 侧
     // 自己维护一套坐标。
@@ -329,18 +338,20 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
                     }
                 }
                 Some(SessionCommand::Mouse(event)) => {
-                    // 鼠标上报未激活（shell 等）时 encode 返回 Err——远端不要
-                    // 这类事件，静默忽略，触摸行为不变（M2a）。
-                    match engine.encode_mouse(event) {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            if let Err(error) = transport.write(&bytes).await {
-                                break (
-                                    SessionState::Failed,
-                                    format!("mouse write: {error:?}"),
-                                );
+                    // 远端没开对应的鼠标上报（shell 等）时 encode 返回 Err——
+                    // 远端不要这类事件，静默忽略（M2a）。
+                    if mouse_motion.admit(&event) {
+                        match engine.encode_mouse(event) {
+                            Ok(bytes) if !bytes.is_empty() => {
+                                if let Err(error) = transport.write(&bytes).await {
+                                    break (
+                                        SessionState::Failed,
+                                        format!("mouse write: {error:?}"),
+                                    );
+                                }
                             }
+                            Ok(_) | Err(_) => {}
                         }
-                        Ok(_) | Err(_) => {}
                     }
                 }
                 Some(SessionCommand::Selection(request)) => {
@@ -359,6 +370,14 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
                         None => String::new(),
                     };
                     ClipboardText { text }.send_signal_to_dart();
+                }
+                Some(SessionCommand::Paste(text)) => {
+                    let bytes = paste_bytes(&text, engine.display_modes().bracketed_paste);
+                    if !bytes.is_empty()
+                        && let Err(error) = transport.write(&bytes).await
+                    {
+                        break (SessionState::Failed, format!("paste write: {error:?}"));
+                    }
                 }
                 Some(SessionCommand::FrameAck(seq)) => {
                     // 上一帧 Dart 已处理完：攒着的变化现在可以画了（节拍允许的话）。
@@ -389,6 +408,67 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
 
 fn send_status(state: SessionState, detail: String) {
     SessionStatus { state, detail }.send_signal_to_dart();
+}
+
+/// 鼠标移动只在跨格（或换了按住的键）时上报——与 xterm 一致；指针在同一格内
+/// 的移动对远端没有信息量。按下 / 松开也记下位置，紧随其后的同格移动不重报。
+#[derive(Default)]
+struct MouseMotion {
+    last: Option<(u16, u16, Option<MouseButton>)>,
+}
+
+impl MouseMotion {
+    fn admit(&mut self, event: &TerminalMouseEvent) -> bool {
+        let held = match event.kind {
+            MouseEventKind::Scroll => return true,
+            MouseEventKind::Press | MouseEventKind::Move => event.button,
+            MouseEventKind::Release => None,
+        };
+        let here = Some((event.cell.column, event.viewport_row, held));
+        if event.kind == MouseEventKind::Move && here == self.last {
+            return false;
+        }
+        self.last = here;
+        true
+    }
+}
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// 粘贴文本 → 写给远端的字节：
+/// * 换行统一成 CR（CRLF / LF → CR，与 xterm / VTE 一致；回车就是 CR）；
+/// * 去掉 Tab / 换行以外的 C0 控制字符、DEL 与 C1 控制字符——粘贴内容里的 ESC 等
+///   能伪造按键或提前结束括号粘贴（`ESC[201~` 注入），一律不外发；
+/// * 远端开了 bracketed paste（DECSET 2004）时包上 `ESC[200~` … `ESC[201~`。
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let mut body = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                body.push('\r');
+            }
+            '\n' => body.push('\r'),
+            '\t' => body.push('\t'),
+            ch if ch.is_control() => {}
+            ch => body.push(ch),
+        }
+    }
+    if body.is_empty() {
+        return Vec::new();
+    }
+    if !bracketed {
+        return body.into_bytes();
+    }
+    let mut bytes = Vec::with_capacity(PASTE_START.len() + body.len() + PASTE_END.len());
+    bytes.extend_from_slice(PASTE_START);
+    bytes.extend_from_slice(body.as_bytes());
+    bytes.extend_from_slice(PASTE_END);
+    bytes
 }
 
 /// 远端 PTY 的尺寸下限：Flutter 在极端布局下可能量出 0 行/列。
@@ -609,11 +689,13 @@ fn terminal_input_from_request(request: InputRequest) -> Option<TerminalInput> {
     })
 }
 
-/// 触摸鼠标请求 → 上游事件。滚轮必须走 Scroll；press/release 带普通键。
+/// 鼠标请求 → 上游事件。滚轮必须走 Scroll；press/release 带普通键；
+/// move 带按住的键（拖动）或不带（悬停）。
 fn mouse_event_from_request(request: MouseRequest) -> Option<TerminalMouseEvent> {
     let kind = match request.kind.as_str() {
         "press" => MouseEventKind::Press,
         "release" => MouseEventKind::Release,
+        "move" => MouseEventKind::Move,
         "scroll" => MouseEventKind::Scroll,
         _ => return None,
     };
@@ -781,9 +863,15 @@ fn known_hosts_path() -> Option<String> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
-    use super::{FramePacer, terminal_input_from_request};
-    use crate::signals::InputRequest;
-    use rshell_m0::rshell_core::{KeyCode, TerminalInput};
+    use super::{
+        FramePacer, MouseMotion, mouse_event_from_request, paste_bytes, terminal_input_from_request,
+    };
+    use crate::signals::{InputRequest, MouseRequest};
+    use rshell_m0::rshell_core::{
+        KeyCode, MouseButton, MouseEventKind, TerminalInput, TerminalOverrides, TerminalSettingsV1,
+        TerminalSize,
+    };
+    use rshell_m0::rshell_session::{DefaultTerminalEngine, TerminalEngine};
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -895,6 +983,28 @@ mod tests {
     }
 
     #[test]
+    fn paste_normalizes_newlines_to_carriage_returns() {
+        assert_eq!(paste_bytes("a\nb\r\nc\rd", false), b"a\rb\rc\rd");
+    }
+
+    #[test]
+    fn paste_is_bracketed_only_when_the_remote_asked() {
+        assert_eq!(paste_bytes("ls\n", false), b"ls\r");
+        assert_eq!(paste_bytes("ls\n", true), b"\x1b[200~ls\r\x1b[201~");
+    }
+
+    #[test]
+    fn paste_drops_control_characters_that_could_escape_the_bracket() {
+        // 内嵌的 ESC[201~ 会提前结束括号粘贴，后面的文本就被当成键入执行。
+        assert_eq!(
+            paste_bytes("safe\x1b[201~rm -rf ~\n", true),
+            b"\x1b[200~safe[201~rm -rf ~\r\x1b[201~"
+        );
+        assert_eq!(paste_bytes("tab\there\u{7f}\u{9b}x", false), b"tab\therex");
+        assert_eq!(paste_bytes("\x03", true), b"");
+    }
+
+    #[test]
     fn character_key_parses() {
         assert!(matches!(
             input("character:c", false),
@@ -929,5 +1039,106 @@ mod tests {
             Some(TerminalInput::Key { code: KeyCode::Character('c'), modifiers })
                 if modifiers.control && !modifiers.shift && !modifiers.alt
         ));
+    }
+
+    fn mouse(kind: &str, button: &str, col: u16, row: u16) -> MouseRequest {
+        MouseRequest {
+            kind: kind.to_owned(),
+            button: button.to_owned(),
+            col,
+            row,
+            shift: false,
+            control: false,
+            alt: false,
+        }
+    }
+
+    #[test]
+    fn mouse_requests_parse() {
+        let drag = mouse_event_from_request(mouse("move", "left", 3, 2)).expect("drag");
+        assert_eq!(drag.kind, MouseEventKind::Move);
+        assert_eq!(drag.button, Some(MouseButton::Left));
+        assert_eq!((drag.cell.column, drag.viewport_row), (3, 2));
+
+        let hover = mouse_event_from_request(mouse("move", "", 0, 0)).expect("hover");
+        assert_eq!(hover.button, None);
+
+        let control = mouse_event_from_request(MouseRequest {
+            control: true,
+            ..mouse("press", "right", 1, 1)
+        })
+        .expect("press");
+        assert!(control.modifiers.control && !control.modifiers.shift);
+
+        assert!(mouse_event_from_request(mouse("hover", "", 0, 0)).is_none());
+    }
+
+    #[test]
+    fn mouse_moves_are_reported_once_per_cell() {
+        let mut motion = MouseMotion::default();
+        let mut admit = |kind, button, col, row| {
+            motion.admit(&mouse_event_from_request(mouse(kind, button, col, row)).expect("event"))
+        };
+
+        assert!(admit("press", "left", 1, 1));
+        assert!(!admit("move", "left", 1, 1), "same cell as the press");
+        assert!(admit("move", "left", 2, 1));
+        assert!(!admit("move", "left", 2, 1));
+        assert!(admit("release", "left", 2, 1));
+        assert!(
+            !admit("move", "", 2, 1),
+            "hover right where the button was released"
+        );
+        assert!(admit("move", "", 3, 1));
+        assert!(
+            admit("move", "right", 3, 1),
+            "same cell, different button held"
+        );
+        assert!(admit("scroll", "wheel_up", 3, 1));
+        assert!(admit("scroll", "wheel_up", 3, 1), "every wheel step counts");
+    }
+
+    /// 拖动与悬停按远端的鼠标模式编码：1000 只要点击，1002 加拖动，1003 加悬停。
+    #[test]
+    fn mouse_motion_is_encoded_per_tracking_mode() {
+        let profile = TerminalSettingsV1::default().resolve(&TerminalOverrides::default());
+        let size = TerminalSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
+        };
+        let mut engine = DefaultTerminalEngine::new(&profile, size).expect("engine");
+        let encode = |engine: &mut DefaultTerminalEngine, kind, button| {
+            let event = mouse_event_from_request(mouse(kind, button, 3, 2)).expect("event");
+            engine.encode_mouse(event).ok()
+        };
+
+        engine
+            .advance(b"\x1b[?1000h\x1b[?1006h")
+            .expect("click tracking");
+        assert_eq!(
+            encode(&mut engine, "press", "left"),
+            Some(b"\x1b[<0;4;3M".to_vec())
+        );
+        assert_eq!(encode(&mut engine, "move", "left"), None);
+
+        engine.advance(b"\x1b[?1002h").expect("drag tracking");
+        assert_eq!(
+            encode(&mut engine, "move", "left"),
+            Some(b"\x1b[<32;4;3M".to_vec())
+        );
+        assert_eq!(encode(&mut engine, "move", ""), None);
+
+        engine.advance(b"\x1b[?1003h").expect("any-motion tracking");
+        assert_eq!(
+            encode(&mut engine, "move", ""),
+            Some(b"\x1b[<35;4;3M".to_vec())
+        );
+        assert_eq!(
+            encode(&mut engine, "release", "left"),
+            Some(b"\x1b[<0;4;3m".to_vec())
+        );
     }
 }

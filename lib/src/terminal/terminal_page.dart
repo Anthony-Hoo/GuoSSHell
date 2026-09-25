@@ -8,12 +8,13 @@ import 'package:rinf/rinf.dart';
 import 'package:terminal_view/terminal_view.dart'
     show
         CellOffset,
+        defaultTerminalShortcuts,
+        PointerInputs,
         TerminalController,
         TerminalStyle,
         TerminalView,
         TerminalThemes,
-        TerminalMouseButton,
-        TerminalMouseButtonState;
+        TerminalMouseButton;
 // 字符度量是 fork 的内部工具，但选区菜单的锚点定位要用它
 // （与行身份缓冲同一类实现级依赖）。
 // ignore: implementation_imports
@@ -35,6 +36,26 @@ const TerminalStyle _terminalStyle = TerminalStyle(
 );
 
 enum _Phase { form, session }
+
+/// 复制 / 全选的快捷键（⌘C / ⌘A 等，按平台由 fork 的默认表给出）改走引擎：
+/// 选区权威在引擎（PLAN §6.1 M2a 选区决定），fork 自带的这两个动作用的是
+/// Dart 侧缓冲，拿不到滚出视口的内容，全选也不会告诉引擎。
+class _EngineCopyIntent extends Intent {
+  const _EngineCopyIntent();
+}
+
+class _EngineSelectAllIntent extends Intent {
+  const _EngineSelectAllIntent();
+}
+
+final Map<ShortcutActivator, Intent> _terminalShortcuts = {
+  for (final entry in defaultTerminalShortcuts.entries)
+    entry.key: switch (entry.value) {
+      CopySelectionTextIntent() => const _EngineCopyIntent(),
+      SelectAllTextIntent() => const _EngineSelectAllIntent(),
+      final other => other,
+    },
+};
 
 /// 待发的连接请求：等首次布局几何到达后才真正发出（见 _onTerminalResize）。
 class _PendingConnect {
@@ -82,7 +103,8 @@ class _TerminalPageState extends State<TerminalPage> {
   final _command = TextEditingController();
 
   final FrameTerminal _terminal = FrameTerminal();
-  final TerminalController _terminalController = TerminalController();
+  final TerminalController _terminalController =
+      TerminalController(pointerInputs: const PointerInputs.all());
   /// 软键盘的开关靠它：焦点在终端上 = 键盘起，unfocus = 收起。
   final FocusNode _terminalFocus = FocusNode();
   /// 选区菜单锚点定位用（终端渲染区的屏幕坐标）。
@@ -324,31 +346,38 @@ class _TerminalPageState extends State<TerminalPage> {
       case TextInputEvent(:final text):
         InputRequest(text: text, key: '', shift: false, control: false, alt: false)
             .sendSignalToRust();
-      case MouseInputEvent(:final button, :final buttonState, :final position):
-        // 滚轮走 Scroll（上游 validate 拒绝「滚轮走 press」）；
-        // 下压/抬起是 Press/Release。
-        final isWheel = button.isWheel;
-        final kind = isWheel
-            ? 'scroll'
-            : switch (buttonState) {
-                TerminalMouseButtonState.down => 'press',
-                TerminalMouseButtonState.up => 'release',
-              };
+      case PasteInputEvent(:final text):
+        PasteRequest(text: text).sendSignalToRust();
+      case MouseInputEvent(
+          :final button,
+          :final action,
+          :final position,
+          :final shift,
+          :final alt,
+          :final ctrl,
+        ):
+        // 滚轮走 Scroll（上游 validate 拒绝「滚轮走 press」）。
         MouseRequest(
-          kind: kind,
+          kind: button != null && button.isWheel
+              ? 'scroll'
+              : switch (action) {
+                  MouseAction.press => 'press',
+                  MouseAction.release => 'release',
+                  MouseAction.move => 'move',
+                },
           button: switch (button) {
             TerminalMouseButton.left => 'left',
             TerminalMouseButton.middle => 'middle',
             TerminalMouseButton.right => 'right',
             TerminalMouseButton.wheelUp => 'wheel_up',
             TerminalMouseButton.wheelDown => 'wheel_down',
-            _ => 'left',
+            TerminalMouseButton.wheelLeft || TerminalMouseButton.wheelRight || null => '',
           },
           col: position.x,
           row: position.y,
-          shift: false,
-          control: false,
-          alt: false,
+          shift: shift,
+          control: ctrl,
+          alt: alt,
         ).sendSignalToRust();
     }
     return true;
@@ -485,7 +514,23 @@ class _TerminalPageState extends State<TerminalPage> {
     CopyRequest().sendSignalToRust();
   }
 
-  /// 系统剪贴板 → 远端（直发原文；bracketed paste 见 followup）。
+  /// 全选当前视口（引擎的选区终点列是排除式的，所以终点取列数）。
+  void _selectAll() {
+    if (_state != SessionState.connected || _terminal.height == 0) return;
+    final first = _terminal.stableRowAt(0);
+    final last = _terminal.stableRowAt(_terminal.height - 1);
+    if (first == null || last == null) return;
+    SelectionRequest(
+      clear: false,
+      anchorRow: first,
+      anchorCol: 0,
+      focusRow: last,
+      focusCol: _terminal.viewWidth,
+      rectangular: false,
+    ).sendSignalToRust();
+  }
+
+  /// 系统剪贴板 → 远端（bracketed paste 等由 Rust 按远端模式处理）。
   Future<void> _pasteClipboard() async {
     final text = (await Clipboard.getData('text/plain'))?.text;
     if (text == null || text.isEmpty) return;
@@ -645,11 +690,21 @@ class _TerminalPageState extends State<TerminalPage> {
               child: Stack(
                 children: [
                   Positioned.fill(
-                    child: _TerminalSurface(
-                      key: _terminalSurfaceKey,
-                      terminal: _terminal,
-                      controller: _terminalController,
-                      focusNode: _terminalFocus,
+                    child: Actions(
+                      actions: {
+                        _EngineCopyIntent: CallbackAction<_EngineCopyIntent>(
+                          onInvoke: (_) => _copySelection(),
+                        ),
+                        _EngineSelectAllIntent: CallbackAction<_EngineSelectAllIntent>(
+                          onInvoke: (_) => _selectAll(),
+                        ),
+                      },
+                      child: _TerminalSurface(
+                        key: _terminalSurfaceKey,
+                        terminal: _terminal,
+                        controller: _terminalController,
+                        focusNode: _terminalFocus,
+                      ),
                     ),
                   ),
                   // 诊断浮层与右上角关闭键已移除：它们悬在终端上方，
@@ -695,6 +750,7 @@ class _TerminalSurface extends StatelessWidget {
       controller: controller,
       focusNode: focusNode,
       autoResize: true,
+      shortcuts: _terminalShortcuts,
       // iOS 软键盘的退格不产生硬件按键事件，必须靠编辑增量探测
       // （fork 的 onDelete → keyInput(backspace)）。
       deleteDetection: true,

@@ -475,14 +475,21 @@ Ed25519 公钥（复制到服务器、改名、删除登记，与钥匙串私钥
 **交付**：OpenPGP 卡的 RSA 与 ECDSA 认证密钥可以登记、登录；模拟卡加了 RSA 2048 与 P-256
 （`GUOSH_VIRTUAL_CARD=rsa` / `p256`），测试里签名均用公钥验证。
 
-### M3d — WebAuthn 安全密钥（sk-ecdsa）—— ⏸ 不急着做
+### M3d — WebAuthn 安全密钥（sk-ecdsa）—— ✅ 已完成（2026-09-26，模拟器 + 模拟安全密钥验收；真机待关联域名与硬件）
 
-- iOS `ASAuthorizationSecurityKeyPublicKeyCredentialProvider`（iOS 15+，系统 UI
-  驱动 NFC/USB-C；Blink Shell 已商用）
-- russh 依赖的 ssh-key 支持 sk-* 公钥（已实测）；sk 签名格式含 flags+counter，需自写
-- ⚠ 风险：RP ID `"ssh:"` 能否被 iOS 接受（待实测）；服务端需 OpenSSH >8.2 且
-  编译了 sk 支持（macOS 自带 sshd 没有）
-- 与卡路线零共享（除 russh Signer 接缝）；估工独立 1~2 周。开启条件：M3b 绿后另立
+- iOS / macOS 经 AuthenticationServices 的 `ASAuthorizationSecurityKeyPublicKeyCredentialProvider`
+  （系统界面驱动 USB-C / NFC / Lightning），objc2 绑定，纯 Rust
+- SSH 公钥类型 `sk-ecdsa-sha2-nistp256@openssh.com`，application 即 WebAuthn 的 RP ID；
+  签名用 OpenSSH 的 `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` 格式（系统生成的
+  clientDataJSON 随签名一起交给服务器）；服务端需 OpenSSH 8.4 以上且编译了 FIDO 支持
+- 系统只接受 App 关联的域名作 RP ID，`ssh:` 不行（陷阱 35）：RP ID 由构建配置给出，
+  没配置的构建不提供安全密钥（followup「安全密钥RP-ID与真机验收」）
+
+**交付**：「私钥」页可以添加安全密钥（构建配置了 RP ID 时出现）——起名后由系统界面引导插上
+（或靠近）并触摸安全密钥，登记新凭据的公钥（复制到服务器、改名、删除登记，与钥匙串私钥同一套
+管理）；连接选它即用安全密钥登录，等用户操作时提示并暂停连接计时；取消即中止连接，其他失败给出
+提示与系统原因。debug 构建设 `GUOSH_VIRTUAL_SECURITY_KEY` 时用模拟安全密钥（值是域名时用它作
+RP ID，否则 `ssh:`）。决定见 §6.1「M3d 安全密钥决定」。
 
 ### M4 — 产品化与合规
 
@@ -588,6 +595,18 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 回车、方向键、Ctrl 组合等直接处理的键不得越过之前敲下、仍在平台文本输入里的字符——
 `HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
 平台不答复的键（死键等）150 ms 超时兜底。
+
+**M3d 安全密钥决定（2026-09-26）：**
+安全密钥走 WebAuthn：系统（AuthenticationServices）只给 WebAuthn 层的接口，clientDataJSON 由系统
+生成，challenge 取 SSH 要签的数据；签名交出前按 OpenSSH 服务器的规则自查（clientDataJSON 以
+`{"type":"webauthn.get","challenge":"<base64url>","origin":"<origin>"` 开头、rpIdHash、标志位），
+DER 签名转 mpint，拼成 `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` 签名。凭据不驻留在安全密钥上
+（resident key 与 user verification 都是 discouraged），凭据 id 与 application 存在钥匙串的信封里
+（`security_key`，没有私钥原文），连接配置同样写 `keychain:<id>`；删除登记后这个凭据不能再用。
+RP ID 取 Info.plist 的 `GUOSHSecurityKeyRelyingParty`（App 经 Associated Domains 关联的域名），
+空则不提供安全密钥；每把已登记的密钥按自己的 application 签名，改配置不影响旧登记。签名经上游
+`ExternalSigner`（补丁 P5）接入，与 OpenPGP 卡共用「等用户时暂停计时」与失败原因回传；系统请求
+在主线程发起、结果经委托回到阻塞线程，3 分钟没有结果就收起系统界面。
 
 **M3b OpenPGP 卡决定（2026-09-26）：**
 卡上认证槽签名（`VERIFY P2=82` + INTERNAL AUTHENTICATE，Ed25519 直接签 SSH 数据），APDU 层用
@@ -855,6 +874,10 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
     120 秒），在登录界面停太久会被服务器断开。
 34. **iPadOS 26 模拟器的窗口控件**：点到窗口左上角会展开红黄绿三个按钮、把 App 变成浮动窗口，
     之后的点击坐标全都错位；点绿色按钮回到全屏。
+35. **AuthenticationServices 的 RP ID 必须是 App 关联的域名**：安全密钥请求也不例外，用 OpenSSH
+    默认的 `ssh:` 会失败（`ASAuthorizationError` 1004，「not associated with domain」）。
+    RP ID 要换成经 Associated Domains（`webcredentials:`）关联的域名；OpenSSH 服务器不限制
+    application，域名形式的 sk 公钥照常认证。
 
 ---
 
@@ -884,6 +907,12 @@ cargo build --release --lib --target aarch64-apple-ios-sim
 ```bash
 # 模拟器里用模拟 OpenPGP 卡（debug 构建）：带环境变量启动 App
 SIMCTL_CHILD_GUOSH_VIRTUAL_CARD=1 xcrun simctl launch booted com.example.guoshShell
+
+# 模拟器里用模拟安全密钥（debug 构建；值为域名时用它作 RP ID，否则 ssh:）
+SIMCTL_CHILD_GUOSH_VIRTUAL_SECURITY_KEY=1 xcrun simctl launch booted com.example.guoshShell
+
+# 模拟器剪贴板里的公钥（「复制公钥」之后）
+xcrun simctl pbpaste booted
 
 # 本地验收 SSH 服务器（Docker；probe / probe，127.0.0.1:2223，自带 vim / htop / m1bar）
 ./scripts/sshd-test.sh up
@@ -1022,7 +1051,18 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
       提示卡上的密钥与登记的不同
 - [x] 连接限时：在 PIN 框停过 60 秒不再「连接超时」（rsHell 补丁 P6 + 等用户时暂停计时）
 - [ ] 真机：RSA / ECDSA 的 OpenPGP 卡实测（待硬件）
-- [ ] M3d / M4 / M5
+
+**M3d —— WebAuthn 安全密钥 —— ✅ 已完成（2026-09-26，模拟器 + 模拟安全密钥验收）**
+
+- [x] 单测：模拟安全密钥注册 → sk-ecdsa 公钥（application = RP ID）；断言 → WebAuthn 签名，按
+      OpenSSH 服务器的规则验证通过、换数据不通过；别的 RP、字段顺序不对、标志位与扩展不符的断言
+      不交出；签名器等用户的起止与失败原因
+- [x] 模拟器（`GUOSH_VIRTUAL_SECURITY_KEY`）：添加安全密钥、复制公钥授权到容器，`ssh:` 与域名
+      两种 application 都登录成功（容器 OpenSSH 9.2 记为 ECDSA-SK）
+- [x] 系统路径（模拟器，不带模拟安全密钥）：请求与委托回调走通，RP ID `ssh:` 被系统拒绝并给出
+      原因；没有配置 RP ID 的构建不出现「添加安全密钥」
+- [ ] 真机：关联域名后用 FIDO2 安全密钥经 USB-C / NFC 登录（followup「安全密钥RP-ID与真机验收」）
+- [ ] M4 / M5
 
 **关于提交**
 

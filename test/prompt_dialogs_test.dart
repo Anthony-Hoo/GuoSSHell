@@ -7,6 +7,8 @@ InteractionPrompt _prompt(
   PromptKind kind, {
   bool changed = false,
   bool canRemember = false,
+  bool retry = false,
+  String name = '',
   List<PromptField> fields = const [],
 }) =>
     InteractionPrompt(
@@ -20,10 +22,11 @@ InteractionPrompt _prompt(
       algorithm: 'ssh-ed25519',
       fingerprint: 'SHA256:abc',
       changed: changed,
-      name: '',
+      name: name,
       instruction: '',
       fields: fields,
       canRemember: canRemember,
+      retry: retry,
     );
 
 void main() {
@@ -92,6 +95,23 @@ void main() {
     await tester.tap(find.widgetWithText(FilledButton, '连接'));
     await tester.pumpAndSettle();
     expect(answer?.answers, ['hunter2']);
+    expect(answer?.remember, isTrue);
+  });
+
+  testWidgets('私钥口令：显示私钥名称，口令错了提示重输', (tester) async {
+    await open(
+      tester,
+      _prompt(PromptKind.passphrase, name: 'laptop', canRemember: true, retry: true),
+    );
+    expect(find.text('输入私钥口令'), findsOneWidget);
+    expect(find.textContaining('私钥「laptop」'), findsOneWidget);
+    expect(find.text('口令不正确，请重新输入'), findsOneWidget);
+    await tester.enterText(find.byType(TextField), 'secret');
+    await tester.tap(find.text('保存口令到钥匙串'));
+    await tester.pump();
+    await tester.tap(find.widgetWithText(FilledButton, '连接'));
+    await tester.pumpAndSettle();
+    expect(answer?.answers, ['secret']);
     expect(answer?.remember, isTrue);
   });
 

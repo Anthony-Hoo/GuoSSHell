@@ -743,6 +743,7 @@ String _failureText(FailureKind failure) => switch (failure) {
       FailureKind.none || FailureKind.other => '连接出错',
       FailureKind.notFound => '这条连接已不存在',
       FailureKind.invalidTarget => '连接目标无效：请检查主机、端口和用户名',
+      FailureKind.keyNotFound => '连接用的私钥不在钥匙串里了，请重新选择',
       FailureKind.authentication => '认证失败：用户名或密码不正确',
       FailureKind.hostKeyRejected => '已拒绝服务器的主机密钥',
       FailureKind.hostKeyChanged => '主机密钥已变更，连接已中止',

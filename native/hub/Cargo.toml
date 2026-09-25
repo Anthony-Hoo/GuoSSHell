@@ -23,8 +23,12 @@ serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.45.0", features = ["rt", "macros", "time", "net", "sync", "io-util"] }
 # 边界上的密码在 Rust 侧接收处立刻包成 SecretString（PLAN.md §2.2）。
 secrecy = "0.10.3"
-# 边界上的连接 id 是字符串，解析成上游的 ConnectionId(Uuid)。
-uuid = "1"
+# 边界上的连接 id 是字符串，解析成上游的 ConnectionId(Uuid)；私钥 id 也用它生成。
+uuid = { version = "1", features = ["v4"] }
+# 钥匙串里的私钥信封与偏好文件。
+serde_json = "1"
+# 私钥原文用完即清零。
+zeroize = "1"
 
 # 业务内核唯一入口：`rshell-m0`（根 workspace 成员，path 依赖）。
 # 它再导出 rshell-core / rshell-session，并把上游 git 依赖的 rev pin 在
@@ -32,6 +36,12 @@ uuid = "1"
 # iOS 的 keyring `protected` feature 也由它那边的 target 依赖经
 # feature unification 打开，这里不需要重复声明。
 rshell-m0 = { path = "../../rust" }
+
+# 私钥存在 Apple 的 protected data 钥匙串（本机与 iCloud 两个存储，keys.rs）；
+# 版本与 keyring 4.1.5 用的一致（rust/Cargo.toml）。
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+keyring-core = "1.0.0"
+apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
 
 # Uncomment below to target the web.
 # tokio_with_wasm = { version = "0.8.5", features = ["rt", "macros", "time"] }

@@ -18,14 +18,17 @@ use rshell_m0::rshell_session::{
     AuthPlan, InteractionBroker, KnownHostsVerifier, NativeSshTransport, SessionTransport,
     TransportRequest, interaction_channel,
 };
+use rshell_m0::russh::keys::PrivateKey;
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::spawn_blocking;
 
 use crate::app::AppContext;
 use crate::catalog;
+use crate::keys;
 use crate::session::SessionCommand;
 use crate::signals::interaction::{InteractionPrompt, InteractionReply, PromptField, PromptKind};
+use crate::signals::keys::KeyError;
 use crate::signals::{ConnectRequest, FailureKind};
 
 pub struct Connected {
@@ -142,27 +145,42 @@ pub async fn establish(
     // 密码：目录里存了就从钥匙串读（每次连接读，不缓存——PLAN §9.2.2）；
     // 没存、读不到、或快速连接没带，就问用户。
     let mut remember = None;
-    let secret = match profile.authentication {
+    let auth = match profile.authentication {
         AuthenticationKind::Password => {
             let password = match saved_password(context, &profile).await {
                 Some(password) => password,
                 None if !quick_password.expose_secret().is_empty() => quick_password,
                 None => {
-                    let (password, keep) =
-                        ask_password(session_id, prompts.next(), &profile, saved, &mut channels)
-                            .await?;
+                    let question = Question {
+                        kind: PromptKind::Password,
+                        name: String::new(),
+                        can_remember: saved,
+                        retry: false,
+                    };
+                    let (password, keep) = ask_secret(
+                        session_id,
+                        prompts.next(),
+                        &profile,
+                        question,
+                        &mut channels,
+                    )
+                    .await?;
                     if keep && saved {
                         remember = Some(SecretString::from(password.expose_secret().to_owned()));
                     }
                     password
                 }
             };
-            Some(password)
+            AuthPlan::from_secret(&profile, Some(password))
         }
-        _ => None,
-    };
-    let auth = AuthPlan::from_secret(&profile, secret)
-        .map_err(|error| Abort::failed(FailureKind::Other, format!("auth plan: {error:?}")))?;
+        AuthenticationKind::PublicKey => {
+            let key =
+                unlock_key(context, session_id, &mut prompts, &profile, &mut channels).await?;
+            AuthPlan::from_private_key(&profile, Arc::new(key))
+        }
+        _ => AuthPlan::from_secret(&profile, None),
+    }
+    .map_err(|error| Abort::failed(FailureKind::Other, format!("auth plan: {error:?}")))?;
 
     // 主机密钥：新主机与变更的密钥都问用户（变更时带 changed，Dart 给出醒目警告）。
     let verifier = KnownHostsVerifier::new(&context.known_hosts).with_changed_key_prompt();
@@ -244,17 +262,28 @@ async fn saved_password(
     }
 }
 
-/// 问密码。返回密码与「连接成功后存进钥匙串」。
-async fn ask_password(
+/// hub 自己问的一个秘密（密码或私钥口令）。
+struct Question {
+    kind: PromptKind,
+    /// Passphrase：私钥名称。
+    name: String,
+    can_remember: bool,
+    retry: bool,
+}
+
+/// 问一个秘密。返回回答与「存进钥匙串」。
+async fn ask_secret(
     session_id: u32,
     prompt_id: u32,
     profile: &ConnectionProfile,
-    saved: bool,
+    question: Question,
     channels: &mut Channels<'_>,
 ) -> Result<(SecretString, bool), Abort> {
     InteractionPrompt {
-        can_remember: saved,
-        ..empty_prompt(session_id, prompt_id, PromptKind::Password, profile)
+        name: question.name,
+        can_remember: question.can_remember,
+        retry: question.retry,
+        ..empty_prompt(session_id, prompt_id, question.kind, profile)
     }
     .send_signal_to_dart();
     loop {
@@ -273,6 +302,86 @@ async fn ask_password(
             command = channels.commands.recv() => channels.defer(command)?,
         }
     }
+}
+
+/// 私钥认证：从钥匙串取出私钥；加密的先用存下的口令解开，解不开就问用户（口令错了
+/// 带 `retry` 再问）。勾选保存的口令在解开后存进私钥所在的存储。
+async fn unlock_key(
+    context: &Arc<AppContext>,
+    session_id: u32,
+    prompts: &mut PromptIds,
+    profile: &ConnectionProfile,
+    channels: &mut Channels<'_>,
+) -> Result<PrivateKey, Abort> {
+    let id = keys::key_id(profile)
+        .map(str::to_owned)
+        .ok_or_else(|| Abort::failed(FailureKind::KeyNotFound, String::new()))?;
+    let task_context = context.clone();
+    let task_id = id.clone();
+    let stored = spawn_blocking(move || keys::load(&task_context, &task_id))
+        .await
+        .map_err(|error| Abort::failed(FailureKind::Other, format!("key task: {error}")))?
+        .map_err(|error| Abort::failed(FailureKind::Keychain, format!("key: {error:?}")))?
+        .ok_or_else(|| Abort::failed(FailureKind::KeyNotFound, id.clone()))?;
+
+    if !stored.encrypted {
+        return decode_key(&stored.private_key, None)
+            .await
+            .map_err(|error| Abort::failed(FailureKind::Other, format!("key: {error:?}")));
+    }
+    if let Some(passphrase) = &stored.passphrase
+        && let Ok(key) = decode_key(&stored.private_key, Some(passphrase)).await
+    {
+        return Ok(key);
+    }
+    let mut retry = false;
+    loop {
+        let question = Question {
+            kind: PromptKind::Passphrase,
+            name: stored.name.clone(),
+            can_remember: true,
+            retry,
+        };
+        let (passphrase, keep) =
+            ask_secret(session_id, prompts.next(), profile, question, channels).await?;
+        let Ok(key) = decode_key(&stored.private_key, Some(&passphrase)).await else {
+            retry = true;
+            continue;
+        };
+        if keep {
+            let task_context = context.clone();
+            let task_id = id.clone();
+            let synchronized = stored.synchronized;
+            let saved = spawn_blocking(move || {
+                keys::save_passphrase(&task_context, &task_id, &passphrase, synchronized)
+            })
+            .await;
+            match saved {
+                Ok(Ok(())) => context.keys_changed.notify_one(),
+                Ok(Err(error)) => debug_print!("[connect] saving passphrase: {error:?}"),
+                Err(error) => debug_print!("[connect] saving passphrase task: {error}"),
+            }
+        }
+        return Ok(key);
+    }
+}
+
+/// 解出私钥（加密私钥的密钥派生较慢，放到阻塞线程）。
+async fn decode_key(
+    private_key: &SecretString,
+    passphrase: Option<&SecretString>,
+) -> Result<PrivateKey, KeyError> {
+    let private_key = SecretString::from(private_key.expose_secret().to_owned());
+    let passphrase =
+        passphrase.map(|passphrase| SecretString::from(passphrase.expose_secret().to_owned()));
+    spawn_blocking(move || {
+        keys::decode(
+            private_key.expose_secret(),
+            passphrase.as_ref().map(ExposeSecret::expose_secret),
+        )
+    })
+    .await
+    .unwrap_or(Err(KeyError::Invalid))
 }
 
 /// 上游 broker 的问题 → Dart。上游只会问主机密钥与 keyboard-interactive；
@@ -336,6 +445,7 @@ fn empty_prompt(
         instruction: String::new(),
         fields: Vec::new(),
         can_remember: false,
+        retry: false,
     }
 }
 
@@ -391,7 +501,9 @@ fn broker_response(kind: PromptKind, reply: InteractionReply) -> InteractionResp
         (PromptKind::KeyboardInteractive, true) => InteractionResponse::Answers(
             reply.answers.into_iter().map(SecretString::from).collect(),
         ),
-        (PromptKind::KeyboardInteractive | PromptKind::Password, _) => InteractionResponse::Cancel,
+        (PromptKind::KeyboardInteractive | PromptKind::Password | PromptKind::Passphrase, _) => {
+            InteractionResponse::Cancel
+        }
     }
 }
 

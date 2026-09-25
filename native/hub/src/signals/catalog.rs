@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize, Serialize, SignalPiece, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
     Password,
+    /// 钥匙串里的私钥（`key_id`）。
+    PublicKey,
     KeyboardInteractive,
 }
 
@@ -21,6 +23,8 @@ pub struct ConnectionSummary {
     pub auth: AuthMethod,
     /// 钥匙串里存了密码（没存则连接时弹框问）。
     pub password_saved: bool,
+    /// PublicKey：用的私钥。
+    pub key_id: String,
     pub command: String,
 }
 
@@ -59,6 +63,8 @@ pub struct SaveConnection {
     pub auth: AuthMethod,
     pub password_action: PasswordAction,
     pub password: String,
+    /// PublicKey：用的私钥。
+    pub key_id: String,
     pub command: String,
 }
 
@@ -84,6 +90,8 @@ pub enum CatalogError {
     PortInvalid,
     UsernameRequired,
     PasswordRequired,
+    /// 私钥认证没选私钥（或选的私钥不在了）。
+    KeyRequired,
     NotFound,
     Keychain,
     Storage,

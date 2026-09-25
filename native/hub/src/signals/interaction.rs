@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, SignalPiece, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Password,
+    /// 私钥口令（`name` 是私钥名称）。
+    Passphrase,
     HostKey,
     KeyboardInteractive,
 }
@@ -42,8 +44,10 @@ pub struct InteractionPrompt {
     pub name: String,
     pub instruction: String,
     pub fields: Vec<PromptField>,
-    /// Password：回答可以存进钥匙串（目录里的连接才可以，快速连接不行）。
+    /// Password / Passphrase：回答可以存进钥匙串（快速连接的密码不行）。
     pub can_remember: bool,
+    /// 上一次的回答不对，再问一次（Passphrase：口令错了）。
+    pub retry: bool,
 }
 
 /// 对 `prompt_id` 的回答。`accept = false` 是取消 / 拒绝。

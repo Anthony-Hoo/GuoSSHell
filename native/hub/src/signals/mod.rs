@@ -3,13 +3,15 @@
 //! 业务模型（`RenderFrame` / `ConnectionProfile` ...）属于上游 `rshell-core`，
 //! 不在这里重建（PLAN.md 铁律 1/4）。这里只放边界上的平铺投影：
 //! * 本文件：启动与会话（请求、状态、帧——帧的 run 压缩字节走二进制通道）
-//! * [`catalog`]：连接目录；[`interaction`]：连接过程中的交互；[`settings`]：设置
+//! * [`catalog`]：连接目录；[`keys`]：私钥；[`interaction`]：连接过程中的交互；
+//!   [`settings`]：设置
 //!
 //! 会话类信号都带 `session_id`（Dart 分配，本进程内唯一）：rinf 的信号按类型
 //! 全局广播，多个会话并存时靠它分流。
 
 pub mod catalog;
 pub mod interaction;
+pub mod keys;
 pub mod settings;
 
 use rinf::{DartSignal, RustSignal, RustSignalBinary, SignalPiece};
@@ -169,6 +171,8 @@ pub enum FailureKind {
     NotFound,
     /// 快速连接的目标无效（主机、端口或用户名）。
     InvalidTarget,
+    /// 连接用的私钥不在钥匙串里了。
+    KeyNotFound,
     Authentication,
     HostKeyRejected,
     /// 主机密钥与记录的不一致，且没有被接受替换。

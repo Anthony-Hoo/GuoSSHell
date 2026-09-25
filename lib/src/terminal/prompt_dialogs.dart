@@ -31,7 +31,7 @@ Future<PromptAnswer> showPromptDialog(
     builder: (context) => _DismissOn(
       dismissed: dismissed,
       child: switch (prompt.kind) {
-        PromptKind.password => _PasswordDialog(prompt: prompt),
+        PromptKind.password || PromptKind.passphrase => _PasswordDialog(prompt: prompt),
         PromptKind.hostKey => _HostKeyDialog(prompt: prompt),
         PromptKind.keyboardInteractive => _KeyboardInteractiveDialog(prompt: prompt),
       },
@@ -103,13 +103,15 @@ class _PasswordDialogState extends State<_PasswordDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final prompt = widget.prompt;
+    final passphrase = prompt.kind == PromptKind.passphrase;
     return AlertDialog(
-      title: const Text('输入密码'),
+      title: Text(passphrase ? '输入私钥口令' : '输入密码'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(_target(widget.prompt)),
+          Text(passphrase ? '私钥「${prompt.name}」 · ${_target(prompt)}' : _target(prompt)),
           const SizedBox(height: 12),
           TextField(
             controller: _password,
@@ -117,15 +119,18 @@ class _PasswordDialogState extends State<_PasswordDialog> {
             obscureText: true,
             autocorrect: false,
             enableSuggestions: false,
-            autofillHints: const [AutofillHints.password],
-            decoration: const InputDecoration(labelText: '密码'),
+            autofillHints: passphrase ? null : const [AutofillHints.password],
+            decoration: InputDecoration(
+              labelText: passphrase ? '口令' : '密码',
+              errorText: prompt.retry ? '口令不正确，请重新输入' : null,
+            ),
             onSubmitted: (_) => _submit(),
           ),
-          if (widget.prompt.canRemember)
+          if (prompt.canRemember)
             CheckboxListTile(
               contentPadding: EdgeInsets.zero,
               controlAffinity: ListTileControlAffinity.leading,
-              title: const Text('连接成功后保存到钥匙串'),
+              title: Text(passphrase ? '保存口令到钥匙串' : '连接成功后保存到钥匙串'),
               value: _remember,
               onChanged: (value) => setState(() => _remember = value ?? false),
             ),
@@ -293,6 +298,8 @@ class _KeyboardInteractiveDialogState extends State<_KeyboardInteractiveDialog> 
                 obscureText: !field.echo,
                 autocorrect: false,
                 enableSuggestions: false,
+                smartDashesType: SmartDashesType.disabled,
+                smartQuotesType: SmartQuotesType.disabled,
                 decoration: InputDecoration(labelText: field.label.trim()),
                 textInputAction: index == prompt.fields.length - 1
                     ? TextInputAction.done

@@ -1211,12 +1211,16 @@ dependencies = [
 name = "hub"
 version = "0.1.0"
 dependencies = [
+ "apple-native-keyring-store",
+ "keyring-core",
  "rinf",
  "rshell-m0",
  "secrecy",
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2037,7 +2041,7 @@ dependencies = [
 [[package]]
 name = "rshell-core"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1#50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=c794280d29282ec2571bb146bfed4dfe12fca51e#c794280d29282ec2571bb146bfed4dfe12fca51e"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2069,7 +2073,7 @@ dependencies = [
 [[package]]
 name = "rshell-platform"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1#50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=c794280d29282ec2571bb146bfed4dfe12fca51e#c794280d29282ec2571bb146bfed4dfe12fca51e"
 dependencies = [
  "directories",
  "thiserror 2.0.20",
@@ -2079,7 +2083,7 @@ dependencies = [
 [[package]]
 name = "rshell-session"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1#50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=c794280d29282ec2571bb146bfed4dfe12fca51e#c794280d29282ec2571bb146bfed4dfe12fca51e"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
@@ -2100,7 +2104,7 @@ dependencies = [
 [[package]]
 name = "rshell-storage"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1#50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=c794280d29282ec2571bb146bfed4dfe12fca51e#c794280d29282ec2571bb146bfed4dfe12fca51e"
 dependencies = [
  "async-trait",
  "keyring",

@@ -27,6 +27,7 @@ Future<CatalogResult> saveConnection({
   required AuthMethod auth,
   required PasswordAction passwordAction,
   required String password,
+  required String keyId,
   required String command,
 }) {
   return _request((requestId) => SaveConnection(
@@ -39,6 +40,7 @@ Future<CatalogResult> saveConnection({
         auth: auth,
         passwordAction: passwordAction,
         password: password,
+        keyId: keyId,
         command: command,
       ).sendSignalToRust());
 }
@@ -56,6 +58,7 @@ String catalogErrorText(CatalogError error) => switch (error) {
       CatalogError.portInvalid => '端口无效',
       CatalogError.usernameRequired => '请填写用户名',
       CatalogError.passwordRequired => '请填写要保存的密码',
+      CatalogError.keyRequired => '请选择私钥',
       CatalogError.notFound => '这条连接已不存在',
       CatalogError.keychain => '钥匙串读写失败',
       CatalogError.storage => '保存失败',

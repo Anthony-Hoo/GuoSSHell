@@ -4,6 +4,7 @@
 //! * `app`           启动：数据目录 → 存储（连接目录 + 钥匙串）→ 各处理任务
 //! * `catalog`       连接目录的查询与增删改
 //! * `settings`      设置（字体、字号）
+//! * `keys`          私钥（钥匙串）：导入、列表、iCloud 同步
 //! * `connect`       建立连接：认证材料、主机密钥与交互问答
 //! * `session`       会话 actor：引擎、帧、输入
 //! * `frame_codec`   RenderFrame → run 压缩字节流（自 bench_frame.rs 提升）
@@ -13,6 +14,7 @@ mod app;
 mod catalog;
 mod connect;
 mod frame_codec;
+mod keys;
 mod local_network;
 mod session;
 mod settings;

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../bindings/bindings.dart';
+import '../keys/keys_page.dart';
 import 'terminal_font.dart';
 
 /// 设置：终端字体与字号（存在 Rust 侧的默认终端配置里，新会话生效）。
@@ -62,6 +63,15 @@ class _SettingsPageState extends State<SettingsPage> {
       child: ListView(
         padding: const EdgeInsets.symmetric(vertical: 8),
         children: [
+          ListTile(
+            leading: const Icon(Icons.key),
+            title: const Text('私钥'),
+            subtitle: const Text('导入私钥、复制公钥、iCloud 钥匙串同步'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(
+              builder: (_) => const KeysPage(),
+            )),
+          ),
           const _SectionTitle('终端字体'),
           RadioGroup<String>(
             groupValue: settings.fontFamily,

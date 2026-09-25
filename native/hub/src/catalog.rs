@@ -14,6 +14,7 @@ use secrecy::SecretString;
 use tokio::task::spawn_blocking;
 
 use crate::app::AppContext;
+use crate::keys::{self, Item};
 use crate::signals::catalog::{
     AuthMethod, CatalogError, CatalogQuery, CatalogResult, CatalogState, ConnectionSummary,
     DeleteConnection, DuplicateConnection, PasswordAction, SaveConnection,
@@ -109,12 +110,17 @@ fn summaries(catalog: &ConnectionCatalog, query: &str) -> Vec<ConnectionSummary>
         .collect()
 }
 
-/// 边界上的连接摘要。只有本 App 写这个目录，里面只会有下面两种认证方式。
+/// 边界上的连接摘要。只有本 App 写这个目录：私钥认证总是引用钥匙串里的私钥，
+/// 也不会有 agent 认证。
 fn summary(profile: &ConnectionProfile) -> Option<ConnectionSummary> {
     let auth = match profile.authentication {
         AuthenticationKind::Password => AuthMethod::Password,
+        AuthenticationKind::PublicKey => {
+            keys::key_id(profile)?;
+            AuthMethod::PublicKey
+        }
         AuthenticationKind::KeyboardInteractive => AuthMethod::KeyboardInteractive,
-        AuthenticationKind::PublicKey | AuthenticationKind::Agent => return None,
+        AuthenticationKind::Agent => return None,
     };
     Some(ConnectionSummary {
         id: profile.id.0.to_string(),
@@ -124,6 +130,7 @@ fn summary(profile: &ConnectionProfile) -> Option<ConnectionSummary> {
         username: profile.username.clone(),
         auth,
         password_saved: auth == AuthMethod::Password && profile.credential_ref.is_some(),
+        key_id: keys::key_id(profile).unwrap_or_default().to_owned(),
         command: profile.remote_command.clone().unwrap_or_default(),
     })
 }
@@ -174,6 +181,15 @@ fn save(context: &AppContext, request: SaveConnection) -> Result<String, Catalog
     };
     let creating = existing.is_none();
     let profile = profile_from_request(existing, &request)?;
+    if request.auth == AuthMethod::PublicKey {
+        let found = context
+            .keys
+            .get(Item::Key, &request.key_id)
+            .map_err(|_| CatalogError::Keychain)?;
+        if found.is_none() {
+            return Err(CatalogError::KeyRequired);
+        }
+    }
     let secret = secret_update(&request, creating)?;
     let id = profile.id;
     let mutation = if creating {
@@ -225,19 +241,29 @@ fn profile_from_request(
     profile.transport = TransportKind::NativeSsh;
     profile.authentication = match request.auth {
         AuthMethod::Password => AuthenticationKind::Password,
+        AuthMethod::PublicKey => AuthenticationKind::PublicKey,
         AuthMethod::KeyboardInteractive => AuthenticationKind::KeyboardInteractive,
+    };
+    profile.identity_file = match request.auth {
+        AuthMethod::PublicKey if request.key_id.trim().is_empty() => {
+            return Err(CatalogError::KeyRequired);
+        }
+        AuthMethod::PublicKey => Some(keys::key_ref(request.key_id.trim())),
+        AuthMethod::Password | AuthMethod::KeyboardInteractive => None,
     };
     profile.remote_command =
         Some(request.command.trim().to_owned()).filter(|command| !command.is_empty());
     Ok(profile)
 }
 
-/// 表单里的密码操作 → 上游的 `SecretUpdate`。keyboard-interactive 不存密码
-/// （修改时清掉可能存过的）；新建时没有可「保留」或「清除」的旧密码。
+/// 表单里的密码操作 → 上游的 `SecretUpdate`。私钥与 keyboard-interactive 不存密码
+/// （修改时清掉可能存过的；私钥的口令跟着私钥存）；新建时没有可「保留」或「清除」的旧密码。
 fn secret_update(request: &SaveConnection, creating: bool) -> Result<SecretUpdate, CatalogError> {
     Ok(match (request.auth, request.password_action) {
-        (AuthMethod::KeyboardInteractive, _) if creating => SecretUpdate::Unchanged,
-        (AuthMethod::KeyboardInteractive, _) => SecretUpdate::Clear,
+        (AuthMethod::PublicKey | AuthMethod::KeyboardInteractive, _) if creating => {
+            SecretUpdate::Unchanged
+        }
+        (AuthMethod::PublicKey | AuthMethod::KeyboardInteractive, _) => SecretUpdate::Clear,
         (AuthMethod::Password, PasswordAction::Set) => {
             if request.password.is_empty() {
                 return Err(CatalogError::PasswordRequired);
@@ -298,6 +324,7 @@ mod tests {
 
     use super::{delete, duplicate, load, profile_from_request, save, secret_update, summary};
     use crate::app::AppContext;
+    use crate::keys::{MemoryKeyStore, PreferenceFile};
     use crate::signals::catalog::{AuthMethod, CatalogError, PasswordAction, SaveConnection};
     use rshell_m0::rshell_core::{AuthenticationKind, CredentialRef, SecretUpdate, TransportKind};
     use rshell_m0::rshell_storage::{
@@ -315,7 +342,12 @@ mod tests {
             credentials: CredentialCoordinator::new(repository.clone(), vault.clone()),
             repository,
             known_hosts: PathBuf::new(),
+            keys: Arc::new(MemoryKeyStore::new(false)),
+            preferences: PreferenceFile::open(
+                std::env::temp_dir().join("guosh-test-preferences.json"),
+            ),
             catalog_changed: Notify::new(),
+            keys_changed: Notify::new(),
         };
         (context, vault)
     }
@@ -411,6 +443,7 @@ mod tests {
             auth,
             password_action: action,
             password: password.to_owned(),
+            key_id: String::new(),
             command: "  ".to_owned(),
         }
     }

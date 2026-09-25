@@ -22,6 +22,8 @@ use std::sync::Arc;
 pub use rshell_core;
 pub use rshell_session;
 pub use rshell_storage;
+// 与 rshell-session 锁在同一版本（见 Cargo.toml）：hub 解析私钥用它，类型与上游一致。
+pub use russh;
 
 /// 把平台的钥匙串设为 keyring 的默认存储（`SystemCredentialVault` 经它读写）。
 ///

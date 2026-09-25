@@ -9,11 +9,13 @@ use rshell_m0::rshell_storage::{CredentialCoordinator, SqliteRepository, SystemC
 use tokio::sync::Notify;
 use tokio::task::spawn_blocking;
 
+use crate::keys::{KeyStore, PreferenceFile};
 use crate::signals::{AppReady, AppStart};
-use crate::{catalog, session, settings};
+use crate::{catalog, keys, session, settings};
 
 const CATALOG_FILE: &str = "catalog.sqlite3";
 const KNOWN_HOSTS_FILE: &str = "known_hosts";
+const PREFERENCES_FILE: &str = "preferences.json";
 
 /// 进程内共享的存储。SQLite 与钥匙串的调用都是阻塞的，一律经 `spawn_blocking`。
 pub struct AppContext {
@@ -22,8 +24,13 @@ pub struct AppContext {
     pub credentials: CredentialCoordinator,
     /// 本 App 自己的 known_hosts（不是用户的 OpenSSH 文件）。
     pub known_hosts: PathBuf,
+    /// 私钥与口令（钥匙串）。
+    pub keys: Arc<dyn KeyStore>,
+    pub preferences: PreferenceFile,
     /// 目录在目录任务之外被改动（连接成功后存密码）时通知它重发。
     pub catalog_changed: Notify,
+    /// 私钥在私钥任务之外被改动（连接时存口令）时通知它重发。
+    pub keys_changed: Notify,
 }
 
 impl AppContext {
@@ -47,9 +54,22 @@ impl AppContext {
             repository,
             credentials,
             known_hosts: support_dir.join(KNOWN_HOSTS_FILE),
+            keys: platform_key_store()?,
+            preferences: PreferenceFile::open(support_dir.join(PREFERENCES_FILE)),
             catalog_changed: Notify::new(),
+            keys_changed: Notify::new(),
         })
     }
+}
+
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn platform_key_store() -> Result<Arc<dyn KeyStore>, String> {
+    Ok(Arc::new(keys::KeychainKeyStore::new()?))
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+fn platform_key_store() -> Result<Arc<dyn KeyStore>, String> {
+    Err("private keys need the Apple keychain".to_owned())
 }
 
 pub async fn run() {
@@ -81,5 +101,6 @@ pub async fn run() {
 
     tokio::spawn(catalog::run(context.clone()));
     tokio::spawn(settings::run(context.clone()));
+    tokio::spawn(keys::run(context.clone()));
     session::supervisor(context).await;
 }

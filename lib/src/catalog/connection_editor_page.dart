@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../bindings/bindings.dart';
+import '../keys/key_import_page.dart';
 import '../terminal/session_target.dart';
 import '../terminal/terminal_page.dart';
 import 'catalog_requests.dart';
@@ -29,18 +30,38 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
 
   late AuthMethod _auth = widget.existing?.auth ?? AuthMethod.password;
   late bool _savePassword = widget.existing?.passwordSaved ?? true;
+  late String _keyId = widget.existing?.keyId ?? '';
+  List<KeySummary> _keys = KeyListState.latestRustSignal?.message.keys ?? const [];
+  StreamSubscription? _keysSub;
   bool _busy = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _keysSub = KeyListState.rustSignalStream.listen((pack) {
+      if (mounted) setState(() => _keys = pack.message.keys);
+    });
+    KeyQuery().sendSignalToRust();
+  }
 
   bool get _editing => widget.existing != null;
   bool get _passwordAlreadySaved => widget.existing?.passwordSaved ?? false;
 
   @override
   void dispose() {
+    _keysSub?.cancel();
     for (final controller in [_name, _host, _port, _username, _password, _command]) {
       controller.dispose();
     }
     super.dispose();
+  }
+
+  Future<void> _importKey() async {
+    final id = await Navigator.of(context).push<String>(MaterialPageRoute(
+      builder: (_) => const KeyImportPage(),
+    ));
+    if (id != null && mounted) setState(() => _keyId = id);
   }
 
   /// 端口按文本解析；解析不了的交给 Rust 判为无效。
@@ -69,6 +90,7 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
         auth: _auth,
         passwordAction: _passwordAction,
         password: _password.text,
+        keyId: _auth == AuthMethod.publicKey ? _keyId : '',
         command: _command.text,
       );
       if (result.error != CatalogError.none) error = catalogErrorText(result.error);
@@ -146,6 +168,7 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
               SegmentedButton<AuthMethod>(
                 segments: const [
                   ButtonSegment(value: AuthMethod.password, label: Text('密码')),
+                  ButtonSegment(value: AuthMethod.publicKey, label: Text('私钥')),
                   ButtonSegment(
                     value: AuthMethod.keyboardInteractive,
                     label: Text('键盘交互'),
@@ -183,6 +206,38 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
                 ),
                 const SizedBox(height: 12),
               ],
+            ] else if (_auth == AuthMethod.publicKey) ...[
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                // 导入新私钥后选中它：选中项与列表一变就重建表单项。
+                key: ValueKey('$_keyId/${_keys.length}'),
+                initialValue: _keys.any((key) => key.id == _keyId) ? _keyId : null,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: '私钥',
+                  border: OutlineInputBorder(),
+                ),
+                hint: Text(_keys.isEmpty ? '还没有私钥' : '选择私钥'),
+                items: [
+                  for (final key in _keys)
+                    DropdownMenuItem(
+                      value: key.id,
+                      child: Text(
+                        '${key.name}（${key.algorithm}）',
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
+                onChanged: (id) => setState(() => _keyId = id ?? ''),
+              ),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  onPressed: _importKey,
+                  icon: const Icon(Icons.add),
+                  label: const Text('导入私钥…'),
+                ),
+              ),
             ] else ...[
               Text(
                 '由服务器逐项提问（例如密码、一次性验证码），连接时回答。',
@@ -214,6 +269,7 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
     TextInputType? keyboardType,
     Iterable<String>? autofillHints,
   }) {
+    // 主机、命令等都是要原样发出的文本：iOS 的智能标点会把 `--` 换成破折号。
     return TextField(
       controller: controller,
       obscureText: obscure,
@@ -221,6 +277,8 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
       autofillHints: autofillHints,
       autocorrect: false,
       enableSuggestions: false,
+      smartDashesType: SmartDashesType.disabled,
+      smartQuotesType: SmartQuotesType.disabled,
       decoration: InputDecoration(
         labelText: label,
         hintText: hint,

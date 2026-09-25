@@ -1,0 +1,54 @@
+import 'dart:async';
+
+import '../bindings/bindings.dart';
+
+/// 私钥请求：带请求号发出，等同号的 [KeyResult]。
+int _nextRequestId = 1;
+
+const _timeout = Duration(seconds: 30);
+
+Future<KeyResult> _request(void Function(int requestId) send) {
+  final requestId = _nextRequestId++;
+  final result = KeyResult.rustSignalStream
+      .map((pack) => pack.message)
+      .firstWhere((result) => result.requestId == requestId)
+      .timeout(_timeout);
+  send(requestId);
+  return result;
+}
+
+Future<KeyResult> importKey({
+  required String name,
+  required String privateKey,
+  required String passphrase,
+}) =>
+    _request((requestId) => ImportKey(
+          requestId: requestId,
+          name: name,
+          privateKey: privateKey,
+          passphrase: passphrase,
+        ).sendSignalToRust());
+
+Future<KeyResult> renameKey(String id, String name) => _request(
+    (requestId) => RenameKey(requestId: requestId, id: id, name: name).sendSignalToRust());
+
+Future<KeyResult> deleteKey(String id) =>
+    _request((requestId) => DeleteKey(requestId: requestId, id: id).sendSignalToRust());
+
+Future<KeyResult> forgetPassphrase(String id) => _request(
+    (requestId) => ForgetPassphrase(requestId: requestId, id: id).sendSignalToRust());
+
+Future<KeyResult> setKeySync(bool enabled) => _request(
+    (requestId) => SetKeySync(requestId: requestId, enabled: enabled).sendSignalToRust());
+
+String keyErrorText(KeyError error) => switch (error) {
+      KeyError.none => '',
+      KeyError.invalid => '不是能识别的私钥',
+      KeyError.passphraseRequired => '这把私钥有口令保护，请填写口令',
+      KeyError.passphraseWrong => '口令不正确',
+      KeyError.alreadyExists => '这把私钥已经导入过',
+      KeyError.notFound => '私钥不存在',
+      KeyError.inUse => '还有连接在用这把私钥',
+      KeyError.keychain => '钥匙串读写失败',
+      KeyError.syncUnavailable => '无法写入 iCloud 钥匙串',
+    };

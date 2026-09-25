@@ -3,16 +3,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rshell_m0::rshell_session::ExternalSigner as _;
+use rshell_m0::russh::keys::HashAlg;
 use rshell_m0::russh::keys::signature::Verifier;
 use rshell_m0::russh::keys::ssh_encoding::Decode as _;
 use rshell_m0::russh::keys::ssh_key::{EcdsaCurve, Signature};
-use rshell_m0::russh::keys::HashAlg;
-use rshell_m0::rshell_session::ExternalSigner as _;
 use secrecy::SecretString;
 use tokio::sync::mpsc;
 
 use super::virtual_card::{CARDHOLDER, CardKey, IDENT, PIN, VirtualCard};
-use super::{CardContext, CardFailure, CardRequest, CardSigner};
+use super::{CardContext, CardFailure, CardSigner};
+use crate::external_signer::SignerRequest;
 
 fn cards(card: &VirtualCard) -> Arc<CardContext> {
     Arc::new(CardContext::new(Arc::new(card.clone())))
@@ -98,7 +99,11 @@ fn another_key_or_another_card_is_refused() {
         cards.probe("0006:12345678", &card.public_key()).err(),
         Some(CardFailure::NotFound)
     );
-    assert_eq!(card.tries_left(), 3, "a mismatched key never reaches VERIFY");
+    assert_eq!(
+        card.tries_left(),
+        3,
+        "a mismatched key never reaches VERIFY"
+    );
 }
 
 #[tokio::test]
@@ -120,8 +125,8 @@ async fn the_signer_asks_again_after_a_wrong_pin_and_remembers_on_request() {
         for answer in ["000000", PIN] {
             let (question, reply) = loop {
                 match questions.recv().await {
-                    Some(CardRequest::Pin { question, reply }) => break (question, reply),
-                    Some(CardRequest::Waiting(_)) => {}
+                    Some(SignerRequest::Pin { question, reply }) => break (question, reply),
+                    Some(SignerRequest::Waiting(_)) => {}
                     None => return asked,
                 }
             };
@@ -151,9 +156,15 @@ async fn the_signer_asks_again_after_a_wrong_pin_and_remembers_on_request() {
         card.public_key(),
         requests,
     );
-    again.sign(b"data", None).await.expect("signed with the remembered PIN");
+    again
+        .sign(b"data", None)
+        .await
+        .expect("signed with the remembered PIN");
     while let Ok(request) = questions.try_recv() {
-        assert!(matches!(request, CardRequest::Waiting(_)), "no PIN question");
+        assert!(
+            matches!(request, SignerRequest::Waiting(_)),
+            "no PIN question"
+        );
     }
 }
 
@@ -172,7 +183,7 @@ async fn cancelling_the_pin_or_a_missing_card_is_reported_by_the_signer() {
     );
     tokio::spawn(async move {
         while let Some(request) = questions.recv().await {
-            if let CardRequest::Pin { reply, .. } = request {
+            if let SignerRequest::Pin { reply, .. } = request {
                 let _ = reply.send(None);
             }
         }
@@ -214,8 +225,14 @@ fn rsa_cards_sign_with_the_sha2_variant_the_server_accepts() {
     let card = VirtualCard::new(CardKey::rsa().expect("RSA test key"), false);
     let found = cards(&card).scan(false).expect("scan");
     assert_eq!(found[0].algorithm, "RSA 2048");
-    assert_eq!(sign_and_verify(&card, Some(HashAlg::Sha256)), "rsa-sha2-256");
-    assert_eq!(sign_and_verify(&card, Some(HashAlg::Sha512)), "rsa-sha2-512");
+    assert_eq!(
+        sign_and_verify(&card, Some(HashAlg::Sha256)),
+        "rsa-sha2-256"
+    );
+    assert_eq!(
+        sign_and_verify(&card, Some(HashAlg::Sha512)),
+        "rsa-sha2-512"
+    );
 }
 
 #[test]
@@ -250,7 +267,8 @@ fn ecdsa_halves_drop_padding_and_keep_positive() {
     let inner = signature.as_bytes();
     let r_len = u32::from_be_bytes(inner[..4].try_into().expect("length")) as usize;
     assert_eq!(r_len, 47);
-    let s_len = u32::from_be_bytes(inner[4 + r_len..8 + r_len].try_into().expect("length")) as usize;
+    let s_len =
+        u32::from_be_bytes(inner[4 + r_len..8 + r_len].try_into().expect("length")) as usize;
     assert_eq!(s_len, 49);
     assert_eq!(inner[8 + r_len], 0x00);
 

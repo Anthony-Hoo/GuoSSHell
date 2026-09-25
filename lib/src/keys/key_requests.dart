@@ -7,12 +7,12 @@ int _nextRequestId = 1;
 
 const _timeout = Duration(seconds: 30);
 
-Future<KeyResult> _request(void Function(int requestId) send) {
+Future<KeyResult> _request(void Function(int requestId) send, {Duration timeout = _timeout}) {
   final requestId = _nextRequestId++;
   final result = KeyResult.rustSignalStream
       .map((pack) => pack.message)
       .firstWhere((result) => result.requestId == requestId)
-      .timeout(_timeout);
+      .timeout(timeout);
   send(requestId);
   return result;
 }
@@ -41,6 +41,12 @@ Future<KeyResult> forgetPassphrase(String id) => _request(
 Future<KeyResult> addCardKey(String ident, String name) => _request((requestId) =>
     AddCardKey(requestId: requestId, ident: ident, name: name).sendSignalToRust());
 
+/// 在安全密钥上新建凭据并登记。系统界面等用户插上、靠近或触摸安全密钥（最多约 3 分钟），
+/// 超时放宽。
+Future<KeyResult> registerSecurityKey(String name) => _request(
+    (requestId) => RegisterSecurityKey(requestId: requestId, name: name).sendSignalToRust(),
+    timeout: const Duration(seconds: 200));
+
 /// 读卡。NFC 读卡要等用户把卡靠近，超时放宽。
 Future<CardScanResult> scanCards({bool nfc = false}) {
   final requestId = _nextRequestId++;
@@ -67,4 +73,7 @@ String keyErrorText(KeyError error) => switch (error) {
       KeyError.syncUnavailable => '无法写入 iCloud 钥匙串',
       KeyError.cardNotFound => '没有找到 OpenPGP 卡',
       KeyError.cardUnsupported => '这张卡的认证槽没有密钥，或算法 SSH 用不了（支持 Ed25519、RSA 与 NIST P-256/384/521）',
+      KeyError.securityKeyUnavailable => '这台设备或这个版本的 App 用不了安全密钥',
+      KeyError.securityKeyCancelled => '已取消',
+      KeyError.securityKeyFailed => '安全密钥没有完成登记（需要支持 ES256 的 FIDO2 安全密钥）',
     };

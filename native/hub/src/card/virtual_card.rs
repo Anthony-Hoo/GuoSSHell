@@ -117,7 +117,10 @@ impl CardKey {
     /// ECDSA 签摘要、回定长 r‖s。
     fn sign(&self, data: &[u8]) -> Option<Vec<u8>> {
         match self {
-            Self::Ed25519(key) => key.try_sign(data).ok().map(|signature| signature.as_bytes().to_vec()),
+            Self::Ed25519(key) => key
+                .try_sign(data)
+                .ok()
+                .map(|signature| signature.as_bytes().to_vec()),
             Self::Rsa(key) => key.sign(Pkcs1v15Sign::new_unprefixed(), data).ok(),
             Self::P256(key) => {
                 let signature: p256::ecdsa::Signature = key.sign_prehash(data).ok()?;
@@ -339,7 +342,10 @@ fn application_related_data(state: &State) -> Vec<u8> {
 
     let mut discretionary = Vec::new();
     for (tag, value) in [
-        (0xC0, vec![0x7D, 0x00, 0x0B, 0xFE, 0x08, 0x00, 0x00, 0xFF, 0x00, 0x00]),
+        (
+            0xC0,
+            vec![0x7D, 0x00, 0x0B, 0xFE, 0x08, 0x00, 0x00, 0xFF, 0x00, 0x00],
+        ),
         (0xC1, ED25519.to_vec()),
         (0xC2, X25519.to_vec()),
         (0xC3, state.key.attributes()),

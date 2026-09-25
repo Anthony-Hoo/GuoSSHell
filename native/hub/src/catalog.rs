@@ -345,6 +345,7 @@ mod tests {
             known_hosts: PathBuf::new(),
             keys: Arc::new(MemoryKeyStore::new(false)),
             cards: Arc::new(CardContext::new(Arc::new(NoCards))),
+            security_keys: Arc::new(crate::security_key::Unavailable),
             preferences: PreferenceFile::open(
                 std::env::temp_dir().join("guosh-test-preferences.json"),
             ),

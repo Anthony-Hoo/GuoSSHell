@@ -1,5 +1,5 @@
-//! 私钥（存在钥匙串里；私钥本身永不过边界，导入时的原文除外）与 OpenPGP 卡上的密钥
-//! （钥匙串里只登记公钥与卡号，私钥在卡里）。
+//! 私钥（存在钥匙串里；私钥本身永不过边界，导入时的原文除外），以及 OpenPGP 卡与安全密钥
+//! 上的密钥（钥匙串里只登记公钥与卡号 / 凭据 id，私钥在卡或安全密钥里）。
 
 use rinf::{DartSignal, RustSignal, SignalPiece};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ pub struct KeySummary {
     pub used_by: u32,
     /// OpenPGP 卡上的密钥：卡号（`厂商:序列号`）；钥匙串里的私钥为空。
     pub card_ident: String,
+    /// 安全密钥（FIDO2）上的密钥。
+    pub security_key: bool,
 }
 
 /// 私钥列表与同步开关。私钥或开关变化后重发。
@@ -33,6 +35,8 @@ pub struct KeyListState {
     pub keys: Vec<KeySummary>,
     /// 私钥经 iCloud 钥匙串同步（新导入的私钥也放进 iCloud 钥匙串）。
     pub sync_enabled: bool,
+    /// 这台设备能用安全密钥（FIDO2）。
+    pub security_keys_available: bool,
 }
 
 #[derive(Deserialize, DartSignal)]
@@ -117,6 +121,13 @@ pub struct AddCardKey {
     pub name: String,
 }
 
+/// 在安全密钥上新建一把 SSH 密钥（系统界面引导插上、靠近或触摸）。回答是 `KeyResult`。
+#[derive(Deserialize, DartSignal)]
+pub struct RegisterSecurityKey {
+    pub request_id: u32,
+    pub name: String,
+}
+
 #[derive(Serialize, SignalPiece, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyError {
     None,
@@ -137,6 +148,12 @@ pub enum KeyError {
     CardNotFound,
     /// 卡的认证槽没有密钥，或算法暂不支持。
     CardUnsupported,
+    /// 这台设备用不了安全密钥。
+    SecurityKeyUnavailable,
+    /// 用户取消了安全密钥的系统界面。
+    SecurityKeyCancelled,
+    /// 安全密钥没能完成注册。
+    SecurityKeyFailed,
 }
 
 /// 私钥操作的结果，`request_id` 原样带回；`key_id` 是导入的私钥。

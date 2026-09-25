@@ -38,6 +38,10 @@ sha1 = "0.11"
 # debug 构建与测试里的模拟卡用它们签 RSA / P-256（与 russh 用的是同一版本）。
 rsa = "0.10.0-rc.18"
 p256 = { version = "0.14", features = ["ecdsa"] }
+# 安全密钥（M3d）：WebAuthn 注册结果（attestation object、COSE 公钥）是 CBOR；
+# clientDataJSON 里的 challenge 是 base64url。
+ciborium = "0.2"
+base64ct = { version = "1", features = ["alloc"] }
 
 # 业务内核唯一入口：`rshell-m0`（根 workspace 成员，path 依赖）。
 # 它再导出 rshell-core / rshell-session，并把上游 git 依赖的 rev pin 在
@@ -53,9 +57,18 @@ keyring-core = "1.0.0"
 apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
 # OpenPGP 卡经 CryptoTokenKit 访问（iOS 没有 PC/SC）。
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSData", "NSEnumerator", "NSError", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSEnumerator", "NSError", "NSSet", "NSString"] }
 objc2-crypto-token-kit = { version = "0.3.2", default-features = false, features = ["std", "TKSmartCard", "TKSmartCardSlotNFCSession", "block2", "bitflags"] }
 block2 = "0.6"
+# 安全密钥经 AuthenticationServices（系统界面在主线程上跑）。
+objc2-authentication-services = { version = "0.3.2", default-features = false, features = ["std", "block2", "ASAuthorization", "ASAuthorizationController", "ASAuthorizationCredential", "ASAuthorizationRequest", "ASAuthorizationProvider", "ASAuthorizationPublicKeyCredentialAssertion", "ASAuthorizationPublicKeyCredentialAssertionRequest", "ASAuthorizationPublicKeyCredentialConstants", "ASAuthorizationPublicKeyCredentialDescriptor", "ASAuthorizationPublicKeyCredentialParameters", "ASAuthorizationPublicKeyCredentialRegistration", "ASAuthorizationPublicKeyCredentialRegistrationRequest", "ASAuthorizationSecurityKeyPublicKeyCredentialAssertion", "ASAuthorizationSecurityKeyPublicKeyCredentialAssertionRequest", "ASAuthorizationSecurityKeyPublicKeyCredentialDescriptor", "ASAuthorizationSecurityKeyPublicKeyCredentialProvider", "ASAuthorizationSecurityKeyPublicKeyCredentialRegistration", "ASAuthorizationSecurityKeyPublicKeyCredentialRegistrationRequest", "ASAuthorizationError", "ASCOSEConstants", "ASFoundation", "ASPublicKeyCredential"] }
+dispatch2 = "0.3"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIApplication", "UIResponder", "UIScene", "UISceneDefinitions", "UIView", "UIWindow", "UIWindowScene"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow"] }
 
 [dev-dependencies]
 # 暂停的时钟（连接时限的测试）。

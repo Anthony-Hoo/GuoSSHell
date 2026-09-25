@@ -11,6 +11,7 @@ use tokio::task::spawn_blocking;
 
 use crate::card::{self, CardContext};
 use crate::keys::{KeyStore, PreferenceFile};
+use crate::security_key::{self, Authenticator};
 use crate::signals::{AppReady, AppStart};
 use crate::{catalog, keys, session, settings};
 
@@ -29,6 +30,8 @@ pub struct AppContext {
     pub keys: Arc<dyn KeyStore>,
     /// OpenPGP 卡（读卡器、记住的 PIN）。
     pub cards: Arc<CardContext>,
+    /// 安全密钥（FIDO2）。
+    pub security_keys: Arc<dyn Authenticator>,
     pub preferences: PreferenceFile,
     /// 目录在目录任务之外被改动（连接成功后存密码）时通知它重发。
     pub catalog_changed: Notify,
@@ -59,6 +62,7 @@ impl AppContext {
             known_hosts: support_dir.join(KNOWN_HOSTS_FILE),
             keys: platform_key_store()?,
             cards: Arc::new(CardContext::new(card::platform_reader())),
+            security_keys: security_key::platform_authenticator(),
             preferences: PreferenceFile::open(support_dir.join(PREFERENCES_FILE)),
             catalog_changed: Notify::new(),
             keys_changed: Notify::new(),

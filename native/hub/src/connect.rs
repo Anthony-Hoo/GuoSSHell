@@ -4,11 +4,14 @@
 //! 期间要用户回答的问题——密码、私钥口令、OpenPGP 卡的 PIN、主机密钥确认、
 //! keyboard-interactive——发成 `InteractionPrompt`，回答经会话的 `replies` 通道回来。用户在此期间的其他操作
 //! （输入、改尺寸）存进 backlog，连上后按原顺序处理；Disconnect 立即中止连接。
+//! 私钥在 OpenPGP 卡或安全密钥上时，签名交给外部签名器，它等用户（PIN、按卡、触摸）的
+//! 时间同样不算进连接时限。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64ct::{Base64UrlUnpadded, Encoding as _};
 use rinf::{RustSignal, debug_print};
 use rshell_m0::rshell_core::{
     AuthenticationKind, CatalogMutation, ConnectionId, ConnectionProfile, HostKeyDecision,
@@ -16,8 +19,8 @@ use rshell_m0::rshell_core::{
     KeyboardInteractivePrompt, SecretUpdate, SessionFailure, TerminalSize, TransportKind,
 };
 use rshell_m0::rshell_session::{
-    AuthPlan, InteractionBroker, KnownHostsVerifier, NativeSshTransport, SessionTransport,
-    TransportRequest, interaction_channel,
+    AuthPlan, ExternalSigner, InteractionBroker, KnownHostsVerifier, NativeSshTransport,
+    SessionTransport, TransportRequest, interaction_channel,
 };
 use rshell_m0::russh::keys::{PrivateKey, PublicKey};
 use secrecy::{ExposeSecret, SecretString};
@@ -27,9 +30,11 @@ use tokio::task::spawn_blocking;
 use tokio::time::Instant;
 
 use crate::app::AppContext;
-use crate::card::{CardFailure, CardRequest, CardSigner, PinQuestion};
+use crate::card::{CardFailure, CardSigner};
 use crate::catalog;
+use crate::external_signer::{PinQuestion, SignerRequest};
 use crate::keys::{self, StoredKey};
+use crate::security_key::{SecurityKeySigner, SkFailure};
 use crate::session::SessionCommand;
 use crate::signals::interaction::{InteractionPrompt, InteractionReply, PromptField, PromptKind};
 use crate::signals::keys::KeyError;
@@ -44,6 +49,29 @@ const CONNECT_LIMIT: Duration = Duration::from_secs(30 * 60);
 pub struct Connected {
     pub transport: NativeSshTransport,
     pub profile: ConnectionProfile,
+}
+
+/// 私钥不在 App 里时代为签名的一方。
+enum Signer {
+    Card(Arc<CardSigner>),
+    SecurityKey(Arc<SecurityKeySigner>),
+}
+
+impl Signer {
+    fn external(&self) -> Arc<dyn ExternalSigner> {
+        match self {
+            Self::Card(signer) => signer.clone(),
+            Self::SecurityKey(signer) => signer.clone(),
+        }
+    }
+
+    /// 签名失败时的真正原因（连接失败后取）。
+    fn abort(&self) -> Option<Abort> {
+        match self {
+            Self::Card(signer) => signer.failure().map(card_abort),
+            Self::SecurityKey(signer) => signer.failure().map(security_key_abort),
+        }
+    }
 }
 
 /// 连接没有建成的原因。
@@ -152,8 +180,8 @@ pub async fn establish(
     let mut prompts = PromptIds::default();
     let described = target.describe();
     let Target { profile, saved } = target;
-    // OpenPGP 卡签名器与它要会话代问的事（PIN）。
-    let mut card: Option<(Arc<CardSigner>, UnboundedReceiver<CardRequest>)> = None;
+    // 外部签名器（OpenPGP 卡或安全密钥）与它要会话代办的事（问 PIN、等用户）。
+    let mut external: Option<(Signer, UnboundedReceiver<SignerRequest>)> = None;
 
     // 密码：目录里存了就从钥匙串读（每次连接读，不缓存——PLAN §9.2.2）；
     // 没存、读不到、或快速连接没带，就问用户。
@@ -188,22 +216,11 @@ pub async fn establish(
         }
         AuthenticationKind::PublicKey => {
             let (id, stored) = load_key(context, &profile).await?;
-            match stored.card.clone() {
-                Some(ident) => {
-                    let public_key = PublicKey::from_openssh(&stored.public_key)
-                        .map_err(|_| Abort::failed(FailureKind::KeyNotFound, id))?;
-                    let (requests, receiver) = mpsc::unbounded_channel();
-                    let signer = Arc::new(CardSigner::new(
-                        context.cards.clone(),
-                        session_id,
-                        described,
-                        stored.name.clone(),
-                        ident,
-                        public_key.clone(),
-                        requests,
-                    ));
-                    card = Some((signer.clone(), receiver));
-                    AuthPlan::from_signer(&profile, public_key, signer)
+            match external_signer(context, session_id, described, &id, &stored)? {
+                Some((signer, receiver, public_key)) => {
+                    let plan = AuthPlan::from_signer(&profile, public_key, signer.external());
+                    external = Some((signer, receiver));
+                    plan
                 }
                 None => {
                     let key = unlock_key(
@@ -239,7 +256,7 @@ pub async fn establish(
 
     let (broker, mut requests) = interaction_channel();
     let transport_request = TransportRequest::new(size);
-    let (card_signer, mut card_requests) = card.unzip();
+    let (signer, mut signer_requests) = external.unzip();
     let result = {
         let connect = transport.connect(&transport_request, broker.clone());
         tokio::pin!(connect);
@@ -247,9 +264,9 @@ pub async fn establish(
         let mut pending_pins: HashMap<u32, oneshot::Sender<Option<(SecretString, bool)>>> =
             HashMap::new();
         let mut budget = Budget::new(CONNECT_BUDGET);
-        let mut card_waiting = false;
+        let mut signer_waiting = false;
         loop {
-            budget.pause(!pending.is_empty() || !pending_pins.is_empty() || card_waiting);
+            budget.pause(!pending.is_empty() || !pending_pins.is_empty() || signer_waiting);
             tokio::select! {
                 result = &mut connect => break result,
                 () = budget.expired() => {
@@ -260,15 +277,15 @@ pub async fn establish(
                         forward_prompt(session_id, &profile, &broker, &mut prompts, &mut pending, id, request);
                     }
                 }
-                request = next_card_request(&mut card_requests) => match request {
-                    Some(CardRequest::Pin { question, reply }) => {
+                request = next_signer_request(&mut signer_requests) => match request {
+                    Some(SignerRequest::Pin { question, reply }) => {
                         let prompt_id = prompts.next();
                         card_pin_prompt(session_id, prompt_id, &profile, question)
                             .send_signal_to_dart();
                         pending_pins.insert(prompt_id, reply);
                     }
-                    Some(CardRequest::Waiting(waiting)) => card_waiting = waiting,
-                    None => card_requests = None,
+                    Some(SignerRequest::Waiting(waiting)) => signer_waiting = waiting,
+                    None => signer_requests = None,
                 },
                 reply = channels.replies.recv() => {
                     if let Some(reply) = reply {
@@ -285,9 +302,9 @@ pub async fn establish(
     };
     if let Err(error) = result {
         debug_print!("[connect] {error:?}");
-        // 卡签名失败时认证失败只是表象，原因在签名器里。
-        if let Some(failure) = card_signer.as_ref().and_then(|signer| signer.failure()) {
-            return Err(card_abort(failure));
+        // 外部签名失败时认证失败只是表象，原因在签名器里。
+        if let Some(abort) = signer.as_ref().and_then(Signer::abort) {
+            return Err(abort);
         }
         return Err(Abort::failed(
             failure_kind(error.failure()),
@@ -408,7 +425,52 @@ async fn ask_secret(
     }
 }
 
-/// 从钥匙串取出连接用的私钥（或 OpenPGP 卡的登记）。
+/// 私钥在 OpenPGP 卡或安全密钥上时，建对应的签名器与它的请求通道；普通私钥返回 `None`。
+fn external_signer(
+    context: &Arc<AppContext>,
+    session_id: u32,
+    described: String,
+    id: &str,
+    stored: &StoredKey,
+) -> Result<Option<(Signer, UnboundedReceiver<SignerRequest>, PublicKey)>, Abort> {
+    let not_found = || Abort::failed(FailureKind::KeyNotFound, id.to_owned());
+    let (requests, receiver) = mpsc::unbounded_channel();
+    let (signer, public_key) = match (&stored.card, &stored.security_key) {
+        (Some(ident), _) => {
+            let public_key =
+                PublicKey::from_openssh(&stored.public_key).map_err(|_| not_found())?;
+            let signer = CardSigner::new(
+                context.cards.clone(),
+                session_id,
+                described,
+                stored.name.clone(),
+                ident.clone(),
+                public_key.clone(),
+                requests,
+            );
+            (Signer::Card(Arc::new(signer)), public_key)
+        }
+        (None, Some(reference)) => {
+            let public_key =
+                PublicKey::from_openssh(&stored.public_key).map_err(|_| not_found())?;
+            let credential_id =
+                Base64UrlUnpadded::decode_vec(&reference.credential_id).map_err(|_| not_found())?;
+            let signer = SecurityKeySigner::new(
+                context.security_keys.clone(),
+                session_id,
+                described,
+                reference.application.clone(),
+                credential_id,
+                requests,
+            );
+            (Signer::SecurityKey(Arc::new(signer)), public_key)
+        }
+        (None, None) => return Ok(None),
+    };
+    Ok(Some((signer, receiver, public_key)))
+}
+
+/// 从钥匙串取出连接用的私钥（或 OpenPGP 卡、安全密钥的登记）。
 async fn load_key(
     context: &Arc<AppContext>,
     profile: &ConnectionProfile,
@@ -497,10 +559,10 @@ async fn decode_key(
     .unwrap_or(Err(KeyError::Invalid))
 }
 
-/// 卡签名器要问的下一件事；没有卡（或签名器已结束）时永远等待。
-async fn next_card_request(
-    requests: &mut Option<UnboundedReceiver<CardRequest>>,
-) -> Option<CardRequest> {
+/// 外部签名器要会话代办的下一件事；没有外部签名器（或它已结束）时永远等待。
+async fn next_signer_request(
+    requests: &mut Option<UnboundedReceiver<SignerRequest>>,
+) -> Option<SignerRequest> {
     match requests {
         Some(requests) => requests.recv().await,
         None => std::future::pending().await,
@@ -546,6 +608,17 @@ fn card_abort(failure: CardFailure) -> Abort {
         CardFailure::Io(_) => FailureKind::CardError,
     };
     Abort::failed(kind, format!("card: {failure:?}"))
+}
+
+/// 安全密钥签名失败的原因 → 连接失败的分类。
+fn security_key_abort(failure: SkFailure) -> Abort {
+    match failure {
+        SkFailure::Cancelled => Abort::Cancelled,
+        failure => Abort::failed(
+            FailureKind::SecurityKeyFailed,
+            format!("security key: {failure:?}"),
+        ),
+    }
 }
 
 /// 上游 broker 的问题 → Dart。上游只会问主机密钥与 keyboard-interactive；
@@ -723,12 +796,12 @@ pub fn failure_kind(failure: SessionFailure) -> FailureKind {
 #[cfg(test)]
 mod tests {
     use super::{Budget, PromptKind, broker_response, is_empty_round};
-    use std::time::Duration;
     use crate::signals::interaction::InteractionReply;
     use rshell_m0::rshell_core::{
         AuthPrompt, HostKeyDecision, InteractionId, InteractionResponse, KeyboardInteractivePrompt,
     };
     use secrecy::ExposeSecret;
+    use std::time::Duration;
 
     #[test]
     fn keyboard_interactive_rounds_without_questions_or_text_are_answered_silently() {

@@ -193,6 +193,8 @@ pub enum FailureKind {
     CardTouchTimeout,
     /// OpenPGP 卡：其他读卡错误。
     CardError,
+    /// 安全密钥没有完成签名（用不了、出错，或给的签名 OpenSSH 验证不了）。
+    SecurityKeyFailed,
     Other,
 }
 
@@ -204,6 +206,8 @@ pub enum ConnectHint {
     TouchCard,
     /// 请把 OpenPGP 卡靠近设备（NFC）。
     TapCard,
+    /// 请按系统界面的提示使用安全密钥（插上或靠近，再触摸）。
+    SecurityKey,
 }
 
 #[derive(Serialize, RustSignal)]

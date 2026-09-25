@@ -231,9 +231,11 @@ class _ConnectionEditorPageState extends State<ConnectionEditorPage> {
                     DropdownMenuItem(
                       value: key.id,
                       child: Text(
-                        key.cardIdent.isEmpty
-                            ? '${key.name}（${key.algorithm}）'
-                            : '${key.name}（OpenPGP 卡）',
+                        switch ((key.cardIdent.isNotEmpty, key.securityKey)) {
+                          (true, _) => '${key.name}（OpenPGP 卡）',
+                          (false, true) => '${key.name}（安全密钥）',
+                          (false, false) => '${key.name}（${key.algorithm}）',
+                        },
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),

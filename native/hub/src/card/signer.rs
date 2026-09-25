@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rinf::{RustSignal, debug_print};
+use rinf::debug_print;
 use rshell_m0::rshell_session::{ExternalSigner, ExternalSignerError};
 use rshell_m0::russh::keys::{HashAlg, PublicKey};
 use secrecy::{ExposeSecret, SecretString};
@@ -17,27 +17,8 @@ use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 
 use super::{CardContext, CardFailure, lock};
-use crate::signals::{ConnectHint, FailureKind, SessionState, SessionStatus};
-
-/// 签名过程中要会话代为问用户的事，以及卡在等用户（按键、靠卡）的起止——
-/// 等用户的时间不算进连接时限。
-pub enum CardRequest {
-    /// 问 PIN。回答是 PIN 与「记住到退出 App」；取消为 `None`。
-    Pin {
-        question: PinQuestion,
-        reply: oneshot::Sender<Option<(SecretString, bool)>>,
-    },
-    Waiting(bool),
-}
-
-pub struct PinQuestion {
-    /// 这把私钥（卡）在本 App 里的名字。
-    pub key_name: String,
-    /// PIN 还能试几次；`None` = 还不知道（NFC：卡还没靠近）。
-    pub tries_left: Option<u8>,
-    /// 上一次的 PIN 不对。
-    pub retry: bool,
-}
+use crate::external_signer::{PinQuestion, SignerRequest, send_hint};
+use crate::signals::ConnectHint;
 
 pub struct CardSigner {
     cards: Arc<CardContext>,
@@ -47,7 +28,7 @@ pub struct CardSigner {
     key_name: String,
     ident: String,
     public_key: PublicKey,
-    requests: UnboundedSender<CardRequest>,
+    requests: UnboundedSender<SignerRequest>,
     failure: Mutex<Option<CardFailure>>,
 }
 
@@ -59,7 +40,7 @@ impl CardSigner {
         key_name: String,
         ident: String,
         public_key: PublicKey,
-        requests: UnboundedSender<CardRequest>,
+        requests: UnboundedSender<SignerRequest>,
     ) -> Self {
         Self {
             cards,
@@ -110,7 +91,7 @@ impl CardSigner {
             if nfc {
                 send_hint(self.session_id, &self.target, ConnectHint::TapCard);
             }
-            let _ = self.requests.send(CardRequest::Waiting(true));
+            let _ = self.requests.send(SignerRequest::Waiting(true));
             let result = {
                 let cards = self.cards.clone();
                 let ident = self.ident.clone();
@@ -129,7 +110,7 @@ impl CardSigner {
                 .await
                 .map_err(|error| CardFailure::Io(error.to_string()))?
             };
-            let _ = self.requests.send(CardRequest::Waiting(false));
+            let _ = self.requests.send(SignerRequest::Waiting(false));
             send_hint(self.session_id, &self.target, ConnectHint::None);
             match result {
                 Ok(blob) => {
@@ -165,7 +146,7 @@ impl CardSigner {
             retry,
         };
         self.requests
-            .send(CardRequest::Pin { question, reply })
+            .send(SignerRequest::Pin { question, reply })
             .map_err(|_| CardFailure::Cancelled)?;
         answer.await.ok().flatten().ok_or(CardFailure::Cancelled)
     }
@@ -184,17 +165,4 @@ impl ExternalSigner for CardSigner {
             ExternalSignerError
         })
     }
-}
-
-/// 连接中状态附带的提示（按卡上的按键、把卡靠近设备）。
-fn send_hint(session_id: u32, target: &str, hint: ConnectHint) {
-    SessionStatus {
-        session_id,
-        state: SessionState::Connecting,
-        failure: FailureKind::None,
-        detail: target.to_owned(),
-        local_network_settings_url: String::new(),
-        hint,
-    }
-    .send_signal_to_dart();
 }

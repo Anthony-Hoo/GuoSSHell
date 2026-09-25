@@ -30,7 +30,7 @@ use rshell_m0::russh::keys::ssh_key::{EcdsaCurve, Mpint};
 use rshell_m0::russh::keys::{HashAlg, PublicKey};
 use secrecy::SecretString;
 
-pub use signer::{CardRequest, CardSigner, PinQuestion};
+pub use signer::CardSigner;
 
 /// 能提供卡的地方。
 pub trait CardReader: Send + Sync {
@@ -107,7 +107,9 @@ pub enum CardFailure {
     KeyMismatch,
     /// 认证槽没有密钥，或算法 SSH 不支持（brainpool、secp256k1 等）。
     Unsupported,
-    PinWrong { tries_left: u8 },
+    PinWrong {
+        tries_left: u8,
+    },
     PinBlocked,
     /// 卡要求按键确认，但没有等到。
     TouchTimeout,
@@ -434,8 +436,16 @@ fn ssh_public_key(material: &PublicKeyMaterial, scheme: Scheme, ident: &str) -> 
 /// RSA：按服务器接受的签名算法取摘要。没有 SHA-2 可用的旧服务器只认 `ssh-rsa`（SHA-1）。
 fn rsa_digest(hash: Option<HashAlg>, data: &[u8]) -> (&'static str, HashAlgo, Vec<u8>) {
     match hash {
-        Some(HashAlg::Sha512) => ("rsa-sha2-512", HashAlgo::SHA512, Sha512::digest(data).to_vec()),
-        Some(_) => ("rsa-sha2-256", HashAlgo::SHA256, Sha256::digest(data).to_vec()),
+        Some(HashAlg::Sha512) => (
+            "rsa-sha2-512",
+            HashAlgo::SHA512,
+            Sha512::digest(data).to_vec(),
+        ),
+        Some(_) => (
+            "rsa-sha2-256",
+            HashAlgo::SHA256,
+            Sha256::digest(data).to_vec(),
+        ),
         None => {
             use sha1::Digest as _;
             ("ssh-rsa", HashAlgo::SHA1, sha1::Sha1::digest(data).to_vec())

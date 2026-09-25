@@ -631,6 +631,11 @@ class _TerminalPageState extends State<TerminalPage> {
               text: '请把 OpenPGP 卡靠近设备',
               detail: '正在连接 ${widget.target.title}',
             ),
+          ConnectHint.securityKey => _Banner(
+              icon: Icons.usb,
+              text: '请按系统提示插上（或靠近）安全密钥，并触摸它',
+              detail: '正在连接 ${widget.target.title}',
+            ),
           ConnectHint.none => _Banner(
               icon: Icons.sync,
               text: '正在连接 ${widget.target.title}…',
@@ -770,6 +775,7 @@ String _failureText(FailureKind failure) => switch (failure) {
       FailureKind.cardPinBlocked => 'OpenPGP 卡的 PIN 已锁定，需要用管理 PIN 解锁',
       FailureKind.cardTouchTimeout => '没有等到卡上的按键确认',
       FailureKind.cardError => '读卡失败',
+      FailureKind.securityKeyFailed => '安全密钥没有完成签名：请确认用的是登记时的那把安全密钥',
     };
 
 class _Banner extends StatelessWidget {

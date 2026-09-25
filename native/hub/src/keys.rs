@@ -3,12 +3,14 @@
 //! 列表靠按 service 搜索钥匙串得到，不另存元数据。口令单独一项，与私钥放在同一个存储
 //! （仅本机，或 iCloud 钥匙串）。连接配置的 `identity_file` 写 `keychain:<私钥 id>`。
 //!
-//! OpenPGP 卡上的密钥（M3b）也登记成一个信封：只有公钥与卡号，私钥在卡里。
+//! OpenPGP 卡（M3b）与安全密钥（M3d）上的密钥也登记成一个信封：只有公钥与卡号 / 凭据 id，
+//! 私钥在卡或安全密钥里。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use base64ct::{Base64UrlUnpadded, Encoding as _};
 use rinf::{DartSignal, RustSignal, debug_print};
 use rshell_m0::rshell_core::{AuthenticationKind, ConnectionCatalog, ConnectionProfile};
 use rshell_m0::russh::keys::{
@@ -21,9 +23,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::AppContext;
 use crate::card::CardInfo;
+use crate::security_key::{self, SkFailure};
 use crate::signals::keys::{
     AddCardKey, CardScanResult, CardSummary, DeleteKey, ForgetPassphrase, ImportKey, KeyError,
-    KeyListState, KeyQuery, KeyResult, KeySummary, RenameKey, ScanCards, SetKeySync,
+    KeyListState, KeyQuery, KeyResult, KeySummary, RegisterSecurityKey, RenameKey, ScanCards,
+    SetKeySync,
 };
 
 /// 连接配置里指向钥匙串私钥的 `identity_file` 前缀。
@@ -220,6 +224,16 @@ struct Envelope {
     /// OpenPGP 卡上的密钥：卡号（`private_key` 为空）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     card: Option<String>,
+    /// 安全密钥上的密钥（`private_key` 为空）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    security_key: Option<SecurityKeyRef>,
+}
+
+/// 安全密钥上的凭据：凭据 id（base64url）与 application（WebAuthn 的 RP ID）。
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SecurityKeyRef {
+    pub credential_id: String,
+    pub application: String,
 }
 
 impl Drop for Envelope {
@@ -249,6 +263,8 @@ pub struct StoredKey {
     pub passphrase: Option<SecretString>,
     /// OpenPGP 卡上的密钥：卡号。
     pub card: Option<String>,
+    /// 安全密钥上的密钥。
+    pub security_key: Option<SecurityKeyRef>,
     /// OpenSSH 一行格式的公钥。
     pub public_key: String,
 }
@@ -352,6 +368,7 @@ pub fn import(
             public_key: public_key.to_openssh().map_err(|_| KeyError::Invalid)?,
             encrypted,
             card: None,
+            security_key: None,
         },
     )
 }
@@ -376,8 +393,54 @@ pub fn add_card(context: &AppContext, ident: &str, name: &str) -> Result<String,
             public_key: public_key.to_openssh().map_err(|_| KeyError::Invalid)?,
             encrypted: false,
             card: Some(ident.to_owned()),
+            security_key: None,
         },
     )
+}
+
+/// 在安全密钥上新建一把凭据并登记，返回 id。系统界面引导用户插上、靠近或触摸安全密钥。
+pub fn add_security_key(context: &AppContext, name: &str) -> Result<String, KeyError> {
+    let name = match name.trim() {
+        "" => "安全密钥".to_owned(),
+        name => name.to_owned(),
+    };
+    let rp_id = context
+        .security_keys
+        .relying_party()
+        .ok_or(KeyError::SecurityKeyUnavailable)?;
+    let registration = context
+        .security_keys
+        .register(&rp_id, &name)
+        .map_err(security_key_error)?;
+    let mut public_key =
+        security_key::public_key(&registration, &rp_id).map_err(security_key_error)?;
+    // 公钥注释用名字，贴进 authorized_keys 后认得出是哪把。
+    public_key.set_comment(name.as_str());
+    reject_duplicate(context, &public_key)?;
+    store_new(
+        context,
+        &Envelope {
+            version: 1,
+            name,
+            private_key: String::new(),
+            public_key: public_key.to_openssh().map_err(|_| KeyError::Invalid)?,
+            encrypted: false,
+            card: None,
+            security_key: Some(SecurityKeyRef {
+                credential_id: Base64UrlUnpadded::encode_string(&registration.credential_id),
+                application: rp_id,
+            }),
+        },
+    )
+}
+
+fn security_key_error(failure: SkFailure) -> KeyError {
+    debug_print!("[keys] security key: {failure:?}");
+    match failure {
+        SkFailure::Unavailable => KeyError::SecurityKeyUnavailable,
+        SkFailure::Cancelled => KeyError::SecurityKeyCancelled,
+        SkFailure::Invalid(_) | SkFailure::Failed(_) => KeyError::SecurityKeyFailed,
+    }
 }
 
 /// 读卡，并标出已经登记过的。
@@ -560,6 +623,7 @@ pub fn load(context: &AppContext, id: &str) -> Result<Option<StoredKey>, KeyErro
         synchronized,
         passphrase,
         card: envelope.card.clone(),
+        security_key: envelope.security_key.clone(),
         public_key: envelope.public_key.clone(),
     }))
 }
@@ -628,6 +692,7 @@ pub fn summaries(
             synchronized,
             used_by: used_by(catalog, id),
             card_ident: envelope.card.clone().unwrap_or_default(),
+            security_key: envelope.security_key.is_some(),
         });
     }
     keys.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -643,6 +708,7 @@ pub async fn run(context: Arc<AppContext>) {
     let sync_rx = SetKeySync::get_dart_signal_receiver();
     let scan_rx = ScanCards::get_dart_signal_receiver();
     let add_card_rx = AddCardKey::get_dart_signal_receiver();
+    let security_key_rx = RegisterSecurityKey::get_dart_signal_receiver();
     loop {
         tokio::select! {
             pack = query_rx.recv() => {
@@ -720,6 +786,15 @@ pub async fn run(context: Arc<AppContext>) {
                 .await;
                 reply(request_id, result);
             }
+            pack = security_key_rx.recv() => {
+                let Some(pack) = pack else { break };
+                let request_id = pack.message.request_id;
+                let result = blocking(&context, move |context| {
+                    add_security_key(context, &pack.message.name)
+                })
+                .await;
+                reply(request_id, result);
+            }
             pack = sync_rx.recv() => {
                 let Some(pack) = pack else { break };
                 let request_id = pack.message.request_id;
@@ -769,6 +844,7 @@ async fn publish(context: &Arc<AppContext>) {
         Ok(keys) => KeyListState {
             keys,
             sync_enabled: context.preferences.get().sync_keys,
+            security_keys_available: context.security_keys.relying_party().is_some(),
         }
         .send_signal_to_dart(),
         Err(error) => debug_print!("[keys] list: {error:?}"),
@@ -847,11 +923,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Item, MemoryKeyStore, PreferenceFile, add_card, decode, delete, forget_passphrase, import,
-        key_ref, load, rename, save_passphrase, scan_cards, set_sync, summaries,
+        Item, MemoryKeyStore, PreferenceFile, add_card, add_security_key, decode, delete,
+        forget_passphrase, import, key_ref, load, rename, save_passphrase, scan_cards, set_sync,
+        summaries,
     };
-    use crate::card::virtual_card::{CARDHOLDER, CardKey, IDENT, VirtualCard};
     use crate::app::AppContext;
+    use crate::card::virtual_card::{CARDHOLDER, CardKey, IDENT, VirtualCard};
     use crate::card::{CardContext, NoCards};
     use crate::signals::keys::KeyError;
     use rshell_m0::rshell_core::{
@@ -883,6 +960,7 @@ mod tests {
             known_hosts: PathBuf::new(),
             keys: Arc::new(MemoryKeyStore::new(cloud_available)),
             cards: Arc::new(CardContext::new(Arc::new(NoCards))),
+            security_keys: Arc::new(crate::security_key::Unavailable),
             preferences: PreferenceFile::open(preferences),
             catalog_changed: Notify::new(),
             keys_changed: Notify::new(),
@@ -992,9 +1070,18 @@ mod tests {
         assert!(summaries(&context, &catalog()).expect("list")[0].passphrase_saved);
 
         forget_passphrase(&context, &id).expect("forget");
-        assert!(load(&context, &id).expect("load").expect("stored").passphrase.is_none());
+        assert!(
+            load(&context, &id)
+                .expect("load")
+                .expect("stored")
+                .passphrase
+                .is_none()
+        );
         assert!(!summaries(&context, &catalog()).expect("list")[0].passphrase_saved);
-        assert_eq!(forget_passphrase(&context, "missing"), Err(KeyError::NotFound));
+        assert_eq!(
+            forget_passphrase(&context, "missing"),
+            Err(KeyError::NotFound)
+        );
     }
 
     #[test]
@@ -1097,7 +1184,10 @@ mod tests {
         assert!(scanned[0].public_key.starts_with("ssh-ed25519 "));
 
         let id = add_card(&context, IDENT, "").expect("register");
-        assert_eq!(add_card(&context, IDENT, "again"), Err(KeyError::AlreadyExists));
+        assert_eq!(
+            add_card(&context, IDENT, "again"),
+            Err(KeyError::AlreadyExists)
+        );
         assert!(scan_cards(&context, false).expect("scan")[0].added);
 
         let listed = summaries(&context, &catalog()).expect("list");
@@ -1111,5 +1201,38 @@ mod tests {
         let public_key = PublicKey::from_openssh(&stored.public_key).expect("public key");
         assert_eq!(public_key.key_data(), card.public_key().key_data());
         assert_eq!(public_key.comment().as_str_lossy(), "cardno:FFFF00000001");
+    }
+
+    #[test]
+    fn a_security_key_credential_is_registered_once_and_loads_as_a_reference() {
+        let mut context = context(false);
+        assert_eq!(
+            add_security_key(&context, "yubikey"),
+            Err(KeyError::SecurityKeyUnavailable)
+        );
+
+        context.security_keys = Arc::new(
+            crate::security_key::virtual_key::VirtualSecurityKey::new([9; 32]).expect("key"),
+        );
+        let id = add_security_key(&context, " yubikey ").expect("register");
+        assert_eq!(
+            add_security_key(&context, "again"),
+            Err(KeyError::AlreadyExists),
+            "the virtual key always returns the same credential"
+        );
+
+        let listed = summaries(&context, &catalog()).expect("list");
+        assert_eq!(listed[0].name, "yubikey");
+        assert!(listed[0].security_key);
+        assert!(listed[0].card_ident.is_empty());
+
+        let stored = load(&context, &id).expect("load").expect("stored");
+        assert!(stored.private_key.expose_secret().is_empty());
+        let reference = stored.security_key.expect("security key reference");
+        assert_eq!(reference.application, "ssh:");
+        assert!(!reference.credential_id.is_empty());
+        let public_key = PublicKey::from_openssh(&stored.public_key).expect("public key");
+        assert_eq!(public_key.algorithm(), Algorithm::SkEcdsaSha2NistP256);
+        assert_eq!(public_key.comment().as_str_lossy(), "yubikey");
     }
 }

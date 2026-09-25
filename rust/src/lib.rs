@@ -166,13 +166,7 @@ pub fn blocking_smoke(
         .enable_all()
         .build()
         .map_err(|error| format!("tokio: {error}"))?;
-    runtime.block_on(smoke(
-        host,
-        port,
-        username,
-        password,
-        known_hosts_path,
-    ))
+    runtime.block_on(smoke(host, port, username, password, known_hosts_path))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

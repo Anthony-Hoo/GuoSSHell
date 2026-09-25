@@ -27,9 +27,8 @@ use rshell_m0::rshell_session::{
 use crate::frame_codec::pack_runs;
 use crate::signals::{
     ClipboardText, ConnectRequest, CopyRequest, DisconnectRequest, FrameAck, FrameUpdate,
-    InputRequest,
-    MouseRequest, PerfStats, ResizeRequest, SelectionRequest, SelectionState, SessionState,
-    SessionStatus,
+    InputRequest, MouseRequest, PerfStats, ResizeRequest, SelectionRequest, SelectionState,
+    SessionState, SessionStatus,
 };
 
 const NO_CURSOR: i32 = -1;
@@ -481,7 +480,9 @@ impl FramePacer {
     }
 
     fn may_send(&self, now: Instant) -> bool {
-        let beat_ok = self.last_start.is_none_or(|start| now >= start + Self::INTERVAL);
+        let beat_ok = self
+            .last_start
+            .is_none_or(|start| now >= start + Self::INTERVAL);
         let ack_ok = self
             .in_flight
             .is_none_or(|(_, sent)| now >= sent + Self::ACK_TIMEOUT);
@@ -806,11 +807,16 @@ mod tests {
             ("arrow_up", KeyCode::ArrowUp),
             ("arrow_left", KeyCode::ArrowLeft),
         ] {
-            assert!(matches!(input(name, false), Some(TerminalInput::Key { code, .. }) if code == expected));
+            assert!(
+                matches!(input(name, false), Some(TerminalInput::Key { code, .. }) if code == expected)
+            );
         }
         assert!(matches!(
             input("f12", false),
-            Some(TerminalInput::Key { code: KeyCode::F(12), .. })
+            Some(TerminalInput::Key {
+                code: KeyCode::F(12),
+                ..
+            })
         ));
         assert!(input("f25", false).is_none());
         assert!(input("not_a_key", false).is_none());
@@ -892,7 +898,10 @@ mod tests {
     fn character_key_parses() {
         assert!(matches!(
             input("character:c", false),
-            Some(TerminalInput::Key { code: KeyCode::Character('c'), .. })
+            Some(TerminalInput::Key {
+                code: KeyCode::Character('c'),
+                ..
+            })
         ));
         // 多字符不是合法键
         assert!(input("character:ab", false).is_none());

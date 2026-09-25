@@ -26,7 +26,8 @@ use rshell_m0::rshell_session::{
 
 use crate::frame_codec::pack_runs;
 use crate::signals::{
-    ClipboardText, ConnectRequest, CopyRequest, DisconnectRequest, FrameUpdate, InputRequest,
+    ClipboardText, ConnectRequest, CopyRequest, DisconnectRequest, FrameAck, FrameUpdate,
+    InputRequest,
     MouseRequest, PerfStats, ResizeRequest, SelectionRequest, SelectionState, SessionState,
     SessionStatus,
 };
@@ -43,6 +44,7 @@ enum SessionCommand {
     Mouse(TerminalMouseEvent),
     Selection(SelectionRequest),
     Copy,
+    FrameAck(u32),
 }
 
 /// 常驻任务：接住 Dart 的请求，逐个转交给当前会话。
@@ -55,6 +57,7 @@ pub async fn supervisor() {
     let mouse_rx = MouseRequest::get_dart_signal_receiver();
     let selection_rx = SelectionRequest::get_dart_signal_receiver();
     let copy_rx = CopyRequest::get_dart_signal_receiver();
+    let ack_rx = FrameAck::get_dart_signal_receiver();
     let mut session_tx: Option<UnboundedSender<SessionCommand>> = None;
 
     loop {
@@ -117,6 +120,12 @@ pub async fn supervisor() {
                 let Some(_pack) = pack else { break };
                 if let Some(tx) = &session_tx {
                     let _ = tx.send(SessionCommand::Copy);
+                }
+            }
+            pack = ack_rx.recv() => {
+                let Some(pack) = pack else { break };
+                if let Some(tx) = &session_tx {
+                    let _ = tx.send(SessionCommand::FrameAck(pack.message.seq));
                 }
             }
         }
@@ -237,7 +246,7 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
     }
     send_selection_state(None);
 
-    loop {
+    let (end_state, end_detail) = loop {
         let frame_deadline = pacer.deadline();
         tokio::select! {
             event = transport.next_event() => match event {
@@ -254,49 +263,44 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
                                 && let Err(detail) =
                                     present(&mut engine, viewport, selection, &mut stats, &mut pacer)
                             {
-                                send_status(SessionState::Failed, detail);
-                                break;
+                                break (SessionState::Failed, detail);
                             }
                         }
                         Err(error) => {
-                            send_status(SessionState::Failed, format!("advance: {error:?}"));
-                            break;
+                            break (SessionState::Failed, format!("advance: {error:?}"));
                         }
                     }
                 }
                 Ok(TransportEvent::Failure(failure)) => {
-                    send_status(SessionState::Failed, format!("session: {failure:?}"));
-                    break;
+                    break (SessionState::Failed, format!("session: {failure:?}"));
                 }
                 Ok(TransportEvent::Eof) => {
-                    send_status(SessionState::Closed, "eof".to_owned());
-                    break;
+                    break (SessionState::Closed, "eof".to_owned());
                 }
                 Ok(TransportEvent::Exit(status)) => {
-                    send_status(
+                    break (
                         SessionState::Closed,
                         format!("exit code={:?} success={}", status.code, status.success),
                     );
-                    break;
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    send_status(SessionState::Failed, format!("transport: {error:?}"));
-                    break;
+                    break (SessionState::Failed, format!("transport: {error:?}"));
                 }
             },
             // 合帧：高输出期间攒下的内容到点一次性画出。
             () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
-                if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
-                    send_status(SessionState::Failed, detail);
-                    break;
+                if pacer.ready_for_pending(Instant::now())
+                    && let Err(detail) =
+                        present(&mut engine, viewport, selection, &mut stats, &mut pacer)
+                {
+                    break (SessionState::Failed, detail);
                 }
             }
             command = commands.recv() => match command {
                 Some(SessionCommand::Resize(new_size)) => {
                     if let Err(error) = engine.resize(new_size) {
-                        send_status(SessionState::Failed, format!("engine resize: {error:?}"));
-                        break;
+                        break (SessionState::Failed, format!("engine resize: {error:?}"));
                     }
                     viewport.rows = new_size.rows;
                     if let Err(error) = transport.resize(new_size).await {
@@ -304,8 +308,7 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
                         rinf::debug_print!("window-change failed: {error:?}");
                     }
                     if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
-                        send_status(SessionState::Failed, detail);
-                        break;
+                        break (SessionState::Failed, detail);
                     }
                 }
                 Some(SessionCommand::Input(input)) => {
@@ -314,17 +317,15 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
                     match engine.encode_input(input) {
                         Ok(bytes) if !bytes.is_empty() => {
                             if let Err(error) = transport.write(&bytes).await {
-                                send_status(
+                                break (
                                     SessionState::Failed,
                                     format!("input write: {error:?}"),
                                 );
-                                break;
                             }
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            send_status(SessionState::Failed, format!("encode_input: {error:?}"));
-                            break;
+                            break (SessionState::Failed, format!("encode_input: {error:?}"));
                         }
                     }
                 }
@@ -334,11 +335,10 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
                     match engine.encode_mouse(event) {
                         Ok(bytes) if !bytes.is_empty() => {
                             if let Err(error) = transport.write(&bytes).await {
-                                send_status(
+                                break (
                                     SessionState::Failed,
                                     format!("mouse write: {error:?}"),
                                 );
-                                break;
                             }
                         }
                         Ok(_) | Err(_) => {}
@@ -349,8 +349,7 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
                     // 内容走）→ 把引擎的选区原样回显（Dart 用它对耳朵/气泡定位）。
                     selection = selection_range_from_request(request);
                     if let Err(detail) = present(&mut engine, viewport, selection, &mut stats, &mut pacer) {
-                        send_status(SessionState::Failed, detail);
-                        break;
+                        break (SessionState::Failed, detail);
                     }
                     send_selection_state(selection);
                 }
@@ -362,13 +361,28 @@ async fn run_session(mut request: ConnectRequest, mut commands: UnboundedReceive
                     };
                     ClipboardText { text }.send_signal_to_dart();
                 }
+                Some(SessionCommand::FrameAck(seq)) => {
+                    // 上一帧 Dart 已处理完：攒着的变化现在可以画了（节拍允许的话）。
+                    pacer.acked(seq);
+                    if pacer.ready_for_pending(Instant::now())
+                        && let Err(detail) =
+                            present(&mut engine, viewport, selection, &mut stats, &mut pacer)
+                    {
+                        break (SessionState::Failed, detail);
+                    }
+                }
                 Some(SessionCommand::Disconnect) | None => {
-                    send_status(SessionState::Closed, "disconnect".to_owned());
-                    break;
+                    break (SessionState::Closed, "disconnect".to_owned());
                 }
             },
         }
+    };
+
+    // 会话结束：先把合帧里攒着的变化画出来（最后一屏输出不能丢），再报状态。
+    if pacer.has_pending() {
+        let _ = present(&mut engine, viewport, selection, &mut stats, &mut pacer);
     }
+    send_status(end_state, end_detail);
 
     let _ = transport.shutdown().await;
     responder.abort();
@@ -395,61 +409,103 @@ fn present<E: TerminalEngine>(
     stats: &mut PerfWindow,
     pacer: &mut FramePacer,
 ) -> Result<(), String> {
+    pacer.started(Instant::now());
     let render_start = std::time::Instant::now();
     let frame = engine
         .render(viewport, selection)
         .map_err(|error| format!("render: {error:?}"))?;
     let render_us = micros_since(render_start);
-    send_frame(&frame, stats, render_us);
-    pacer.sent(Instant::now());
+    let seq = send_frame(&frame, stats, render_us);
+    pacer.sent(seq, Instant::now());
     if let Some(perf) = stats.maybe_report() {
         perf.send_signal_to_dart();
     }
     Ok(())
 }
 
-/// 帧节拍：空闲后的第一帧立即发（打字回显不等），之后按显示刷新率合帧
-/// （≤60 Hz）。高输出（`cat` 大文件）时每个输出块都渲染发帧会把 Dart
-/// 冲垮——rinf 的队列无界，积压只会越来越深。
+/// 帧节拍与流控：
+/// * 同一时刻最多一帧在途——Dart 回 [`FrameAck`](crate::signals::FrameAck) 之前不发下一帧，
+///   期间的变化只标记待发，Dart 跟不上时只画最新状态（rinf 的队列无界，不能靠它积压）；
+/// * 两帧的渲染起点至少相隔 [`Self::INTERVAL`]（上限约 120 Hz），`cat` 大文件这类
+///   高输出不会逐块出帧；远小于 60 Hz 源的周期，不会误合并 60 Hz 的刷新；
+/// * 空闲后的第一帧立即发（打字回显不等）；ACK 迟迟不来（App 暂停等）时
+///   [`Self::ACK_TIMEOUT`] 后照发，防止卡死。
 struct FramePacer {
-    last_sent: Option<Instant>,
+    last_start: Option<Instant>,
+    in_flight: Option<(u32, Instant)>,
     pending: bool,
 }
 
 impl FramePacer {
-    const INTERVAL: Duration = Duration::from_millis(16);
+    const INTERVAL: Duration = Duration::from_millis(8);
+    const ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
     fn new() -> Self {
         Self {
-            last_sent: None,
+            last_start: None,
+            in_flight: None,
             pending: false,
         }
     }
 
-    /// 内容变了。返回 true = 现在就出帧；false = 已记为待发，到 [`Self::deadline`] 再出。
+    /// 内容变了。返回 true = 现在就出帧；false = 已记为待发。
     fn mark_dirty(&mut self, now: Instant) -> bool {
-        match self.last_sent {
-            Some(last) if now < last + Self::INTERVAL => {
-                self.pending = true;
-                false
-            }
-            _ => true,
+        if self.may_send(now) {
+            return true;
         }
+        self.pending = true;
+        false
     }
 
-    /// 待发帧最早的出帧时刻；没有待发帧为 `None`。
+    fn has_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// 有待发的帧，且此刻允许发。
+    fn ready_for_pending(&self, now: Instant) -> bool {
+        self.pending && self.may_send(now)
+    }
+
+    /// 需要醒来检查待发帧的时刻：节拍到点，或在途帧的 ACK 超时。
+    /// 等 ACK 的情况下 ACK 本身会唤醒循环，这里只给超时兜底。
     fn deadline(&self) -> Option<Instant> {
-        if self.pending {
-            self.last_sent.map(|last| last + Self::INTERVAL)
-        } else {
-            None
+        if !self.pending {
+            return None;
+        }
+        let beat = self.last_start.map(|start| start + Self::INTERVAL);
+        let ack = self.in_flight.map(|(_, sent)| sent + Self::ACK_TIMEOUT);
+        match (beat, ack) {
+            (Some(beat), Some(ack)) => Some(beat.max(ack)),
+            (beat, ack) => beat.or(ack),
         }
     }
 
-    /// 刚发出一帧（它已包含此前所有变化）。
-    fn sent(&mut self, now: Instant) {
-        self.last_sent = Some(now);
+    fn may_send(&self, now: Instant) -> bool {
+        let beat_ok = self.last_start.is_none_or(|start| now >= start + Self::INTERVAL);
+        let ack_ok = self
+            .in_flight
+            .is_none_or(|(_, sent)| now >= sent + Self::ACK_TIMEOUT);
+        beat_ok && ack_ok
+    }
+
+    /// 开始渲染一帧（节拍从渲染起点算，渲染耗时不推迟下一拍）。
+    fn started(&mut self, now: Instant) {
+        self.last_start = Some(now);
+    }
+
+    /// 帧 `seq` 已发出；它包含此前所有变化。
+    fn sent(&mut self, seq: u32, now: Instant) {
+        self.in_flight = Some((seq, now));
         self.pending = false;
+    }
+
+    /// Dart 处理完了帧 `seq`（以及它之前的帧）。
+    fn acked(&mut self, seq: u32) {
+        if let Some((in_flight, _)) = self.in_flight
+            && seq.wrapping_sub(in_flight) < u32::MAX / 2
+        {
+            self.in_flight = None;
+        }
     }
 }
 
@@ -652,7 +708,8 @@ fn micros_since(start: std::time::Instant) -> u32 {
     u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX)
 }
 
-fn send_frame(frame: &RenderFrame, stats: &mut PerfWindow, render_us: u32) {
+/// 发出一帧，返回它的帧序号。
+fn send_frame(frame: &RenderFrame, stats: &mut PerfWindow, render_us: u32) -> u32 {
     let (cursor_col, cursor_row) = match &frame.cursor {
         Some(cursor) => {
             let row = cursor.position.stable_row - frame.viewport_top;
@@ -679,6 +736,7 @@ fn send_frame(frame: &RenderFrame, stats: &mut PerfWindow, render_us: u32) {
         alternate_screen: frame.alternate_screen,
     }
     .send_signal_to_dart(binary);
+    seq
 }
 
 /// known_hosts 落在 App 沙箱内（iOS 的 `HOME` 就是容器主目录）。
@@ -772,19 +830,62 @@ mod tests {
     }
 
     #[test]
-    fn pacer_sends_first_frame_immediately_then_coalesces() {
+    fn pacer_sends_first_frame_immediately() {
+        let now = Instant::now();
+        let mut pacer = FramePacer::new();
+        assert!(pacer.mark_dirty(now));
+        assert_eq!(pacer.deadline(), None);
+    }
+
+    #[test]
+    fn pacer_keeps_one_frame_in_flight() {
         let start = Instant::now();
         let mut pacer = FramePacer::new();
-        // 空闲后第一帧：立即出。
-        assert!(pacer.mark_dirty(start));
-        pacer.sent(start);
-        assert_eq!(pacer.deadline(), None);
-        // 节拍内的新内容：攒着，到点再出。
-        assert!(!pacer.mark_dirty(start + Duration::from_millis(5)));
+        pacer.started(start);
+        pacer.sent(1, start);
+        // 节拍已过，但上一帧还没 ACK：攒着。
+        let later = start + FramePacer::INTERVAL * 2;
+        assert!(!pacer.mark_dirty(later));
+        assert!(!pacer.ready_for_pending(later));
+        // ACK 到了：待发帧可以发。
+        pacer.acked(1);
+        assert!(pacer.ready_for_pending(later));
+    }
+
+    #[test]
+    fn pacer_spaces_frames_by_the_interval() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new();
+        pacer.started(start);
+        pacer.sent(1, start);
+        pacer.acked(1);
+        assert!(!pacer.mark_dirty(start + Duration::from_millis(3)));
         assert_eq!(pacer.deadline(), Some(start + FramePacer::INTERVAL));
-        // 过了节拍：立即出。
-        let later = start + FramePacer::INTERVAL + Duration::from_millis(1);
-        assert!(pacer.mark_dirty(later));
+        // 60 Hz 的源（16.7 ms 一次）不会被合并。
+        assert!(pacer.ready_for_pending(start + Duration::from_micros(16_700)));
+    }
+
+    #[test]
+    fn pacer_gives_up_on_a_missing_ack() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new();
+        pacer.started(start);
+        pacer.sent(7, start);
+        assert!(!pacer.mark_dirty(start + FramePacer::INTERVAL));
+        assert_eq!(pacer.deadline(), Some(start + FramePacer::ACK_TIMEOUT));
+        assert!(pacer.ready_for_pending(start + FramePacer::ACK_TIMEOUT));
+    }
+
+    #[test]
+    fn pacer_ignores_stale_acks() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new();
+        pacer.started(start);
+        pacer.sent(5, start);
+        pacer.acked(4);
+        assert!(!pacer.mark_dirty(start + FramePacer::INTERVAL));
+        pacer.acked(5);
+        assert!(pacer.ready_for_pending(start + FramePacer::INTERVAL));
     }
 
     #[test]

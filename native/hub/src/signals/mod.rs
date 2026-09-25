@@ -100,6 +100,13 @@ pub struct SelectionRequest {
 #[derive(Deserialize, DartSignal)]
 pub struct CopyRequest {}
 
+/// Dart 已处理完 `seq` 这一帧（流控：同一时刻最多一帧在途，Dart 跟不上时
+/// Rust 只保留最新状态，不在 rinf 的无界队列里积压）。
+#[derive(Deserialize, DartSignal)]
+pub struct FrameAck {
+    pub seq: u32,
+}
+
 // ── Rust → Dart ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize, SignalPiece)]

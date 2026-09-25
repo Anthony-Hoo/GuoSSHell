@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
@@ -93,6 +94,7 @@ class _TerminalPageState extends State<TerminalPage> {
   StreamSubscription? _frameSub;
   StreamSubscription? _selectionSub;
   StreamSubscription? _clipboardSub;
+  StreamSubscription? _perfSub;
 
   /// 引擎最近一次选区回显（绝对行坐标）。视口一变就要拿它重新投影。
   SelectionState? _selectionEcho;
@@ -112,6 +114,9 @@ class _TerminalPageState extends State<TerminalPage> {
     _frameSub = FrameUpdate.rustSignalStream.listen(_onFrame);
     _selectionSub = SelectionState.rustSignalStream.listen(_onSelectionState);
     _clipboardSub = ClipboardText.rustSignalStream.listen(_onClipboardText);
+    if (kDebugMode) {
+      _perfSub = PerfStats.rustSignalStream.listen(_onPerfStats);
+    }
     _terminal
       ..onInput = _onTerminalInput
       ..onResize = _onTerminalResize;
@@ -137,6 +142,7 @@ class _TerminalPageState extends State<TerminalPage> {
     _frameSub?.cancel();
     _selectionSub?.cancel();
     _clipboardSub?.cancel();
+    _perfSub?.cancel();
     _terminalController
       ..removeListener(_onSelectionChanged)
       ..onSelectionIntent = null;
@@ -203,7 +209,19 @@ class _TerminalPageState extends State<TerminalPage> {
       }
     } catch (error) {
       debugPrint('[frame] decode failed: $error');
+    } finally {
+      // 流控：Rust 等到这一帧的 ACK 才发下一帧（解码失败也要回，免得它空等）。
+      FrameAck(seq: msg.seq).sendSignalToRust();
     }
+  }
+
+  /// debug 构建的帧率自检（只打日志、不画浮层）：Rust 每 5 秒汇总一次
+  /// 出帧数与渲染/打包耗时。
+  void _onPerfStats(RustSignalPack<PerfStats> pack) {
+    final p = pack.message;
+    final fps = p.windowMs == 0 ? 0 : p.frames * 1000 / p.windowMs;
+    debugPrint('[perf] ${fps.toStringAsFixed(1)} fps · render avg ${p.renderUsAvg}µs '
+        'max ${p.renderUsMax}µs · pack avg ${p.packUsAvg}µs · ${p.bytesAvg} B/frame');
   }
 
   /// 引擎回显选区 → 记住（绝对行坐标）→ 投影到当前视口。

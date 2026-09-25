@@ -9,15 +9,15 @@
 | 上游仓库 | https://github.com/hugefiver/rsHell |
 | 上游基线 commit | `b2ab8656079225dc2c920c24f5d9e0124f4f83e1` |
 | fork 仓库 | https://github.com/Anthony-Hoo/rsHell（`guosh` 分支） |
-| pin 住的 commit | `50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1`（基线 + 下文补丁） |
+| pin 住的 commit | `c794280d29282ec2571bb146bfed4dfe12fca51e`（基线 + 下文补丁） |
 | 许可证 | MIT，Copyright (c) 2026 hugefiver（副本见 `LICENSES/rsHell-MIT.txt`） |
 
 依赖声明在 `Cargo.toml`：
 
 ```toml
-rshell-core = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1" }
-rshell-session = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1" }
-rshell-storage = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "50c0f9b076fe8f3d8a0a32e9ec22eb57905f32f1" }
+rshell-core = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "c794280d29282ec2571bb146bfed4dfe12fca51e" }
+rshell-session = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "c794280d29282ec2571bb146bfed4dfe12fca51e" }
+rshell-storage = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "c794280d29282ec2571bb146bfed4dfe12fca51e" }
 ```
 
 升级上游 = 在 fork 里把 `guosh` 分支 rebase 到新基线（补丁都很小，冲突面可控），
@@ -114,3 +114,4 @@ MIT 要求「许可声明随软件或其重要部分一起分发」。App Store 
 | P1 | `103a00b` feat(core): expose bracketed paste in terminal display modes | `rshell-core/src/render.rs`：`TerminalDisplayModes` 加 `bracketed_paste`（`#[serde(default)]`）；`rshell-session/src/alacritty_display.rs`：由 `TermMode::BRACKETED_PASTE` 填充；两处测试字面量补字段、`engine_contract.rs` 加用例 | 粘贴要按远端是否开启 DECSET 2004 包 `ESC[200~ … ESC[201~`，这个模式原本只在 alacritty 适配层内部可见。不计入 `has_residue()`、恢复序列也不重置它——shell 在每个提示符都会打开它 |
 | P2 | `a2730aa` feat(core): allow password profiles without a saved credential | `rshell-core/src/connection/validation.rs`：Password 认证不再强制 `credential_ref`；`connection_catalog.rs` 与存储层 `credentials.rs` 的对应用例改为新语义 | 「不保存密码、连接时再问」是必要能力；没存密码时 App 弹框问、用 `AuthPlan::from_secret` 连接。清除已存密码因此合法，并删除钥匙串里的条目 |
 | P3 | `50c0f9b` feat(session): optional prompt to replace a changed host key | `rshell-session/src/host_keys.rs`：`KnownHostsVerifier::with_changed_key_prompt()`；`host_keys/storage.rs`：`replace` 按 russh 的条目编号（不计注释行）去掉该 host:port 的旧条目再写新键；`tests/host_keys.rs` 加两个用例 | 密钥变更时要给出显式警告并允许用户确认后替换（PLAN §5 M3）。默认关闭：上游的「变更即失败、不提示」语义与测试不变；拒绝仍是 `HostKeyChanged` |
+| P4 | `c794280` feat(session): authenticate with a decoded private key held in memory | `rshell-session/src/auth.rs`：`AuthPlan::PrivateKey{host, key}` 与 `AuthPlan::from_private_key`（只接受 PublicKey 认证的配置，不读 `identity_file`）；`transport/native_ssh/auth.rs`：该变体直接做公钥认证，与读文件的路径共用 `authenticate_with_key`（RSA 按服务器支持选 SHA-2 签名）；`tests/auth.rs`、`tests/ssh_smoke.rs` 各加一个用例 | 私钥存在钥匙串、口令由 App 询问并解密，私钥只在内存里；上游只能从 `identity_file` 读磁盘文件 |

@@ -393,19 +393,18 @@ Rust 侧接口现成：`AuthPlan::from_profile(&profile, &vault)` + `CredentialV
 局域网目标的网络类失败附本地网络权限说明与设置入口；设置页选字体与字号；会话信号带
 `session_id`。决定见 §6.1「M3 连接与凭证决定」。
 
-### M3a — 私钥认证与同步（M3 之后）
+### M3a — 私钥认证与同步 —— ✅ 已完成（2026-09-25，模拟器验收；双设备同步实测待真机）
 
 **已定（2026-09-22 拍板）**：私钥 blob 跨设备同步的安全取舍**接受**，但必须做成**开关**：
 默认关闭；开关启用时明确告知「私钥将随 iCloud Keychain 上传同步」，用户同意后才写入
 synchronizable 条目。（iOS 硬规则：`kSecClassKey` 不参与 iCloud Keychain 同步，
 所以只能走 generic password 里的 blob。）
 
-- 本地私钥文件认证：russh 公钥路径 + 上游 `AuthPlan::from_profile` /
-  `ConnectionProfile.identity_file`，接口现成
-- 私钥入 Keychain：OpenSSH 私钥整体作为 generic password blob
-- 同步开关（上述 UX 约束）+ 首次开启时的确认 UI
-- 待查：上游 CredentialVault 的 apple 后端是否暴露 synchronizable 属性；
-  不行就在我们侧自实现该 trait（不动上游）
+**交付**：私钥导入（粘贴或从「文件」选择；OpenSSH / PEM / PKCS#8 等格式，名称缺省用私钥
+注释）、复制公钥、改名、删除（有连接在用时说明并拒绝）；连接可选私钥认证，私钥只在钥匙串
+与内存里（rsHell 补丁 P4）；有口令的私钥连接时询问口令、输错重问，可存入钥匙串，也可再忘掉；
+iCloud 钥匙串同步开关（默认关，开关前确认，私钥与口令整体搬迁）。
+决定见 §6.1「M3a 私钥决定」。
 
 ### M3b — 硬件密钥：OpenPGP 卡 Ed25519 —— 已立项（2026-09-23 拍板）
 
@@ -580,6 +579,19 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 `HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
 平台不答复的键（死键等）150 ms 超时兜底。
 
+**M3a 私钥决定（2026-09-25）：**
+私钥整块存钥匙串的 generic password（service `guosshell.ssh-key`，account 是私钥 id），内容是
+JSON 信封：名称、私钥原文（可能加密）、OpenSSH 公钥、是否加密——同步到别的设备时信封完整；
+列表靠按 service 搜索钥匙串得到，不另存元数据。口令单独一项（`guosshell.ssh-key-passphrase`），
+与私钥放在同一个存储，只在解密成功后才写入。连接配置的 `identity_file` 写 `keychain:<id>`；
+连接时 hub 从钥匙串读出、在内存里解密，经 `AuthPlan::from_private_key`（补丁 P4）认证，
+私钥不落盘。导入时由 Rust 侧（russh 的 ssh-key）校验、算指纹，指纹相同的不重复导入；
+OpenSSH 格式的加密私钥不用口令就能读出公钥，其他格式要口令。存储是 apple-native-keyring-store
+的 protected data store：本机一个，`cloud-sync` 配置（synchronizable 条目）一个；synchronizable
+条目不需要额外的 capability，是否真的同步取决于用户是否开启了 iCloud 钥匙串。同步开关存在
+数据目录的 `preferences.json`；切换时私钥与口令先全部写进目标存储，有一项失败就撤回已写的，
+全部成功才删原处；删除只动条目所在的存储。
+
 **M3 连接与凭证决定（2026-09-25）：**
 存储直接用上游：连接目录是 `rshell-storage` 的 SQLite（`SqliteRepository`），增删改一律走
 `CredentialCoordinator::apply_catalog(mutation, SecretUpdate)`——目录与钥匙串之间的两阶段提交、
@@ -687,7 +699,7 @@ shell）。数据目录由 Dart 用 path_provider 取 Application Support 交给
 2. **M3 的凭证 UI 形态**：已定——每次连接都读钥匙串，不在内存缓存（§6.1 M3 决定）。
    Face ID 保护（钥匙串条目的访问控制）留到需要时再加。
 3. **上游 fork 的边界。** 已经 fork（UPSTREAM.md 的 P1 bracketed paste、P2 密码可不存、
-   P3 主机密钥变更提示）。还有两个已知的可能再改上游的需求，都不急：
+   P3 主机密钥变更提示、P4 内存私钥认证）。还有两个已知的可能再改上游的需求，都不急：
    - **把 iOS 不可用的三个传输（`local` / `pty` / `system_ssh`）从编译图里摘掉**，
      而不是靠链接器裁符号。现在靠 `-Wl,-dead_strip` 能压到 0（§3.2），所以**不急**；
      但如果哪天想做 App Store 的静态审查友好度，或者要减 `.a` 的 65 MB，就得 fork 加 feature gate。
@@ -788,7 +800,8 @@ shell）。数据目录由 Dart 用 path_provider 取 Application Support 交给
 21. **可打印键走平台文本输入是异步的，直接处理的键会越过它。** 硬件键盘上 `ls` + 回车打得快，
     会先执行 `l`、`s` 落到下一行。见 §6.1 的 `HardwareKeyOrder`。
 22. **iOS 文本输入默认开着智能引号 / 智能破折号**（`TextInputConfiguration` 在非 obscureText 时
-    默认 enabled），终端里 `"` 会变成 `“`。要显式关掉。
+    默认 enabled），终端里 `"` 会变成 `“`，私钥里的 `-----` 会变成破折号、私钥就读不出来了。
+    终端与所有技术字段（私钥、主机、命令、问答）都要显式关掉。
 23. **模拟器的自动输入（`simctl` 等）走的是硬件键盘事件**，覆盖的是硬件键盘路径；软键盘路径
     （delta 插入/删除）要点屏幕键盘验证。模拟器默认输入法可能是拼音，英文输入先切到英文键盘。
 24. **iOS 的「双空格变句号」**：在「词 + 空格」后再敲空格，iOS 把前一个空格替换成「.」
@@ -810,6 +823,9 @@ shell）。数据目录由 Dart 用 path_provider 取 Application Support 交给
     `Navigator.pop` 弹掉的是下面的页面（实测：拒绝主机密钥后终端页被一起关掉）。
 31. **`PopScope(canPop: false)` 会直接禁用 iOS 的边缘右滑返回**，`onPopInvoked` 不会被调用；
     连接中的会话只能从页面上的「断开」离开。
+32. **对话框里输入框的 `TextEditingController` 不能在 `showDialog` 返回后立刻 dispose**：
+    对话框还在退场动画里、输入框仍在用它（debug 下断言 `_dependents.isEmpty` 红屏）。
+    控制器交给对话框自己的 State 创建和销毁。
 
 ---
 
@@ -946,7 +962,17 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
       局域网目标的本地网络提示与设置入口
 - [x] 设置：内置 MesloLGS NF / 系统 Menlo、字号；新会话生效
 - [ ] 真机：钥匙串读写、本地网络权限弹窗与被拒后的提示（待硬件）
-- [ ] M3a / M3b / M3c(不急) / M3d(不急) / M4 / M5
+
+**M3a —— 私钥认证与同步 —— ✅ 已完成（2026-09-25，模拟器验收）**
+
+- [x] 导入：粘贴与从「文件」选择；OpenSSH 加密私钥不用口令即可导入、PEM 加密私钥要口令；
+      重复导入拒绝；名称缺省用私钥注释
+- [x] 认证：Ed25519（无口令）与 RSA 3072（有口令）连容器；口令输错重问，存入钥匙串后
+      重启 App 直接连上；忘掉口令后再次询问
+- [x] 管理：复制公钥与原文件一致；改名；删除，有连接在用时说明并拒绝
+- [x] 同步开关：开启确认后私钥与口令搬进 iCloud 钥匙串且照常连接，关闭后搬回本机
+- [ ] 真机：双设备 iCloud 钥匙串同步（待签名构建与两台设备）
+- [ ] M3b / M3c / M3d / M4 / M5
 
 **关于提交**
 

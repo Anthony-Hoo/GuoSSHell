@@ -12,6 +12,7 @@ pub struct SaveSettings {
     pub font_family: String,
     pub font_size: f64,
     pub scrollback_lines: u32,
+    pub show_key_bar: bool,
 }
 
 /// 当前设置。设置变化后重发。
@@ -27,4 +28,6 @@ pub struct SettingsState {
     pub scrollback_lines: u32,
     /// 本机的滚回上界（按物理内存分档）。
     pub max_scrollback_lines: u32,
+    /// 终端下方显示键位条（Esc、Tab、方向键、Ctrl、Alt…）。
+    pub show_key_bar: bool,
 }

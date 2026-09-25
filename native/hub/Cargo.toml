@@ -70,6 +70,10 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std",
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow"] }
+# 没有钥匙串访问组的构建用登录钥匙串（legacy keychain）存私钥；判断缺不缺访问组要看
+# protected 存储回的系统错误码。
+apple-native-keyring-store = { version = "1.0.1", features = ["keychain", "protected"] }
+security-framework = "3"
 
 [dev-dependencies]
 # 暂停的时钟（连接时限的测试）。

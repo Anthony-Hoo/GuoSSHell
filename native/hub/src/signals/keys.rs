@@ -35,6 +35,8 @@ pub struct KeyListState {
     pub keys: Vec<KeySummary>,
     /// 私钥经 iCloud 钥匙串同步（新导入的私钥也放进 iCloud 钥匙串）。
     pub sync_enabled: bool,
+    /// 这个构建能用 iCloud 钥匙串（没有团队签名的 macOS 构建不能）。
+    pub sync_available: bool,
     /// 这台设备能用安全密钥（FIDO2）。
     pub security_keys_available: bool,
 }

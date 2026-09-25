@@ -280,11 +280,16 @@ class _KeysPageState extends State<KeysPage> {
                 children: [
                   SwitchListTile(
                     title: const Text('通过 iCloud 钥匙串同步私钥'),
-                    subtitle: Text(state.syncEnabled
-                        ? '私钥保存在 iCloud 钥匙串，随 Apple 账户同步到其他设备'
-                        : '私钥只保存在这台设备上'),
+                    subtitle: Text(switch ((state.syncEnabled, state.syncAvailable)) {
+                      (true, _) => '私钥保存在 iCloud 钥匙串，随 Apple 账户同步到其他设备',
+                      (false, true) => '私钥只保存在这台设备上',
+                      (false, false) => '私钥只保存在这台设备上（这个版本的 App 不能使用 iCloud 钥匙串）',
+                    }),
                     value: state.syncEnabled,
-                    onChanged: _syncBusy ? null : _toggleSync,
+                    // 已开着的总能关掉；不能用 iCloud 钥匙串时不能打开。
+                    onChanged: _syncBusy || (!state.syncEnabled && !state.syncAvailable)
+                        ? null
+                        : _toggleSync,
                   ),
                   const Divider(),
                   if (_registering)

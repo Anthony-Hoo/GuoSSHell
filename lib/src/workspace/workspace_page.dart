@@ -216,7 +216,7 @@ class _WorkspacePageState extends State<WorkspacePage> {
                   ),
                 ),
               ),
-              if (active != null)
+              if (active != null && (SettingsState.latestRustSignal?.message.showKeyBar ?? true))
                 TerminalKeyBar(
                   key: ObjectKey(active),
                   terminal: active.controller.terminal,

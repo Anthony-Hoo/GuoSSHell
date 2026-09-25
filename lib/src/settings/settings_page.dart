@@ -6,7 +6,7 @@ import '../bindings/bindings.dart';
 import '../keys/keys_page.dart';
 import 'terminal_font.dart';
 
-/// 设置：终端字体、字号与滚回行数（存在 Rust 侧的默认终端配置里，新会话生效）。
+/// 设置：终端字体、字号、键位条与滚回行数（存在 Rust 侧，新会话生效）。
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
 
@@ -36,13 +36,14 @@ class _SettingsPageState extends State<SettingsPage> {
     super.dispose();
   }
 
-  void _save({String? fontFamily, double? fontSize, int? scrollbackLines}) {
+  void _save({String? fontFamily, double? fontSize, int? scrollbackLines, bool? showKeyBar}) {
     final settings = _settings;
     if (settings == null) return;
     SaveSettings(
       fontFamily: fontFamily ?? settings.fontFamily,
       fontSize: fontSize ?? settings.fontSize,
       scrollbackLines: scrollbackLines ?? settings.scrollbackLines,
+      showKeyBar: showKeyBar ?? settings.showKeyBar,
     ).sendSignalToRust();
   }
 
@@ -133,6 +134,13 @@ class _SettingsPageState extends State<SettingsPage> {
                     color: Colors.white,
                   ),
             ),
+          ),
+          const _SectionTitle('键盘'),
+          SwitchListTile(
+            title: const Text('显示键位条'),
+            subtitle: const Text('终端下方的 Esc、Tab、方向键、Ctrl、Alt 与复制粘贴'),
+            value: settings.showKeyBar,
+            onChanged: (value) => _save(showKeyBar: value),
           ),
           const _SectionTitle('滚回'),
           ListTile(

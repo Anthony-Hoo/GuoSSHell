@@ -1311,6 +1311,7 @@ dependencies = [
  "rsa",
  "rshell-m0",
  "secrecy",
+ "security-framework",
  "serde",
  "serde_json",
  "sha1",

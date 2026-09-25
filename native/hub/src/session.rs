@@ -670,6 +670,16 @@ async fn wait_offline(
     }
 }
 
+/// 远端设置的窗口标题；没设置时上游给的是它自己的名字，当作没有标题（标签上显示连接名）。
+fn remote_title(title: &str) -> String {
+    const UPSTREAM_DEFAULT_TITLE: &str = "rsHell";
+    if title == UPSTREAM_DEFAULT_TITLE {
+        String::new()
+    } else {
+        title.to_owned()
+    }
+}
+
 /// 连上之后的网络失败与超时：连接断了（区别于连不上）。
 fn lost(failure: SessionFailure) -> FailureKind {
     match failure {
@@ -1153,7 +1163,7 @@ fn send_frame(
         screen_top_stable_row: screen_top,
         cursor_col,
         cursor_row,
-        title: frame.title.clone(),
+        title: remote_title(&frame.title),
         mouse_reporting: frame.mouse_reporting,
         alternate_screen: frame.alternate_screen,
     }

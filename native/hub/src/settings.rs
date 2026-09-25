@@ -47,6 +47,11 @@ fn physical_memory() -> u64 {
     0
 }
 
+/// 键位条默认显示与否：触屏设备（iOS / iPadOS）默认显示，桌面（有实体键盘）默认不显示。
+pub fn default_show_key_bar() -> bool {
+    cfg!(target_os = "ios")
+}
+
 /// 设置里的滚回行数收窄到本机上界。
 fn effective_scrollback(lines: usize) -> usize {
     lines.clamp(
@@ -112,6 +117,11 @@ pub async fn run(context: Arc<AppContext>) {
             pack = save_rx.recv() => {
                 let Some(pack) = pack else { break };
                 let request = pack.message;
+                let mut preferences = context.preferences.get();
+                preferences.show_key_bar = Some(request.show_key_bar);
+                if let Err(error) = context.preferences.set(preferences) {
+                    debug_print!("[settings] preferences: {error}");
+                }
                 let task_context = context.clone();
                 let saved = spawn_blocking(move || save(&task_context.repository, &request)).await;
                 match saved {
@@ -155,6 +165,11 @@ async fn publish(context: &Arc<AppContext>) {
         max_font_size: f64::from(MAX_FONT_SIZE),
         scrollback_lines: u32::try_from(settings.scrollback_lines).unwrap_or(u32::MAX),
         max_scrollback_lines: u32::try_from(scrollback_cap()).unwrap_or(u32::MAX),
+        show_key_bar: context
+            .preferences
+            .get()
+            .show_key_bar
+            .unwrap_or_else(default_show_key_bar),
     }
     .send_signal_to_dart();
 }
@@ -186,6 +201,7 @@ mod tests {
                 font_family: "Menlo".to_owned(),
                 font_size: 17.0,
                 scrollback_lines: 3_000,
+                show_key_bar: true,
             },
         )
         .expect("save");
@@ -206,6 +222,7 @@ mod tests {
                 font_family: "Comic Sans".to_owned(),
                 font_size: 200.0,
                 scrollback_lines: 10,
+                show_key_bar: false,
             },
         )
         .expect("save");

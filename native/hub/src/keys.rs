@@ -71,25 +71,52 @@ pub trait KeyStore: Send + Sync {
     fn delete(&self, item: Item, id: &str, synchronized: bool) -> Result<(), StoreError>;
     /// 一个存储里这类条目的全部 id。
     fn list(&self, item: Item, synchronized: bool) -> Result<Vec<String>, StoreError>;
+    /// 能否存进 iCloud 钥匙串（同步开关据此可用或不可用）。
+    fn sync_available(&self) -> bool;
 }
 
-/// Apple 的 protected data 钥匙串：本机一个存储、iCloud 同步一个存储。
+/// Apple 的钥匙串：本机一个存储、iCloud 同步一个存储，都在 protected data 钥匙串里。
+/// macOS 上的 protected data 钥匙串要求 App 带团队签名的钥匙串访问组；没有的构建（本地调试的
+/// ad-hoc 签名）用登录钥匙串存本机条目，没有 iCloud 同步。
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub struct KeychainKeyStore {
-    local: Arc<apple_native_keyring_store::protected::Store>,
-    cloud: Arc<apple_native_keyring_store::protected::Store>,
+    local: Arc<keyring_core::CredentialStore>,
+    cloud: Option<Arc<keyring_core::CredentialStore>>,
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 impl KeychainKeyStore {
     pub fn new() -> Result<Self, String> {
         use apple_native_keyring_store::protected::Store;
+        let local = Store::new().map_err(|error| format!("keychain: {error}"))?;
+        #[cfg(target_os = "macos")]
+        if missing_entitlement(&local) {
+            debug_print!("[keys] no keychain access group: using the login keychain");
+            let login = apple_native_keyring_store::keychain::Store::new()
+                .map_err(|error| format!("login keychain: {error}"))?;
+            return Ok(Self {
+                local: login,
+                cloud: None,
+            });
+        }
         let cloud_sync = std::collections::HashMap::from([("cloud-sync", "true")]);
         Ok(Self {
-            local: Store::new().map_err(|error| format!("keychain: {error}"))?,
-            cloud: Store::new_with_configuration(&cloud_sync)
-                .map_err(|error| format!("iCloud keychain: {error}"))?,
+            local,
+            cloud: Some(
+                Store::new_with_configuration(&cloud_sync)
+                    .map_err(|error| format!("iCloud keychain: {error}"))?,
+            ),
         })
+    }
+
+    fn store(&self, synchronized: bool) -> Result<&Arc<keyring_core::CredentialStore>, StoreError> {
+        if synchronized {
+            self.cloud
+                .as_ref()
+                .ok_or_else(|| StoreError("iCloud keychain is not available".to_owned()))
+        } else {
+            Ok(&self.local)
+        }
     }
 
     fn entry(
@@ -98,15 +125,30 @@ impl KeychainKeyStore {
         id: &str,
         synchronized: bool,
     ) -> Result<keyring_core::Entry, StoreError> {
-        use keyring_core::api::CredentialStoreApi;
-        let store = if synchronized {
-            &self.cloud
-        } else {
-            &self.local
-        };
-        store
+        self.store(synchronized)?
             .build(item.service(), id, None)
             .map_err(|error| StoreError(error.to_string()))
+    }
+}
+
+/// protected data 钥匙串能不能用：缺钥匙串访问组时，查询只回「没有」，写入才回
+/// `errSecMissingEntitlement`，所以写一个探测条目再删掉。
+#[cfg(target_os = "macos")]
+fn missing_entitlement(store: &Arc<apple_native_keyring_store::protected::Store>) -> bool {
+    use keyring_core::api::CredentialStoreApi;
+    const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
+    let Ok(probe) = store.build("guosshell.keychain-probe", "probe", None) else {
+        return false;
+    };
+    match probe.set_password("probe") {
+        Ok(()) => {
+            let _ = probe.delete_credential();
+            false
+        }
+        Err(keyring_core::Error::PlatformFailure(error)) => error
+            .downcast_ref::<security_framework::base::Error>()
+            .is_some_and(|error| error.code() == ERR_SEC_MISSING_ENTITLEMENT),
+        Err(_) => false,
     }
 }
 
@@ -130,6 +172,9 @@ impl KeyStore for KeychainKeyStore {
             Err(keyring_core::Error::NoEntry) => {}
             Err(error) => return Err(StoreError(error.to_string())),
         }
+        if self.cloud.is_none() {
+            return Ok(None);
+        }
         // iCloud 钥匙串读不出来时当作没有，不挡住本机条目。
         match self.entry(item, id, true)?.get_secret() {
             Ok(secret) => Ok(Some((Zeroizing::new(secret), true))),
@@ -149,11 +194,8 @@ impl KeyStore for KeychainKeyStore {
     }
 
     fn list(&self, item: Item, synchronized: bool) -> Result<Vec<String>, StoreError> {
-        use keyring_core::api::CredentialStoreApi;
-        let store = if synchronized {
-            &self.cloud
-        } else {
-            &self.local
+        let Ok(store) = self.store(synchronized) else {
+            return Ok(Vec::new());
         };
         let spec = std::collections::HashMap::from([("service", item.service())]);
         match store.search(&spec) {
@@ -169,6 +211,10 @@ impl KeyStore for KeychainKeyStore {
             Err(error) => Err(StoreError(error.to_string())),
         }
     }
+
+    fn sync_available(&self) -> bool {
+        self.cloud.is_some()
+    }
 }
 
 /// 应用偏好（上游设置里没有对应字段的），存在数据目录的 `preferences.json`。
@@ -177,6 +223,9 @@ pub struct Preferences {
     /// 私钥经 iCloud 钥匙串同步。默认关（PLAN §5 M3a）。
     #[serde(default)]
     pub sync_keys: bool,
+    /// 终端下方显示键位条；没设置过时按平台（见 `settings::default_show_key_bar`）。
+    #[serde(default)]
+    pub show_key_bar: Option<bool>,
 }
 
 pub struct PreferenceFile {
@@ -567,6 +616,9 @@ pub fn set_sync(context: &AppContext, enabled: bool) -> Result<(), KeyError> {
     if preferences.sync_keys == enabled {
         return Ok(());
     }
+    if enabled && !context.keys.sync_available() {
+        return Err(KeyError::SyncUnavailable);
+    }
     let store = context.keys.as_ref();
     let mut moving = Vec::new();
     for item in [Item::Key, Item::Passphrase] {
@@ -844,6 +896,7 @@ async fn publish(context: &Arc<AppContext>) {
         Ok(keys) => KeyListState {
             keys,
             sync_enabled: context.preferences.get().sync_keys,
+            sync_available: context.keys.sync_available(),
             security_keys_available: context.security_keys.relying_party().is_some(),
         }
         .send_signal_to_dart(),
@@ -913,6 +966,10 @@ impl KeyStore for MemoryKeyStore {
             .filter(|(kind, _, cloud)| *kind == item && *cloud == synchronized)
             .map(|(_, id, _)| id.clone())
             .collect())
+    }
+
+    fn sync_available(&self) -> bool {
+        self.cloud_available
     }
 }
 

@@ -353,7 +353,7 @@ $ echo M0-ECHO
 
 - Flutter 的输入 → `TerminalInput::{CommittedText, Key{code, modifiers}}` →
   Rust `encode_input()`（alacritty 键编码，含 Kitty / CSI-u 协商）→ `transport.write()`。
-- fork 改造（方案 A，勘察见 `docs/survey-terminal-view-2026-09-16.md`）：
+- fork 改造（方案 A，结论见 §6.1 的 M2 fork 决定块）：
   render/widget 依赖的 `Terminal` 收窄成接口；painter/缓存零改动；
   App 侧写帧适配器（帧→BufferLine 行池，内容比对复用以保住行 Picture 重放）。
 - 键位条：双排固定布局（修饰键挂住一次、长按锁定，Termux 同款；
@@ -523,8 +523,9 @@ Android 的 Flutter 侧产物在 M1 之后基本是免费的。
 **⚠️ 复用 `terminal_view` / `xterm.dart` 的边界（对应铁律 4）：**
 它们的 `Terminal` 是**完整的 VT100/xterm 解析器 + 缓冲区**。
 我们**只复用它的绘制层**（`TerminalView` / render object / 字形缓存 /
-选择手柄 / IME 接入 / 主题 / 鼠标 / 超链接 / 搜索 / OSC 52），
-把数据源换成来自 Rust 的 `RenderFrame`。
+选择手柄 / IME 接入 / 主题 / 鼠标点击与滚轮），
+把数据源换成来自 Rust 的 `RenderFrame`。超链接、搜索、OSC 52 在它的绘制层里并不存在
+（搜索测试整体注释掉、主题里的搜索色无人读取），需要时自己做。
 **绝不使用它的解析器与缓冲区**——那会造出第二份终端状态权威。
 
 **M1 第一遍的渲染决定（2026-09-15）：** M1 先用了一个 ~200 行的自写 `CustomPainter`
@@ -535,13 +536,14 @@ painter 不违反铁律 4。
 
 **M2 fork 决定（2026-09-16，/grill-me 定案）：**
 上游 `Termphin/terminal_view` @ v0.2.0，MIT；**GitHub fork + git 依赖**（与 Rust 上游
-对称，源码不进本仓库）；本地先 clone 改造、分 commit，remote URL 由用户后补。
+对称，源码不进本仓库）：fork 仓库 `Anthony-Hoo/terminal_view` 的 `guosh/frame-source` 分支。
+开发期在仓库根放 `pubspec_overrides.yaml` 指向本地工作副本 `.forks/terminal_view`
+（两者都不入库），改完推 fork、`pubspec.yaml` 换 ref。
 接缝用**方案 A**：render/widget 依赖的 `Terminal` 收窄成接口，painter 与行/段落缓存
 **零改动**，App 侧写帧适配器把解码后的帧**填进池化的真 BufferLine**（内容逐 run 比对、
 相同则复用对象且不碰 `version`——行 Picture 重放的命中条件）；包内 parser/buffer
 **留而不用**（不引用即不进 AOT 产物）。适配器放 App 侧（与 rinf 耦合属业务），
 fork 保持通用。滚动锁底部，scrollback 留 M4；选区/粘贴/鼠标留 M2a。
-勘察全文：`docs/survey-terminal-view-2026-09-16.md`。
 
 **M2a 选区决定（2026-09-24）：**
 选区权威在**引擎**（上游 `SelectionRange` 的坐标就是绝对行），Dart 不再自建锚点
@@ -558,6 +560,17 @@ tap-down 清选区（所以官方的 translucent 在这里要换成 opaque）。
 → 引擎 `selected_text`（跨行拼行、裁尾空格都是引擎的职责）→ `ClipboardText` →
 剪贴板 + 发清除。选区菜单按钮用官方 `ContextMenuButtonType.copy/paste`
 （文案随 Flutter 本地化，接受英文）。fork 侧 API 变化随 fork 仓库自己的提交记录。
+
+**文本输入决定（2026-09-25）：**
+IME 连接背后的隐藏文本框每次提交后重置为初始值，但下一次按键可能在重置生效前到达平台。
+fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）：每条 delta 带着平台
+自己的 `oldText`，按「组字区之前的已提交文本」前后差异算出「退格 n 次 + 输入一段文本」
+（`text_input_delta.dart`），插入、删除、输入法整段/部分提交、替换都走同一条规则；预编辑
+只绘制、绝不外发。智能引号与智能破折号关闭（终端要原字符）。
+硬件键盘：无 Ctrl/Alt/Cmd 的可打印键交给平台文本输入（输入法才能组字，大小写与布局原样）；
+回车、方向键、Ctrl 组合等直接处理的键不得越过之前敲下、仍在平台文本输入里的字符——
+`HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
+平台不答复的键（死键等）150 ms 超时兜底。
 
 ### 6.2 明确不用
 
@@ -590,6 +603,7 @@ tap-down 清选区（所以官方的 translucent 在这里要换成 opaque）。
 | Rust | 1.89+ | 需要 `aarch64-apple-ios` / `aarch64-apple-ios-sim` 两个目标 |
 | `rinf` CLI | 8.x | M1 用 `rinf template` 铺 Flutter 骨架、`rinf gen` 生成 Dart 侧类型，**不手写桥接样板** |
 | Flutter / Dart | 3.4x | M1 之后才需要 |
+| Docker | 可选 | 本地验收 SSH 服务器 `scripts/sshd-test.sh`（vim / htop / 主机密钥变更等验收用） |
 
 **工具不在 PATH 是常态**（cargo 常装在 `~/.cargo/bin`、Flutter 常由 fvm 之类的版本管理器
 托管）。`scripts/setup.sh` 会主动探测并提示，不需要把路径写死在文档里。
@@ -604,6 +618,7 @@ tap-down 清选区（所以官方的 translucent 在这里要换成 opaque）。
 | 边界类型**沿用** `rshell-core::protocol` | 上游已有完整可序列化协议，重建等于在 Dart 写业务模型（违反铁律 1） |
 | **不做本地 shell 面板** | iOS 不可能；Rust 侧零改动，Flutter 侧不暴露入口即可 |
 | 帧格式：**结构化帧 + run 压缩 + 脏行增量** | §4.3 实测 |
+| **帧流控：Dart 处理完回 `FrameAck`，同一时刻至多一帧在途** | rinf 的队列无界，逐块出帧会在高输出下积压；在途期间的变化只保留最新状态。两帧渲染起点至少相隔 8 ms（不合并 60 Hz 刷新），ACK 缺失 250 ms 后照发；会话结束前先画出待发帧 |
 | 度量权威归 **Flutter** | 字体度量只有一个权威，就是实际画字的那一方。`TerminalSize{cols,rows,pixel_width,pixel_height,dpi}` 由 Flutter 测完回传 |
 | 状态权威归 **Rust** | alacritty 网格只在 Rust 侧 |
 | M0 宿主用 **Swift 而不是 Flutter** | 把「SSH 通不通」与「Flutter 构建集成」两个未知量分开；`.a` 在两种宿主下通用，M1 换宿主零返工 |
@@ -735,6 +750,16 @@ tap-down 清选区（所以官方的 translucent 在这里要换成 opaque）。
     会在 analyze/构建时报 `Undefined class 'RustSignalPack'` / 找不到 `package:rinf`。
     另外 v8.10 没有 `#[signal(binary)]` 属性：二进制信号用 `#[derive(RustSignalBinary)]`，
     字节作为 `send_signal_to_dart(binary)` 的**方法参数**传，不是字段。
+20. **iOS 文本输入框的重置有竞态。** 提交后把隐藏文本框重置为初始值，下一次按键可能在重置
+    生效前到达，平台给回的值里还带着上一段文本——按「初始值之后的全部」算增量就会重发
+    （`echo` 变成 `eecechecho`，快速输入与输入法提交时稳定复现）。必须用 delta 模型，
+    按平台自己的 `oldText` 计算。见 §6.1 文本输入决定。
+21. **可打印键走平台文本输入是异步的，直接处理的键会越过它。** 硬件键盘上 `ls` + 回车打得快，
+    会先执行 `l`、`s` 落到下一行。见 §6.1 的 `HardwareKeyOrder`。
+22. **iOS 文本输入默认开着智能引号 / 智能破折号**（`TextInputConfiguration` 在非 obscureText 时
+    默认 enabled），终端里 `"` 会变成 `“`。要显式关掉。
+23. **模拟器的自动输入（`simctl` 等）走的是硬件键盘事件**，覆盖的是硬件键盘路径；软键盘路径
+    （delta 插入/删除）要点屏幕键盘验证。模拟器默认输入法可能是拼音，英文输入先切到英文键盘。
 
 ---
 
@@ -759,6 +784,18 @@ cargo run --release --example bench_frame
 # iOS 产物（静态库探针；M0b 壳退役后仅作编译冒烟）
 cargo build --release --lib --target aarch64-apple-ios
 cargo build --release --lib --target aarch64-apple-ios-sim
+```
+
+```bash
+# 本地验收 SSH 服务器（Docker；probe / probe，127.0.0.1:2223，自带 vim / htop / m1bar）
+./scripts/sshd-test.sh up
+./scripts/sshd-test.sh rekey      # 重新生成主机密钥（验收密钥变更告警）
+
+# 连它跑 App；exec 模式直接跑 60Hz×10s 进度条，debug 构建日志里看 [perf] 帧率
+flutter run -d <模拟器id> \
+  --dart-define=GUOSH_HOST=127.0.0.1 --dart-define=GUOSH_PORT=2223 \
+  --dart-define=GUOSH_USER=probe --dart-define=GUOSH_PASS=probe \
+  --dart-define=GUOSH_CMD=m1bar
 ```
 
 （M0b 的「起飞前检查」`scripts/link-check.sh` 已随壳退役；App 构建由
@@ -832,6 +869,11 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
       performAction 与 "\n" 插入两条路），fork 侧去重修复，
       terminal_view ref 7f89795 → 21d04c2
 - [x] M1-b 缩减为小屏布局验收，并入 M2a
+- [x] 输入与帧回归修复（2026-09-25，模拟器实测）：软键盘大小写与数字、F 键、
+      快速输入与输入法提交不再重发（delta 模型）、硬件键保序、关闭智能标点；
+      重连不再卡「连接中」、连接中的尺寸变化连上后补发、pixel 为整个终端像素；
+      密码所有权移入 SecretString；帧流控（ACK，至多一帧在途），m1bar 60fps 不回退、
+      20 万行输出末屏完整；诊断探针移出连接路径
 - [ ] M2a / M3 / M3a / M3b / M3c(不急) / M3d(不急) / M4 / M5
 
 **关于提交**

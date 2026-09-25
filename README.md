@@ -26,7 +26,9 @@ GuoSSHell/
 ├── Cargo.toml           根 workspace（members = native/*, rust）+ release profile
 ├── ios/                 Flutter 的 iOS 宿主（Runner）
 └── scripts/
-    └── setup.sh         幂等环境准备
+    ├── setup.sh         幂等环境准备
+    ├── sshd-test.sh     本地验收 SSH 服务器（Docker：vim / htop / 主机密钥变更）
+    └── m1bar.sh         60Hz 帧率自检进度条
 ```
 
 整个 Rust 侧是**一个 workspace**（根 `Cargo.toml`），`native/hub` 通过 `rshell-m0`
@@ -49,6 +51,9 @@ cargo run --release --example bench_frame
 
 # M1：起一个无凭证的环回 SSH 服务器（probe / probe，密钥稳定不换）
 cargo run --example demo_server -- 2222
+
+# 或者：真实 sshd（Docker，probe / probe，127.0.0.1:2223，带 vim / htop / m1bar）
+../scripts/sshd-test.sh up
 
 # App（另开一个终端；iOS 模拟器可达宿主 127.0.0.1）
 cd ..

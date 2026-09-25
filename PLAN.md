@@ -491,13 +491,21 @@ Ed25519 公钥（复制到服务器、改名、删除登记，与钥匙串私钥
 提示与系统原因。debug 构建设 `GUOSH_VIRTUAL_SECURITY_KEY` 时用模拟安全密钥（值是域名时用它作
 RP ID，否则 `ssh:`）。决定见 §6.1「M3d 安全密钥决定」。
 
-### M4 — 产品化与合规
+### M4 — 产品化与合规 —— ✅ 已完成（2026-09-26，模拟器验收 + release 构建；真机与上架决定待你）
 
-- 多标签 / 分屏（`PaneTree` / `SplitAxis` / `WorkspaceState` / `UiCommand::Split` 都已在 Rust 侧）
-- **滚动回看的分级上界**：桌面契约是 `scrollback_lines` 上限 `1_000_000` 行，
-  手机上会触发 jetsam 直接杀进程。必须另设平台分级上界。
-- App 生命周期：进后台后 SSH 连接怎么处理（`SessionUiCommand::Reconnect` 已在协议里）
-- 分发合规：App Review 2.5.2 对远程 shell 类应用有限制，定位与描述要提前想清楚。
+- **滚回**：会话的滚回在引擎里，Dart 按滚动位置向 Rust 要窗口（上下各多一屏），fork 的
+  Scrollable 原样滚动；行数上界按设备物理内存分档（2 千到 10 万行），设置页可调
+- **多标签 / 分屏**：标签条 + 左右 / 上下分屏（同方向并成一层、分隔条可拖），每个窗格一条
+  独立会话，键位条跟着活动窗格；硬件键盘 ⌘T / ⌘W / ⌘D / ⌘⇧D / ⌘1…9 / ⌘⇧[ ] / ⌘[ ]
+- **生命周期**：keepalive（rsHell 补丁 P7）发现悄悄断掉的连接；断开后在同一会话里重连，
+  引擎与滚回保留；进后台时向系统申请一小段后台运行时间
+- **合规**：开源许可页（Dart 包 + rsHell + MesloLGS NF + Rust 依赖，cargo-about 生成）、
+  PrivacyInfo.xcprivacy；上架定位、出口合规、bundle id 等是你的决定（followup
+  「上架前的产品与合规决定」）
+- **release 构建**：`flutter build ios --release --no-codesign` 通过，App 39.6 MB（Rust 核心
+  16 MB、Dart AOT 12 MB、Flutter 引擎 10 MB；未经归档剥离符号），debug 专用的模拟卡与模拟
+  安全密钥不在 release 里
+- 决定见 §6.1「M4 滚回与工作区决定」「M4 生命周期决定」「M4 合规决定」
 
 ### M5 — 平台宽度（Android / macOS，**非阻塞，但架构上现在就别堵死**）
 
@@ -595,6 +603,36 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 回车、方向键、Ctrl 组合等直接处理的键不得越过之前敲下、仍在平台文本输入里的字符——
 `HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
 平台不答复的键（死键等）150 ms 超时兜底。
+
+**M4 滚回与工作区决定（2026-09-26）：**
+滚回的内容只在引擎里。`FrameTerminal` 对 fork 呈现「滚回 + 屏幕」那么多行（行号 = 绝对行 −
+最早一行），fork 的 Scrollable 照常滚动（惯性、滚动条都是现成的）；Rust 只渲染 Dart 按滚动
+位置请求的窗口（`ViewportRequest`，可见区上下各多一屏，已有窗口还盖得住就不重发），窗口外
+的行是空白占位；在底部时跟着屏幕、随输出滚动。帧带滚回范围（最早一行、屏幕首行）与光标的
+屏幕行；滚回满了裁掉旧行时，停在滚回里的滚动位置随之上移，内容不漂。打字、粘贴回到底部；
+远端接管滚动（备用屏、鼠标上报）时回到底部。选区行号覆盖整个滚回，全选含滚回。滚回行数的
+上界按设备物理内存分档（<5 GB 2 千、<9 GB 5 千、<17 GB 2 万、更大 10 万；取不到按 5 千），
+设置页可调但不超上界，新会话生效。
+标签与分屏是 Flutter 的界面状态（§2：标签 / 分屏在 Flutter 层）：每个窗格是一条独立会话，
+Rust 不需要知道它们怎么摆，不用上游 `WorkspaceState`。分屏树同方向的分屏并成一层，布局用
+`multi_split_view`（MIT）；窗格的控制器（适配器、选区、焦点）独立于 widget，重新布局时会话不断；
+窗格从界面上移除即断开。开新标签、分屏时从目录选连接。
+
+**M4 生命周期决定（2026-09-26）：**
+连上之后 15 秒收不到服务器的东西就发 keepalive，连续 3 次没有回音即以「连接已断开」结束
+（rsHell 补丁 P7）——设备休眠、换网络后悄悄没了的连接一分钟内结束，不会一直挂着。连上之后的
+网络失败与连不上分开提示。断开（失败、对端关闭、keepalive 超时）后会话留在窗格里：滚回、
+选区、复制照常，「重试 / 重新连接」在同一会话里再连一次，引擎与滚回保留（复位远端留下的
+模式、另起一行），新的输出接在后面；只有关掉窗格才结束会话。进后台时向系统申请一小段后台
+运行时间（iOS 约 30 秒），回到前台或用完即交还；更长时间的后台保活 iOS 不提供，靠重连。
+
+**M4 合规决定（2026-09-26）：**
+许可页用 Flutter 的 `showLicensePage`：Dart 包的许可 Flutter 自动收集，另补上游 rsHell（MIT）、
+内置字体与 Rust 依赖。Rust 依赖清单由 `scripts/licenses.sh`（cargo-about，只算 iOS / macOS
+目标，不列本仓库自己的 crate）生成，随代码入库，依赖变了就重跑。App 的 PrivacyInfo.xcprivacy：
+不跟踪、不收集数据（连接目录、私钥与主机密钥都只在设备与用户自己的 iCloud 钥匙串里）；按
+二进制实际引用的「需说明理由的 API」声明 FileTimestamp（C617.1）与 DiskSpace（E174.1，内置
+SQLite 的 statfs / fstatvfs）。bundle id、应用名、图标、签名团队、出口合规、上架定位由你决定。
 
 **M3d 安全密钥决定（2026-09-26）：**
 安全密钥走 WebAuthn：系统（AuthenticationServices）只给 WebAuthn 层的接口，clientDataJSON 由系统
@@ -878,6 +916,11 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
     默认的 `ssh:` 会失败（`ASAuthorizationError` 1004，「not associated with domain」）。
     RP ID 要换成经 Associated Domains（`webcredentials:`）关联的域名；OpenSSH 服务器不限制
     application，域名形式的 sk 公钥照常认证。
+36. **量帧率前先看主机负载**：模拟器跑在主机上，主机被别的进程压满（`uptime` 的负载远超核数、
+    另一个模拟器还开着 App）时，m1bar 会掉到个位数帧、render / pack 慢十倍，看着像回归。先
+    `uptime`、关掉多余的模拟器，再量。
+37. **模拟器的系统进程也会崩**：`backboardd` 崩溃会带着 SpringBoard 与所有 App 一起重启，看起来
+    像 App 闪退。先看 `~/Library/Logs/DiagnosticReports/` 里是谁的崩溃报告，再怀疑自己的代码。
 
 ---
 
@@ -913,6 +956,16 @@ SIMCTL_CHILD_GUOSH_VIRTUAL_SECURITY_KEY=1 xcrun simctl launch booted com.example
 
 # 模拟器剪贴板里的公钥（「复制公钥」之后）
 xcrun simctl pbpaste booted
+
+# 让验收服务器「悄悄没了」（keepalive 与重连）：冻结再恢复容器
+docker pause guosh-sshd
+docker unpause guosh-sshd
+
+# 依赖变了之后重新生成许可页里的 Rust 依赖清单（需要 cargo-about）
+./scripts/licenses.sh
+
+# release 构建冒烟（不签名）
+flutter build ios --release --no-codesign
 
 # 本地验收 SSH 服务器（Docker；probe / probe，127.0.0.1:2223，自带 vim / htop / m1bar）
 ./scripts/sshd-test.sh up
@@ -1062,7 +1115,22 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
 - [x] 系统路径（模拟器，不带模拟安全密钥）：请求与委托回调走通，RP ID `ssh:` 被系统拒绝并给出
       原因；没有配置 RP ID 的构建不出现「添加安全密钥」
 - [ ] 真机：关联域名后用 FIDO2 安全密钥经 USB-C / NFC 登录（followup「安全密钥RP-ID与真机验收」）
-- [ ] M4 / M5
+
+**M4 —— 产品化与合规 —— ✅ 已完成（2026-09-26，模拟器验收 + release 构建）**
+
+- [x] 滚回：`seq` 输出后上滑到历史深处、选中历史里的一行复制；滚回满了持续输出时停在原处
+      不漂；打字回到底部；vi（备用屏）进出后滚回还在；m1bar 60 fps 不回退
+- [x] 设置：滚回行数可选，上界随设备内存（模拟器 10 万行）
+- [x] 标签与分屏：左右分屏两个会话各自输入、活动窗格描边；新标签；切标签会话不断；关掉一个
+      窗格另一个铺满；返回时确认后全部断开（容器里不留会话）
+- [x] 生命周期：冻结容器后约一分钟提示「连接已断开」，恢复后「重试」在原会话里连上，滚回保留、
+      新的登录信息另起一行；服务器端杀掉会话同样；进后台时申请后台时间、回前台交还
+- [x] rsHell 补丁 P7（keepalive）：经可冻结的 TCP 代理测试，关掉 keepalive 时测试失败
+- [x] 合规：许可页（rsHell、字体、Dart 包、232 个 Rust crate）；PrivacyInfo.xcprivacy 随 App 打包
+- [x] release 构建（不签名）通过，39.6 MB；模拟卡与模拟安全密钥不在 release 里
+- [ ] 真机：进后台后的连接行为、release 构建在设备上跑一遍；上架前的决定
+      （followup「上架前的产品与合规决定」）
+- [ ] M5
 
 **关于提交**
 

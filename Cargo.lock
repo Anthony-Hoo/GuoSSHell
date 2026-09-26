@@ -2254,7 +2254,7 @@ dependencies = [
 [[package]]
 name = "rshell-core"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=4ff71e550eb027b4ae442ec51753c19e0b1b1cb1#4ff71e550eb027b4ae442ec51753c19e0b1b1cb1"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9#d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2286,7 +2286,7 @@ dependencies = [
 [[package]]
 name = "rshell-platform"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=4ff71e550eb027b4ae442ec51753c19e0b1b1cb1#4ff71e550eb027b4ae442ec51753c19e0b1b1cb1"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9#d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9"
 dependencies = [
  "directories",
  "thiserror 2.0.20",
@@ -2296,7 +2296,7 @@ dependencies = [
 [[package]]
 name = "rshell-session"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=4ff71e550eb027b4ae442ec51753c19e0b1b1cb1#4ff71e550eb027b4ae442ec51753c19e0b1b1cb1"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9#d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
@@ -2317,7 +2317,7 @@ dependencies = [
 [[package]]
 name = "rshell-storage"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=4ff71e550eb027b4ae442ec51753c19e0b1b1cb1#4ff71e550eb027b4ae442ec51753c19e0b1b1cb1"
+source = "git+https://github.com/Anthony-Hoo/rsHell?rev=d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9#d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9"
 dependencies = [
  "async-trait",
  "keyring",

@@ -9,15 +9,15 @@
 | 上游仓库 | https://github.com/hugefiver/rsHell |
 | 上游基线 commit | `b2ab8656079225dc2c920c24f5d9e0124f4f83e1` |
 | fork 仓库 | https://github.com/Anthony-Hoo/rsHell（`guosh` 分支） |
-| pin 住的 commit | `4ff71e550eb027b4ae442ec51753c19e0b1b1cb1`（基线 + 下文补丁） |
+| pin 住的 commit | `d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9`（基线 + 下文补丁） |
 | 许可证 | MIT，Copyright (c) 2026 hugefiver（副本见 `LICENSES/rsHell-MIT.txt`） |
 
 依赖声明在 `Cargo.toml`：
 
 ```toml
-rshell-core = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "4ff71e550eb027b4ae442ec51753c19e0b1b1cb1" }
-rshell-session = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "4ff71e550eb027b4ae442ec51753c19e0b1b1cb1" }
-rshell-storage = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "4ff71e550eb027b4ae442ec51753c19e0b1b1cb1" }
+rshell-core = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9" }
+rshell-session = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9" }
+rshell-storage = { git = "https://github.com/Anthony-Hoo/rsHell", rev = "d15ca5d898d3ad2c008a1bacdc1ed0045c46ffb9" }
 ```
 
 升级上游 = 在 fork 里把 `guosh` 分支 rebase 到新基线（补丁都很小，冲突面可控），
@@ -118,3 +118,4 @@ MIT 要求「许可声明随软件或其重要部分一起分发」。App Store 
 | P5 | `64233db` feat(session): authenticate through an external signer | `rshell-session/src/auth.rs`：`ExternalSigner` trait（签名、返回 SSH 签名 blob）、`ExternalSignerError`、`AuthPlan::Signer{host, public_key, signer}` 与 `AuthPlan::from_signer`（只接受 PublicKey 认证的配置）；`transport/native_ssh/auth.rs`：该变体经 russh 的 `authenticate_publickey_with` 认证，适配器把签名 blob 作为 SSH string 接在待签数据之后，签名器失败按认证失败报；`tests/auth.rs` 加一个用例，`tests/ssh_smoke.rs` 加两个（外部签名器认证通过、签名器失败即认证失败） | 私钥在硬件卡（OpenPGP 卡）或平台认证器里，进程拿不到私钥，只能请它签名 |
 | P6 | `bb38b1f` feat(session): bound connecting separately from other operations | `rshell-session/src/transport/native_ssh.rs`：`NativeSshTransport::with_connect_timeout`，只作用于 `connect`（TCP、握手、主机密钥确认与认证，含等交互的时间），不设时仍用操作超时；`tests/native_ssh.rs` 加一个用例（问答等待超过操作超时、未超连接上限时照常连上） | 上游的操作超时把用户看指纹、输 PIN、按卡的时间也算进连接里，慢一点就「连接超时」。App 自己只给等网络的时间计时（等用户时暂停），交给传输层的连接上限放宽 |
 | P7 | `4ff71e5` feat(session): give up connections whose keepalives go unanswered | `rshell-session/src/transport/native_ssh.rs`：`NativeSshTransport::with_keepalive(interval, max)`，把 russh 的 `keepalive_interval` / `keepalive_max` 交给调用方，不设时不发 keepalive（上游行为不变）；`tests/native_ssh.rs` 加一个用例（经可冻结的 TCP 代理，对端静默后以网络失败结束，而不是一直挂着） | 上游不发 keepalive：设备休眠、换网络后对端悄悄没了，会话会一直挂在「已连接」。App 设置间隔与次数，死连接在一分钟内以「连接已断开」结束，可以重连 |
+| P8 | `d15ca5d` feat(session): end synchronized updates at their deadline | `rshell-session/src/engine.rs`：`TerminalEngine::sync_deadline()` / `end_sync()`（默认实现为空）；`alacritty_adapter.rs` / `alacritty_feed.rs`：给出 vte 解析器缓冲同步输出的截止时刻，`end_sync` 把缓冲的输出按常规的滚回记账画上去，截止之后到的输出先结束同步再解析（喂字节的记账抽成 `apply_window` 共用）；`tests/engine_contract.rs` 加三个用例 | 同步输出（DEC 2026）期间 vte 缓冲全部输出直到结束序列，终端在短超时后放弃等待（alacritty 150 ms），上游没有这一步：程序在一帧中途被杀，之后的输出连同 shell 提示符都被扣住，画面卡死。会话循环按截止时刻结束同步 |

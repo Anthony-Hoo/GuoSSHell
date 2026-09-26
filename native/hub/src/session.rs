@@ -301,6 +301,24 @@ impl Screen {
         }
     }
 
+    /// 同步输出（DEC 2026）进行中时它的截止时刻：到点还没收到结束序列就由 [`Self::end_sync`] 结束。
+    fn sync_deadline(&self) -> Option<Instant> {
+        self.engine.sync_deadline().map(Instant::from_std)
+    }
+
+    /// 结束到点的同步输出，把攒着的输出画上去（程序在一帧中途退出时画面不卡住）；
+    /// 返回要回写远端的查询应答。
+    fn end_sync(&mut self, session_id: u32) -> Result<Vec<u8>, String> {
+        let delta = self
+            .engine
+            .end_sync()
+            .map_err(|error| format!("end sync: {error:?}"))?;
+        if delta.dirty {
+            self.changed(session_id)?;
+        }
+        Ok(delta.outbound)
+    }
+
     fn resize(&mut self, session_id: u32, size: TerminalSize) -> Result<(), String> {
         self.engine
             .resize(size)
@@ -512,6 +530,7 @@ async fn run_connected(
 
     loop {
         let frame_deadline = screen.pacer.deadline();
+        let sync_deadline = screen.sync_deadline();
         tokio::select! {
             event = transport.next_event() => match event {
                 Ok(TransportEvent::Output(bytes)) => match screen.engine.advance(&bytes) {
@@ -550,6 +569,15 @@ async fn run_connected(
             () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
                 if let Err(detail) = screen.flush(session_id) {
                     return (SessionEnd::failed(FailureKind::Other, detail), false);
+                }
+            }
+            () = sleep_until(sync_deadline.unwrap_or_else(Instant::now)), if sync_deadline.is_some() => {
+                match screen.end_sync(session_id) {
+                    Ok(outbound) if !outbound.is_empty() => {
+                        let _ = transport.write(&outbound).await;
+                    }
+                    Ok(_) => {}
+                    Err(detail) => return (SessionEnd::failed(FailureKind::Other, detail), false),
                 }
             }
             command = next_command(backlog, commands) => {
@@ -638,12 +666,21 @@ async fn wait_offline(
     }
     loop {
         let frame_deadline = screen.as_ref().and_then(|screen| screen.pacer.deadline());
+        // 断在一帧同步输出的中途（程序被杀、连接断开）：到点把攒着的输出画上去。
+        let sync_deadline = screen.as_ref().and_then(Screen::sync_deadline);
         tokio::select! {
             () = sleep_until(frame_deadline.unwrap_or_else(Instant::now)), if frame_deadline.is_some() => {
                 if let Some(screen) = screen.as_mut()
                     && let Err(detail) = screen.flush(session_id)
                 {
                     debug_print!("[session {session_id}] offline frame: {detail}");
+                }
+            }
+            () = sleep_until(sync_deadline.unwrap_or_else(Instant::now)), if sync_deadline.is_some() => {
+                if let Some(screen) = screen.as_mut()
+                    && let Err(detail) = screen.end_sync(session_id)
+                {
+                    debug_print!("[session {session_id}] offline sync: {detail}");
                 }
             }
             command = commands.recv() => match command {

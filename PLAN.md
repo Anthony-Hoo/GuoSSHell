@@ -548,9 +548,9 @@ rinf 单向信号流、Flutter 只画不解析）本身就与平台无关。
 `cargo check --target aarch64-linux-android` 配上 NDK，把 Rust 侧的不确定量消掉。
 Android 的 Flutter 侧产物在 M1 之后基本是免费的。
 
-### M6 — 兼容性与性能验收（coding agent / 全屏 TUI / 设备矩阵）—— 进行中（2026-09-26 立项）
+### M6 — 兼容性与性能验收（coding agent / 全屏 TUI / 设备矩阵）—— ✅ 已完成（2026-09-26，四台模拟器 + macOS profile 验收；真机待你）
 
-验收定义、测试台、用例与通过标准见 `docs/acceptance-m6-2026-09-26.md`，本节只放摘要。
+验收定义、测试台、用例、通过标准与结果见 `docs/acceptance-m6-2026-09-26.md`，本节只放摘要。
 
 **要回答**：Claude Code、Codex CLI、opencode 在高速流式输出、连续工具调用、多个 subagent 并发与
 视图切换下，有没有性能问题与显示 bug；btop、nvtop、网速监控（nload / bmon / iftop）进出全屏有没有
@@ -559,18 +559,22 @@ Android 的 Flutter 侧产物在 M1 之后基本是免费的。
 
 **测试台**：验收服务器扩展为 M6 全套（Debian trixie；三个 agent 预置配置、指向容器内的假上游；
 全屏 TUI、nvtop 的假 GPU、回环流量、`m6-*` 辅助程序）。假 AI 上游复用 aimock（三种协议的流式应答与
-工具调用），我们只写剧本：按用户消息里的标记选场景、按工具调用 id 定轮次，subagent 靠派发时写进
-prompt 的标记识别。App 侧新增显示延迟、ACK 超时、Flutter 帧耗时、RSS 与画面一致性自检（引擎与 Dart
-逐列比对）。自动化用 Flutter integration_test（模拟器与 macOS）和 XCUITest（iPad 上系统合成的硬件
-键盘与指针事件），`scripts/m6.sh` 编排。
+工具调用），我们只写剧本，外加一层补 Codex 协议扩展的转发。App 侧新增显示延迟、ACK 超时、Flutter
+帧耗时、RSS 与画面一致性自检（引擎与 Dart 逐列比对）。自动化用 Flutter integration_test（模拟器与
+macOS）和 XCUITest（iPad 上系统合成的硬件键盘与指针事件、各设备的真实旋转），`scripts/m6.sh` 编排。
 
-**通过标准**（摘要）：macOS profile 构建上显示延迟 p95 ≤ 50 ms、max ≤ 250 ms、无 ACK 超时、卡顿帧
-≤ 1%；场景结束时画面一致性通过；全屏 TUI 进出的断言全过；iPad 键鼠每个事件远端收到的字节与期望一致。
-模拟器只有 debug 构建，只判功能与相对值；真机清单列给你。
+**结果**：三个 agent 的全部场景、六个全屏 TUI、终端协议与键鼠在四台模拟器与 macOS 上通过；场景结束时
+画面与引擎逐列一致，退出（含流式中被杀）后终端模式干净。macOS profile 构建上全部达到门槛：显示延迟
+p95 ≤ 11 ms、max ≤ 27 ms，无 ACK 超时，卡顿帧 ≤ 0.6%；agent 输入框打字回显 17–50 ms，shell 回显
+p95 19 ms、另一窗格每秒 2000 行输出时 17 ms；长会话内存不涨。
 
-**立项时已确认的问题**（M6 当场修）：帧编码按「格」而不是「列」记位置（整行中文只画出一半、宽字符
-后的着色段错位）；同步输出（DEC 2026）没有超时（BSU 之后没有 ESU 画面就卡死）；硬件键盘快速连续
-输入时回车越过前面的字符。
+**验收中修复**：帧编码按列定位（整行中文只画出一半、宽字符后的着色段错位）；同步输出 150 ms 超时
+（rsHell 补丁 P8）；硬件键盘快速连续输入保序；清屏后输出很快时视图脱离底部；组合字符不绘制；
+Ctrl / Alt + 标点被丢掉（Ctrl+[、Alt+. 等）；debug 自动连接认进程环境变量。
+
+**记下待处理**（followup）：SSH 会话不发送 LANG；XTVERSION 不应答；颜色查询答黑色；kitty 键盘协议默认
+关闭；OSC 52 复制进不了剪贴板；焦点上报不发送；带 VS16 的 emoji 宽度；iPhone 横屏行数不够全屏 TUI。
+决定见 §6.1「M6 验收决定」。
 
 ---
 
@@ -638,6 +642,23 @@ fork 的 `CustomTextEdit` 因此改用 **delta 模型**（`enableDeltaModel`）�
 回车、方向键、Ctrl 组合等直接处理的键不得越过之前敲下、仍在平台文本输入里的字符——
 `HardwareKeyOrder` 把它们扣到平台答复了之前每个文本键（每键一条编辑更新）再放行，
 平台不答复的键（死键等）150 ms 超时兜底。
+
+**M6 验收决定（2026-09-26）：**
+假 AI 上游复用 aimock（编程接口），我们只写剧本：回复只由请求内容决定（工具调用 id 带场景与轮次，
+subagent 靠派发时写进 prompt 的标记识别），并发与重试都安全；aimock 不认识的两处 Codex 协议扩展
+（工具命名空间、`agent_message` 输入项）由前面一层转发补上。测试判断 agent 推进到哪一步看假上游记下
+的剧本决定，不看屏幕文字（agent 会改写它：markdown 渲染去掉标记、Codex 给子任务换显示名）。
+画面一致性自检只在测试里用：Rust 取最后发出的那一帧及其序号，Dart 等自己的行池应用到同一帧再逐列
+比对，持续刷新的程序也能比。度量随 `PerfStats` 5 秒一窗：显示延迟（远端字节进引擎 → 含它的帧被
+Dart 确认）、ACK 超时、远端输出字节、同步超时；Dart 汇总帧应用耗时、Flutter 帧耗时与卡顿、RSS，
+非 release 构建打 `[m6-perf]`。宽度只以引擎为准：帧里的 run 按列定位，含宽字符与组合字符的 run 带
+每格的码点数与宽度，Dart 不再自己算宽度。同步输出（DEC 2026）150 ms 没有结束就照常显示（rsHell 补丁
+P8，与 alacritty 一致）。只有用户发起的滚动能让视图离开底部（iOS 回弹动画与内容增长叠加时不算）。
+debug 构建的自动连接除了 `--dart-define`，也认进程环境变量 `GUOSH_*`：由 Rust 读取、随 `AppReady`
+交给 Dart（iOS 上 Dart 读不到进程环境变量），XCUITest 与 `simctl launch` 都经它传入。自动化分三层：
+integration_test（App 内：读自己的终端缓冲断言、截图、度量）、XCUITest（系统合成的硬件键盘与指针
+事件、真实旋转）、`scripts/m6.sh`（模拟器矩阵、构建后等主机负载降下来再测）。模拟器只有 debug 构建，
+性能门槛在 macOS profile 构建与真机上判。
 
 **M5 macOS 决定（2026-09-26）：**
 macOS 与 iOS 共用全部 Dart 与 Rust 代码，平台差异都在 Rust 与工程配置里：钥匙串——启动时往
@@ -823,7 +844,9 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
 2. **M3 的凭证 UI 形态**：已定——每次连接都读钥匙串，不在内存缓存（§6.1 M3 决定）。
    Face ID 保护（钥匙串条目的访问控制）留到需要时再加。
 3. **上游 fork 的边界。** 已经 fork（UPSTREAM.md 的 P1 bracketed paste、P2 密码可不存、
-   P3 主机密钥变更提示、P4 内存私钥认证、P5 外部签名认证、P6 连接单独限时）。还有两个已知的可能再改上游的需求，都不急：
+   P3 主机密钥变更提示、P4 内存私钥认证、P5 外部签名认证、P6 连接单独限时、P7 keepalive、
+   P8 同步输出超时）。M6 验收记下的几项终端协议能力（XTVERSION、颜色查询、OSC 52、焦点上报、
+   emoji 计宽）也要改上游，见各自的 followup。还有两个已知的可能再改上游的需求，都不急：
    - **把 iOS 不可用的三个传输（`local` / `pty` / `system_ssh`）从编译图里摘掉**，
      而不是靠链接器裁符号。现在靠 `-Wl,-dead_strip` 能压到 0（§3.2），所以**不急**；
      但如果哪天想做 App Store 的静态审查友好度，或者要减 `.a` 的 65 MB，就得 fork 加 feature gate。
@@ -975,6 +998,43 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
 40. **不能截 macOS 的屏时用 Flutter 自己的截图**：`flutter run` 给出的 VM service 上，widget inspector 的
     `ext.flutter.inspector.screenshot` 把界面画成 PNG，不需要系统的屏幕录制权限；`evaluate` 可以在 App 的
     库上下文里直接调请求函数（导入私钥、存连接、发 ConnectRequest）来驱动流程。
+41. **新建的模拟器第一次启动、Spotlight 给新的构建产物建索引，都会把主机压垮**：负载可到核数的
+    几十倍，这段时间的帧率与计时全部失真（陷阱 36 的放大版）。新模拟器先空跑到负载降下来；
+    `scripts/m6.sh` 在构建之后、测试之前等负载。
+42. **iOS 上 Dart 的 `Platform.environment` 是空的**：进程环境变量（XCUITest 的 launchEnvironment、
+    `simctl launch` 的 `SIMCTL_CHILD_*`）只有原生代码读得到，由 Rust 读了经信号交给 Dart。
+43. **XCUITest 的 `typeText` 在终端里用不了**：它要一个有键盘焦点的无障碍元素，终端的文本输入不在
+    无障碍树里（「Neither element nor any descendant has keyboard focus」）；逐键 `typeKey` 走硬件
+    键盘路径，可以用。但 `typeKey` 合成的回车、退格、Esc、Home / End、翻页、向前删除到不了 App（模拟器
+    自带的按键注入可以），F1–F12 到达时错一位（F2 成了 F1）；**`hover()` 在 iPad 模拟器上不产生任何
+    指针事件**（点按、右键、拖动、滚动都有）。这些只能在 Flutter 层注入。XCUITest 每个动作前等 App
+    空闲、最多 60 秒，App 偶尔一直不空闲，测试会慢很多但结果不受影响。UI 测试自己处理首次连接的
+    主机密钥确认，不依赖别的测试留下的信任记录。
+44. **模拟器的系统语言跟主机**：中文主机上新建的模拟器默认是拼音输入法，XCUITest 敲的字母会被组成
+    汉字、回车与 Esc 被输入法接走。核对原始按键字节的测试要让模拟器只留英文键盘（`scripts/m6.sh` 改
+    设备自己的偏好文件；**别用主机的 `defaults` 写 `.GlobalPreferences` 路径**，它会当成主机的全局域）。
+45. **用 xcodeproj gem 新建的测试目标要设 `PRODUCT_NAME = $(TARGET_NAME)`**：否则产物名为空，
+    构建报「Multiple commands produce …/PlugIns/.xctest」。
+46. **`flutter drive --use-application-binary` 在 iOS 模拟器上白屏卡住**：直接 `flutter drive`
+    （先 `flutter build` 一次，drive 只剩增量构建与安装）。
+47. **integration_test 的 `binding.reportData` 是整体替换**：tearDownAll 里再赋值会冲掉之前记下的
+    截图，要合并；截图字节也在里面（一套几百 MB），驱动端写报告时剥掉。iOS 上插件还把每张截图以
+    UIImage 留在 App 进程里直到测试结束（iPad 一张约 30 MB），**App 的 RSS 随截图张数上涨**——看内存
+    要用不截图的运行（macOS）。用 `tester.view.physicalSize` 改尺寸（假旋转）App 会按新尺寸布局，但系统
+    截图还是整块屏幕、看不出效果，系统键盘与安全区也不跟着转：竖屏的软键盘还在时宽高对调，工作区只剩
+    几十像素、布局溢出，要先收起软键盘。改尺寸后的画面用画面一致性自检判，真实旋转用 XCUITest 截图。
+48. **Docker 镜像的 `ENV` 不进 SSH 会话**：sshd 给会话的是 PAM 的环境（Debian 读 `/etc/default/locale`），
+    镜像里的 `ENV LANG` 不起作用；App 又不发 LANG（followup），没配系统 locale 的服务器上 btop 拒绝启动。
+49. **iOS 的回弹会让「跟随底部」失效**：清屏后内容快速增长时，回弹动画把滚动位置拉离底部，按「在不在
+    底部」判断就停止跟随、画面卡在旧位置。只有用户发起的滚动（`userScrollDirection` 不是 idle）才算
+    离开底部。
+50. **agent 的界面会改写文本**：markdown 渲染去掉 `##` 等标记，Codex 给子任务换显示名；测试判断
+    agent 推进到哪一步看假上游记下的剧本决定，不看屏幕文字。
+51. **aimock 的请求日志截断 64 KB 以上的请求体**：agent 的请求（整个对话加工具定义）很快超过，断言要看
+    剧本自己记的决定。Codex 的 subagent 协议（工具命名空间、`agent_message` 输入项）aimock 不认识，
+    由前面一层转发补上（验收文档 §2.2）。
+52. **opencode 在全新的家目录里第一次启动很慢**（装插件、建数据库，十几秒不发请求）：验收容器起来后
+    先在后台把三个 agent 各跑一次。
 
 ---
 
@@ -1035,6 +1095,26 @@ flutter run -d <模拟器id> \
   --dart-define=GUOSH_HOST=127.0.0.1 --dart-define=GUOSH_PORT=2223 \
   --dart-define=GUOSH_USER=probe --dart-define=GUOSH_PASS=probe \
   --dart-define=GUOSH_CMD=m1bar
+```
+
+```bash
+# M6 验收（docs/acceptance-m6-2026-09-26.md）：先起验收服务器（M6 全套）
+./scripts/sshd-test.sh up
+./scripts/m6.sh sims                          # 四台模拟器（GuoSSH-M6 <设备>，没有就新建）
+./scripts/m6.sh run agents ipad-pro-11 --dart-define=M6_SCENARIOS=stream,subagents
+./scripts/m6.sh matrix                        # 四台 × 三套（protocol / tui / agents）
+./scripts/m6.sh ui ipad-pro-11                # XCUITest：iPad 键盘与鼠标、真实旋转
+./scripts/m6.sh macos agents                  # macOS profile 构建（性能门槛在这里判）
+./scripts/m6.sh report                        # 汇总 → build/m6/summary.md
+
+# 手动看某个场景：登录验收服务器（probe / probe）后
+m6-agent codex subagents                      # 或 claude / opencode；场景见验收文档 §2.2
+m6-tui btop                                   # 或 nvtop / nload / bmon / iftop / htop
+
+# 带自动连接启动已装好的 debug 构建（进程环境变量，与 --dart-define 等价）
+SIMCTL_CHILD_GUOSH_HOST=127.0.0.1 SIMCTL_CHILD_GUOSH_PORT=2223 \
+  SIMCTL_CHILD_GUOSH_USER=probe SIMCTL_CHILD_GUOSH_PASS=probe \
+  xcrun simctl launch booted com.example.guoshShell
 ```
 
 （M0b 的「起飞前检查」`scripts/link-check.sh` 已随壳退役；App 构建由
@@ -1204,20 +1284,22 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
       窗口缩放；CanoKey 经 USB 读卡登录；带团队签名的构建上 iCloud 钥匙串同步
       （followup「macOS 键盘菜单与签名构建待验」）
 
-**M6 —— 兼容性与性能验收 —— 进行中（2026-09-26 立项）**
+**M6 —— 兼容性与性能验收 —— ✅ 已完成（2026-09-26，四台模拟器 + macOS profile 验收）**
 
 - [x] 立项：验收文档（用例、测试台、通过标准、真机清单）
-- [ ] 测试台：验收服务器（trixie、三个 agent、全屏 TUI、假 GPU、回环流量、`m6-*` 辅助程序）
-- [ ] 测试台：假上游剧本（aimock）
-- [ ] App：度量（显示延迟、ACK 超时、Flutter 帧耗时、RSS）与画面一致性自检
-- [ ] 自动化：integration_test、XCUITest、`scripts/m6.sh`
-- [ ] 修复：帧编码按列；同步输出超时（rsHell 补丁）；硬件键盘快速输入保序
-- [ ] A：三个 agent × S1–S7，多窗格
-- [ ] B：全屏 TUI B1–B5
-- [ ] C：四台模拟器
-- [ ] D：iPad 键盘与鼠标 D1–D12
-- [ ] E：终端协议 E1–E4
-- [ ] 真机（你来验，验收文档 §7）
+- [x] 测试台：验收服务器（trixie、三个 agent、全屏 TUI、假 GPU、回环流量、`m6-*` 辅助程序）
+- [x] 测试台：假上游剧本（aimock + 剧本 + 补 Codex 协议扩展的转发层）
+- [x] App：度量（显示延迟、ACK 超时、Flutter 帧耗时、RSS）与画面一致性自检
+- [x] 自动化：integration_test、XCUITest、`scripts/m6.sh`；debug 构建经进程环境变量自动连接
+- [x] 修复：帧编码按列；同步输出超时（rsHell 补丁 P8）；硬件键盘快速输入保序；清屏后快速输出时
+      视图不再脱离底部；组合字符照常绘制；Ctrl / Alt + 标点不再被丢掉；debug 自动连接认进程环境变量
+- [x] A：三个 agent（iPad Pro 11 上 8 个场景，其余设备与 macOS 上 S1 + S3，macOS 另跑 S4；S5 退出与流式中
+      被杀）、多窗格；macOS profile 达到全部性能门槛
+- [x] B：六个全屏 TUI 的 B1–B5（四台模拟器 + macOS）
+- [x] C：四台模拟器上三套集成测试与真实旋转
+- [x] D：iPad 键盘与鼠标 D1–D12（XCUITest 合成事件 + Flutter 层注入）
+- [x] E：终端协议 E1–E4；待定的几项记 followup（XTVERSION、颜色查询、kitty 键盘、OSC 52、焦点上报）
+- [ ] 真机（你来验，验收文档 §7；含没有自动化的 agent 手动部分）
 
 **关于提交**
 

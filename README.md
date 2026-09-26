@@ -10,8 +10,8 @@
 
 ```
 GuoSSHell/
-├── PLAN.md              实现规划：铁律 / 架构 / 实测事实 / 性能预算 / M0–M5 / 复用清单 / 陷阱
-├── docs/                调研报告（可行性 + 里程碑与 M0 交接单）
+├── PLAN.md              实现规划：铁律 / 架构 / 实测事实 / 性能预算 / M0–M6 / 复用清单 / 陷阱
+├── docs/                调研报告、验收文档、followups/（「存在但不马上修」的问题）
 ├── lib/                 Flutter app（纯展示与交互，无终端状态）
 │   ├── main.dart        入口：initializeRust + 许可登记 + MaterialApp
 │   └── src/
@@ -29,12 +29,18 @@ GuoSSHell/
 │   └── examples/        m0.rs · m0_loopback.rs · bench_frame.rs · demo_server.rs
 ├── Cargo.toml           根 workspace（members = native/*, rust）+ release profile
 ├── ios/                 Flutter 的 iOS 宿主（Runner；PrivacyInfo.xcprivacy）
+│   └── RunnerUITests/   XCUITest：iPad 硬件键盘与指针事件、真实旋转（M6）
 ├── macos/               Flutter 的 macOS 宿主（沙箱 entitlements）
+├── integration_test/    M6 集成测试：终端协议、全屏 TUI、coding agent（m6_harness.dart 是公共部分）
+├── test_driver/         flutter drive 的驱动：截图与报告写进 build/m6/
 ├── assets/              内置字体、Rust 依赖许可清单（许可页用）
 ├── about.toml / .hbs    cargo-about 配置与输出模板（scripts/licenses.sh）
 └── scripts/
     ├── setup.sh         幂等环境准备
     ├── sshd-test.sh     本地验收 SSH 服务器（Docker：vim / htop / 主机密钥变更 / 私钥与安全密钥授权）
+    ├── sshd-test/m6/    M6 验收服务器的内容：假 AI 上游（aimock + 剧本）、m6-* 辅助程序、agent 配置
+    ├── m6.sh            M6 编排：模拟器矩阵、集成测试、XCUITest、macOS profile、报告汇总
+    ├── m6-report.py     把 M6 的测试报告汇总成 markdown
     ├── m1bar.sh         60Hz 帧率自检进度条
     └── licenses.sh      重新生成许可页里的 Rust 依赖许可
 ```

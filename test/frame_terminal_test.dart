@@ -1,16 +1,27 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:guosh_shell/src/terminal/frame.dart';
 import 'package:guosh_shell/src/terminal/frame_terminal.dart';
 import 'package:terminal_view/terminal_view.dart';
 
-FrameRun run(int start, int len, String text, {int attrs = 0}) => FrameRun(
+FrameRun run(int start, int len, String text, {int attrs = 0, List<int>? layout}) => FrameRun(
       start: start,
       len: len,
-      attrs: attrs,
+      attrs: layout == null ? attrs : attrs | Attr.layout,
       fg: const DefaultColor(),
       bg: const DefaultColor(),
       text: text,
+      layout: layout == null ? null : Uint8List.fromList(layout),
     );
+
+/// 一行的每一列：有字形的列给出字形（含组合字符），宽字符的第二列与空白列为空串。
+List<String> columnsOf(BufferLine line, int cols) => [
+      for (var col = 0; col < cols; col++)
+        line.getCodePoint(col) == 0
+            ? ''
+            : String.fromCharCode(line.getCodePoint(col)) + (line.getCombined(col) ?? ''),
+    ];
 
 /// 没有滚回的帧：最早一行 = 屏幕首行 = 帧的第一行。
 TerminalFrame frame({
@@ -40,6 +51,55 @@ void main() {
         wrapped: false,
         runs: [run(0, text.length, text)],
       );
+
+  test('宽字符按引擎给的布局铺格：之后的着色段落在引擎的列上', () {
+    final terminal = FrameTerminal();
+    // 引擎：中(0-1) 文(2-3) X(4) " tail "(5-10) 🚀(11-12) Y(13)
+    terminal.applyFrame(frame(lines: [
+      FrameRow(stableRow: 0, wrapped: false, runs: [
+        run(0, 4, '中文', layout: [0x12, 0x12]),
+        run(4, 1, 'X'),
+        run(5, 8, ' tail 🚀', layout: [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x12]),
+        run(13, 1, 'Y'),
+      ]),
+    ]));
+    final columns = columnsOf(terminal.lineAt(0), 14);
+    expect(columns, ['中', '', '文', '', 'X', ' ', 't', 'a', 'i', 'l', ' ', '🚀', '', 'Y']);
+  });
+
+  test('一整行宽字符铺满所有列，不丢后半行', () {
+    final terminal = FrameTerminal();
+    terminal.applyFrame(frame(cols: 20, lines: [
+      FrameRow(stableRow: 0, wrapped: false, runs: [
+        run(0, 20, '中' * 10, layout: List.filled(10, 0x12)),
+      ]),
+    ]));
+    final columns = columnsOf(terminal.lineAt(0), 20);
+    expect(columns.where((c) => c == '中').length, 10);
+    expect(columns[18], '中');
+  });
+
+  test('组合字符跟随它的基字符占一格', () {
+    final terminal = FrameTerminal();
+    terminal.applyFrame(frame(lines: [
+      FrameRow(stableRow: 0, wrapped: false, runs: [
+        run(0, 1, 'e\u0301', layout: [0x21]),
+        run(1, 1, '!'),
+      ]),
+    ]));
+    final columns = columnsOf(terminal.lineAt(0), 2);
+    expect(columns, ['e\u0301', '!']);
+  });
+
+  test('布局变了的行不复用对象（只比 text 会漏掉宽度变化）', () {
+    final terminal = FrameTerminal();
+    FrameRow wide(List<int> layout, int len) =>
+        FrameRow(stableRow: 0, wrapped: false, runs: [run(0, len, 'ab', layout: layout)]);
+    terminal.applyFrame(frame(lines: [wide([0x11, 0x11], 2)]));
+    final before = terminal.lineAt(0);
+    terminal.applyFrame(frame(lines: [wide([0x12, 0x11], 3)]));
+    expect(identical(before, terminal.lineAt(0)), isFalse);
+  });
 
   test('同一行的内容跨帧不变则复用同一对象（锚点与 Picture 缓存的地基）', () {
     final terminal = FrameTerminal();

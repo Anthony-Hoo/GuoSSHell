@@ -28,14 +28,20 @@ class Attr {
   static const int strike = 8;
   static const int reverse = 16;
   static const int selected = 32;
+
+  /// run 后面带逐格布局（有宽字符或多码点的格子）。
+  static const int layout = 64;
 }
 
-/// 一段连续同属性单元格。`start`/`len` 以列计（CJK 占 2 列），
-/// `text` 的字符数可以小于 `len`（宽字符）。
+/// 一段连续同属性单元格。`start`/`len` 以列计。
+///
+/// 每格的宽度与字形由引擎给出，这里不算宽度：[layout] 为空时 [text] 的每个码点就是一格、
+/// 宽 1；否则 [layout] 逐格给出 `码点数 << 4 | 宽度`（宽字符的第二列不单独成格）。
 class FrameRun {
   final int start, len, attrs;
   final TermColor fg, bg;
   final String text;
+  final Uint8List? layout;
   const FrameRun({
     required this.start,
     required this.len,
@@ -43,6 +49,7 @@ class FrameRun {
     required this.fg,
     required this.bg,
     required this.text,
+    this.layout,
   });
 
   bool get bold => attrs & Attr.bold != 0;
@@ -92,8 +99,9 @@ class TerminalFrame {
 /// 解码 `frame_codec::pack_runs` 的字节流。
 /// wire 格式（全部小端）：
 /// row_count:u16 → 每行 { run_count:u16 · stable_row:i64 · wrapped:u8 →
-///   每个 run { start:u16 · len:u16 · fg · bg · attrs:u8 · text_len:u32 · text } }
-/// fg/bg：0=Default；1+u8=Ansi；2+r,g,b=Rgb。
+///   每个 run { start:u16 · len:u16 · fg · bg · attrs:u8 · text_len:u32 · text ·
+///     [attrs 带 Attr.layout 时] cell_count:u16 · layout:[u8] } }
+/// fg/bg：0=Default；1+u8=Ansi；2+r,g,b=Rgb。start / len 以列计。
 TerminalFrame decodeFrame(
   Uint8List binary, {
   required int cols,
@@ -172,6 +180,13 @@ TerminalFrame decodeFrame(
       need(textLen);
       final text = utf8.decode(binary.sublist(o, o + textLen), allowMalformed: true);
       o += textLen;
+      Uint8List? layout;
+      if (attrs & Attr.layout != 0) {
+        final cells = u16();
+        need(cells);
+        layout = binary.sublist(o, o + cells);
+        o += cells;
+      }
       runs.add(
         FrameRun(
           start: start,
@@ -180,6 +195,7 @@ TerminalFrame decodeFrame(
           fg: fg,
           bg: bg,
           text: text,
+          layout: layout,
         ),
       );
     }

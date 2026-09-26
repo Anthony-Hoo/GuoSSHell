@@ -6,7 +6,6 @@ import 'package:terminal_view/src/utils/circular_buffer.dart';
 import 'package:terminal_view/terminal_view.dart';
 
 import 'frame.dart';
-import 'unicode_width.dart';
 
 /// 输入事件（适配器 → 页面 → rinf → Rust）。
 sealed class TerminalInputEvent {
@@ -265,6 +264,7 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
           x.len != y.len ||
           x.attrs != y.attrs ||
           x.text != y.text ||
+          !listEquals(x.layout, y.layout) ||
           x.fg.runtimeType != y.fg.runtimeType ||
           x.bg.runtimeType != y.bg.runtimeType) {
         return false;
@@ -291,8 +291,8 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
     return true;
   }
 
-  /// 把一行 run 展开回 BufferLine：按列填充，宽字符占 2 列（第二列
-  /// 只带颜色不带字形），run 覆盖范围内剩余列留空白（内容 0、颜色同 run）。
+  /// 把一行 run 展开回 BufferLine：每格的列与宽度都按引擎给的布局（Dart 不算字符宽度）。
+  /// 宽字符占 2 列（第二列只带颜色不带字形），run 覆盖范围内没有字形的列留空白、保留颜色。
   BufferLine _buildLine(FrameRow row) {
     final line = BufferLine(_cols, isWrapped: row.wrapped);
     for (final run in row.runs) {
@@ -300,31 +300,27 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
       final bg = _encodeColor(run.bg, foreground: false);
       final attrs = _encodeAttrs(run);
       final end = (run.start + run.len).clamp(0, _cols);
+      final runes = run.text.runes.toList(growable: false);
+      final layout = run.layout;
 
       var col = run.start;
-      final buffer = StringBuffer();
-      for (final rune in run.text.runes) {
-        final width = runeCellWidth(rune);
-        if (width == 0 && buffer.isNotEmpty) {
-          buffer.writeCharCode(rune); // 零宽：贴附到前一个字形
-          continue;
-        }
-        if (buffer.isNotEmpty) {
-          _fillCluster(line, col, buffer.toString(), 1, fg, bg, attrs);
+      if (layout == null) {
+        // 简单 run：一个码点一格、宽 1。
+        for (final rune in runes) {
+          if (col >= end) break;
+          _fillCluster(line, col, [rune], 1, fg, bg, attrs);
           col += 1;
-          buffer.clear();
         }
-        if (col >= end) break;
-        final clusterWidth = width < 1 ? 1 : width;
-        buffer.writeCharCode(rune);
-        _fillCluster(line, col, buffer.toString(), clusterWidth, fg, bg, attrs);
-        col += clusterWidth;
-        buffer.clear();
-        if (col >= end) break;
-      }
-      if (buffer.isNotEmpty && col < end) {
-        _fillCluster(line, col, buffer.toString(), 1, fg, bg, attrs);
-        col += 1;
+      } else {
+        var next = 0;
+        for (final cell in layout) {
+          final count = cell >> 4;
+          final width = cell & 0x0f;
+          if (col >= end || next + count > runes.length) break;
+          _fillCluster(line, col, runes.sublist(next, next + count), width, fg, bg, attrs);
+          next += count;
+          col += width;
+        }
       }
       // run 内剩余列：空白，但保留 run 的底色（反显/色块场景需要）。
       while (col < end) {
@@ -338,7 +334,7 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   void _fillCluster(
     BufferLine line,
     int col,
-    String cluster,
+    List<int> codepoints,
     int width,
     int fg,
     int bg,
@@ -346,7 +342,6 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   ) {
     if (col >= _cols) return;
     _setColors(line, col, fg, bg, attrs);
-    final codepoints = cluster.runes.toList(growable: false);
     line.setContent(col, codepoints.first | (width << CellContent.widthShift));
     if (codepoints.length > 1) {
       line.setCombined(col, String.fromCharCodes(codepoints.sublist(1)));

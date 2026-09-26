@@ -74,6 +74,8 @@ flutter run -d <模拟器id 或 macos> \
 # GUOSH_PASS 可省略（连接时询问）；
 # GUOSH_CMD=top 可选——exec 模式（连上直接执行命令，M1 帧率实测用，无需键盘）。
 # 60fps 视觉自检：scp scripts/m1bar.sh 到远端后，GUOSH_CMD="bash /tmp/m1bar.sh"
+# 同名的进程环境变量也认（没有 --dart-define 时）：XCUITest 的 launchEnvironment、
+# simctl launch 的 SIMCTL_CHILD_GUOSH_* 都走这条。
 ```
 
 ## 上游与许可

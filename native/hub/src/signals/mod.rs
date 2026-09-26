@@ -34,10 +34,20 @@ pub struct AppLifecycle {
 }
 
 /// 启动结果。`ok = false` 时存储不可用（`detail` 说明原因），目录与连接都不能用。
-#[derive(Serialize, RustSignal)]
+///
+/// `auto_*`：debug 构建的自动连接目标，取自进程环境变量 `GUOSH_HOST` / `GUOSH_PORT` /
+/// `GUOSH_USER` / `GUOSH_PASS` / `GUOSH_CMD`（XCUITest 的 launchEnvironment、simctl 的
+/// `SIMCTL_CHILD_` 前缀都经它传入；iOS 上 Dart 读不到进程环境变量，由 Rust 转交）。
+/// release 构建恒为空。
+#[derive(Serialize, RustSignal, Default)]
 pub struct AppReady {
     pub ok: bool,
     pub detail: String,
+    pub auto_host: String,
+    pub auto_port: u16,
+    pub auto_user: String,
+    pub auto_pass: String,
+    pub auto_command: String,
 }
 
 // ── Dart → Rust ──────────────────────────────────────────────────────────────

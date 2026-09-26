@@ -80,6 +80,22 @@ fn platform_key_store() -> Result<Arc<dyn KeyStore>, String> {
     Err("private keys need the Apple keychain".to_owned())
 }
 
+/// debug 构建的自动连接目标（见 [`AppReady`]）；release 构建与没设环境变量时为空。
+fn debug_auto_connect() -> AppReady {
+    if !cfg!(debug_assertions) {
+        return AppReady::default();
+    }
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    AppReady {
+        auto_host: var("GUOSH_HOST"),
+        auto_port: var("GUOSH_PORT").parse().unwrap_or(22),
+        auto_user: var("GUOSH_USER"),
+        auto_pass: var("GUOSH_PASS"),
+        auto_command: var("GUOSH_CMD"),
+        ..AppReady::default()
+    }
+}
+
 pub async fn run() {
     let start = AppStart::get_dart_signal_receiver();
     let Some(pack) = start.recv().await else {
@@ -89,13 +105,19 @@ pub async fn run() {
     let context = match spawn_blocking(move || AppContext::open(&support_dir)).await {
         Ok(Ok(context)) => Arc::new(context),
         Ok(Err(detail)) => {
-            AppReady { ok: false, detail }.send_signal_to_dart();
+            AppReady {
+                ok: false,
+                detail,
+                ..AppReady::default()
+            }
+            .send_signal_to_dart();
             return;
         }
         Err(error) => {
             AppReady {
                 ok: false,
                 detail: format!("startup task: {error}"),
+                ..AppReady::default()
             }
             .send_signal_to_dart();
             return;
@@ -103,7 +125,7 @@ pub async fn run() {
     };
     AppReady {
         ok: true,
-        detail: String::new(),
+        ..debug_auto_connect()
     }
     .send_signal_to_dart();
 

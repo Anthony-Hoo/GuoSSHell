@@ -158,6 +158,41 @@ final class KeyboardMouseUITests: XCTestCase {
         XCTAssertTrue(events.isEmpty, "Shift+点击是本地选区，不发到远端：\(events)")
     }
 
+    /// 编辑器可在真实会话中打开和保存，当前排布保持不变。
+    func testKeyBarEditor() throws {
+        try launch(modes: "mouse drag")
+        let edit = app.buttons["编辑功能按钮"]
+        XCTAssertTrue(edit.waitForExistence(timeout: 10))
+        edit.tap()
+        XCTAssertTrue(app.buttons["添加按钮"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["恢复默认"].exists)
+        let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screenshot.name = "功能按钮编辑器"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        app.buttons["保存"].tap()
+        XCTAssertTrue(edit.waitForExistence(timeout: 10))
+    }
+
+    /// 修饰键回归独立于 XCTest 的滚轮合成限制。
+    func testModifierCombinations() throws {
+        try launch(modes: "mouse drag")
+        try ensureAsciiInput()
+        try expectBytes([0x1b], "Ctrl+[") { app.typeKey("[", modifierFlags: .control) }
+        try expectBytes([0x1b, 0x78], "Option+x") { app.typeKey("x", modifierFlags: .option) }
+        try expectBytes([0x1b, 0x5b, 0x5a], "Shift+Tab") { app.typeKey(XCUIKeyboardKey.tab.rawValue, modifierFlags: .shift) }
+        let center = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2))
+        var events = try mouseEvents { XCUIElement.perform(withKeyModifiers: .option) { center.click() } }
+        XCTAssertEqual(events.first?.kind, "8M", "Option+点击")
+        events = try mouseEvents { XCUIElement.perform(withKeyModifiers: .control) { center.click() } }
+        XCTAssertTrue(events.first.map { $0.kind == "16M" || $0.kind == "18M" } ?? false, "Control+点击")
+        events = try mouseEvents { XCUIElement.perform(withKeyModifiers: .shift) { center.click() } }
+        XCTAssertTrue(events.isEmpty, "Shift+点击留在本地")
+        try expectBytes([], "⌘+缩放不发送远端") { app.typeKey("=", modifierFlags: .command) }
+        try expectBytes([], "⌘0重置不发送远端") { app.typeKey("0", modifierFlags: .command) }
+        try expectBytes([0x61], "松开修饰键后普通文本") { app.typeKey("a", modifierFlags: []) }
+    }
+
     // MARK: - 辅助
 
     /// 启动 App，自动连上验收服务器并以 exec 模式运行 m6-keyecho；点一下终端拿到焦点，

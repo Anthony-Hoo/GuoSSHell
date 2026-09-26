@@ -84,6 +84,12 @@ flutter run -d <模拟器id 或 macos> \
 # simctl launch 的 SIMCTL_CHILD_GUOSH_* 都走这条。
 ```
 
+## 缩放与功能按钮
+
+终端支持屏幕或触控板双指捏合，以及 `⌘+` / `⌘−` 缩放；`⌘0` 恢复默认字号。
+下方的编辑图标可调整两排功能按钮：拖动排序、移到另一排、增删按钮、自定义文本和恢复默认，保存后立即生效。
+使用说明见 [终端输入、缩放与功能按钮](docs/terminal-input-and-controls.md)。
+
 ## 真机验收
 
 真机的覆盖、结果、限制与复测命令见 [真机 E2E 补充验收](docs/acceptance-device-2026-09-27.md)。

@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import '../bindings/bindings.dart';
 import '../keys/keys_page.dart';
 import 'terminal_font.dart';
+import 'key_bar_editor.dart';
+import '../terminal/key_bar_layout.dart';
 
 /// 设置：终端字体、字号、键位条与滚回行数（存在 Rust 侧，新会话生效）。
 class SettingsPage extends StatefulWidget {
@@ -36,7 +38,12 @@ class _SettingsPageState extends State<SettingsPage> {
     super.dispose();
   }
 
-  void _save({String? fontFamily, double? fontSize, int? scrollbackLines, bool? showKeyBar}) {
+  void _save({
+    String? fontFamily,
+    double? fontSize,
+    int? scrollbackLines,
+    bool? showKeyBar,
+  }) {
     final settings = _settings;
     if (settings == null) return;
     SaveSettings(
@@ -49,10 +56,10 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 滚回行数的可选档位，不超过本机上界（上界本身也是一档）。
   static List<int> _scrollbackChoices(int max) => [
-        for (final lines in const [1000, 2000, 5000, 10000, 20000, 50000, 100000])
-          if (lines < max) lines,
-        max,
-      ];
+    for (final lines in const [1000, 2000, 5000, 10000, 20000, 50000, 100000])
+      if (lines < max) lines,
+    max,
+  ];
 
   @override
   Widget build(BuildContext context) {
@@ -77,9 +84,9 @@ class _SettingsPageState extends State<SettingsPage> {
             title: const Text('私钥'),
             subtitle: const Text('导入私钥、复制公钥、iCloud 钥匙串同步'),
             trailing: const Icon(Icons.chevron_right),
-            onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(
-              builder: (_) => const KeysPage(),
-            )),
+            onTap: () => Navigator.of(
+              context,
+            ).push(MaterialPageRoute<void>(builder: (_) => const KeysPage())),
           ),
           const _SectionTitle('终端字体'),
           RadioGroup<String>(
@@ -109,8 +116,12 @@ class _SettingsPageState extends State<SettingsPage> {
                   child: Slider(
                     min: settings.minFontSize,
                     max: settings.maxFontSize,
-                    divisions: (settings.maxFontSize - settings.minFontSize).round(),
-                    value: size.clamp(settings.minFontSize, settings.maxFontSize),
+                    divisions: (settings.maxFontSize - settings.minFontSize)
+                        .round(),
+                    value: size.clamp(
+                      settings.minFontSize,
+                      settings.maxFontSize,
+                    ),
                     label: size.round().toString(),
                     onChanged: (value) => setState(() => _draggingSize = value),
                     onChangeEnd: (value) {
@@ -129,10 +140,9 @@ class _SettingsPageState extends State<SettingsPage> {
             color: Colors.black,
             child: Text(
               'probe@nas:~\$ ls -la\n main  ✔  中文 ⌘',
-              style: terminalStyle(settings).toTextStyle().copyWith(
-                    fontSize: size,
-                    color: Colors.white,
-                  ),
+              style: terminalStyle(settings)
+                  .toTextStyle()
+                  .copyWith(fontSize: size, color: Colors.white),
             ),
           ),
           const _SectionTitle('键盘'),
@@ -142,6 +152,20 @@ class _SettingsPageState extends State<SettingsPage> {
             value: settings.showKeyBar,
             onChanged: (value) => _save(showKeyBar: value),
           ),
+          ListTile(
+            leading: const Icon(Icons.tune),
+            title: const Text('编辑功能按钮'),
+            subtitle: const Text('排序、增删、移动到另一排或添加自定义文本'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => KeyBarEditor(
+                  initialRows: settings.keyBarRows,
+                  onSave: saveKeyBarLayout,
+                ),
+              ),
+            ),
+          ),
           const _SectionTitle('滚回'),
           ListTile(
             title: const Text('每个会话保留的行数'),
@@ -149,7 +173,9 @@ class _SettingsPageState extends State<SettingsPage> {
             trailing: DropdownButton<int>(
               value: settings.scrollbackLines,
               items: [
-                for (final lines in _scrollbackChoices(settings.maxScrollbackLines))
+                for (final lines in _scrollbackChoices(
+                  settings.maxScrollbackLines,
+                ))
                   DropdownMenuItem(value: lines, child: Text('$lines')),
                 if (!_scrollbackChoices(settings.maxScrollbackLines)
                     .contains(settings.scrollbackLines))
@@ -166,7 +192,7 @@ class _SettingsPageState extends State<SettingsPage> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Text(
-              '新打开的会话使用新设置。',
+              '字体和滚回设置用于新会话；按钮排布立即生效。',
               style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
             ),
           ),
@@ -197,9 +223,8 @@ class _SectionTitle extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
       child: Text(
         text,
-        style: Theme.of(context).textTheme.titleSmall?.copyWith(
-              color: Theme.of(context).colorScheme.primary,
-            ),
+        style: Theme.of(context).textTheme.titleSmall
+            ?.copyWith(color: Theme.of(context).colorScheme.primary),
       ),
     );
   }

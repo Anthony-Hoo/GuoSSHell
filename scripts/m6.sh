@@ -133,8 +133,8 @@ wait_for_load() {
 
 target_of() {
   case "$1" in
-    protocol | tui | agents | performance | network) echo "integration_test/m6_$1_test.dart" ;;
-    *) echo "未知套件：$1（可选：protocol / tui / agents / performance / network）" >&2; exit 2 ;;
+    protocol | tui | agents | performance | network | input_features) echo "integration_test/m6_$1_test.dart" ;;
+    *) echo "未知套件：$1（可选：protocol / tui / agents / performance / network / input_features）" >&2; exit 2 ;;
   esac
 }
 

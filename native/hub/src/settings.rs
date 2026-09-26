@@ -9,7 +9,9 @@ use rshell_m0::rshell_storage::{SqliteRepository, StorageError};
 use tokio::task::spawn_blocking;
 
 use crate::app::AppContext;
-use crate::signals::settings::{SaveSettings, SettingsQuery, SettingsState};
+use crate::signals::settings::{
+    KeyBarLayoutResult, SaveKeyBarLayout, SaveSettings, SettingsQuery, SettingsState,
+};
 
 /// 可选字体：第一个随 App 内置（带 powerline / Nerd Font 字形），其余是系统自带。
 pub const FONT_FAMILIES: [&str; 2] = ["MesloLGS NF", "Menlo"];
@@ -107,6 +109,7 @@ pub async fn terminal_settings(context: &Arc<AppContext>) -> TerminalSettingsV1 
 pub async fn run(context: Arc<AppContext>) {
     let query_rx = SettingsQuery::get_dart_signal_receiver();
     let save_rx = SaveSettings::get_dart_signal_receiver();
+    let layout_rx = SaveKeyBarLayout::get_dart_signal_receiver();
     loop {
         tokio::select! {
             pack = query_rx.recv() => {
@@ -114,12 +117,24 @@ pub async fn run(context: Arc<AppContext>) {
                     break;
                 }
             }
+            pack = layout_rx.recv() => {
+                let Some(pack) = pack else { break };
+                let saved = validate_key_bar_rows(&pack.message.rows).and_then(|()| {
+                    context.preferences.update(|preferences| {
+                        preferences.key_bar_rows = Some(pack.message.rows);
+                    })
+                });
+                KeyBarLayoutResult {
+                    ok: saved.is_ok(),
+                    detail: saved.err().unwrap_or_default(),
+                }.send_signal_to_dart();
+            }
             pack = save_rx.recv() => {
                 let Some(pack) = pack else { break };
                 let request = pack.message;
-                let mut preferences = context.preferences.get();
-                preferences.show_key_bar = Some(request.show_key_bar);
-                if let Err(error) = context.preferences.set(preferences) {
+                if let Err(error) = context.preferences.update(|preferences| {
+                    preferences.show_key_bar = Some(request.show_key_bar);
+                }) {
                     debug_print!("[settings] preferences: {error}");
                 }
                 let task_context = context.clone();
@@ -165,6 +180,12 @@ async fn publish(context: &Arc<AppContext>) {
         max_font_size: f64::from(MAX_FONT_SIZE),
         scrollback_lines: u32::try_from(settings.scrollback_lines).unwrap_or(u32::MAX),
         max_scrollback_lines: u32::try_from(scrollback_cap()).unwrap_or(u32::MAX),
+        key_bar_rows: context
+            .preferences
+            .get()
+            .key_bar_rows
+            .filter(|rows| validate_key_bar_rows(rows).is_ok())
+            .unwrap_or_else(default_key_bar_rows),
         show_key_bar: context
             .preferences
             .get()
@@ -174,12 +195,146 @@ async fn publish(context: &Arc<AppContext>) {
     .send_signal_to_dart();
 }
 
+/// 稳定标识与 Flutter 的按钮目录对应；自定义文本不包含控制字符。
+const KEY_BAR_BUTTONS: &[&str] = &[
+    "escape",
+    "tab",
+    "up",
+    "down",
+    "left",
+    "right",
+    "ctrl",
+    "alt",
+    "keyboard",
+    "backspace",
+    "disconnect",
+    "copy",
+    "paste",
+    "pipe",
+    "slash",
+    "minus",
+    "tilde",
+    "period",
+    "enter",
+    "delete",
+    "home",
+    "end",
+    "pageUp",
+    "pageDown",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5",
+    "f6",
+    "f7",
+    "f8",
+    "f9",
+    "f10",
+    "f11",
+    "f12",
+    "ctrlC",
+    "ctrlD",
+    "ctrlZ",
+    "ctrlL",
+    "zoomIn",
+    "zoomOut",
+    "zoomReset",
+];
+
+pub fn default_key_bar_rows() -> Vec<Vec<String>> {
+    [
+        vec![
+            "escape",
+            "tab",
+            "up",
+            "down",
+            "left",
+            "right",
+            "ctrl",
+            "alt",
+            "keyboard",
+            "backspace",
+        ],
+        vec![
+            "disconnect",
+            "copy",
+            "paste",
+            "pipe",
+            "slash",
+            "minus",
+            "tilde",
+            "period",
+        ],
+    ]
+    .into_iter()
+    .map(|row| row.into_iter().map(str::to_owned).collect())
+    .collect()
+}
+
+fn validate_key_bar_rows(rows: &[Vec<String>]) -> Result<(), String> {
+    if rows.len() != 2 || rows.iter().any(|row| row.len() > 24) {
+        return Err("键位条需要两排，每排最多 24 个按钮。".to_owned());
+    }
+    for button in rows.iter().flatten() {
+        let custom_valid = button.strip_prefix("text:").is_some_and(|text| {
+            !text.trim().is_empty()
+                && text.chars().count() <= 32
+                && !text.chars().any(char::is_control)
+        });
+        if !KEY_BAR_BUTTONS.contains(&button.as_str()) && !custom_valid {
+            return Err("键位条含有未知按钮或无效文本。".to_owned());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
     use super::{FONT_FAMILIES, adopt_app_defaults, default_profile, save, scrollback_cap_for};
     use crate::signals::settings::SaveSettings;
     use rshell_m0::rshell_storage::SqliteRepository;
+
+    #[test]
+    fn key_bar_layout_survives_reopen_and_other_preferences() {
+        use crate::keys::PreferenceFile;
+        let directory = std::env::temp_dir().join(format!("guosh-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("临时目录");
+        let path = directory.join("preferences.json");
+        std::fs::write(&path, r#"{"sync_keys":true,"show_key_bar":false}"#).expect("旧偏好");
+        let preferences = PreferenceFile::open(path.clone());
+        assert!(preferences.get().key_bar_rows.is_none());
+        let rows = vec![vec!["f1".to_owned(), "text:ls -la".to_owned()], vec![]];
+        super::validate_key_bar_rows(&rows).expect("有效排布");
+        preferences
+            .update(|p| p.key_bar_rows = Some(rows.clone()))
+            .expect("保存");
+        preferences
+            .update(|p| p.show_key_bar = Some(true))
+            .expect("其他设置");
+        let loaded = PreferenceFile::open(path).get();
+        assert!(loaded.sync_keys);
+        assert_eq!(loaded.show_key_bar, Some(true));
+        assert_eq!(loaded.key_bar_rows, Some(rows));
+        std::fs::remove_dir_all(directory).expect("清理");
+    }
+
+    #[test]
+    fn key_bar_rejects_unknown_and_control_text_but_allows_empty_rows() {
+        assert!(super::validate_key_bar_rows(&super::default_key_bar_rows()).is_ok());
+        assert!(super::validate_key_bar_rows(&[vec![], vec![]]).is_ok());
+        for id in [
+            "unknown",
+            "text:",
+            "text: ",
+            "text:cmd\n",
+            "text:\u{1b}[31m",
+        ] {
+            assert!(super::validate_key_bar_rows(&[vec![id.to_owned()], vec![]]).is_err());
+        }
+        assert!(super::validate_key_bar_rows(&[vec!["tab".to_owned(); 25], vec![]]).is_err());
+    }
 
     fn repository() -> SqliteRepository {
         let repository = SqliteRepository::open_in_memory().expect("in-memory catalog");

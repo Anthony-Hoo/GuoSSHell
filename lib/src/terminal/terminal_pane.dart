@@ -27,6 +27,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:guosh_shell/src/bindings/bindings.dart';
 
 import '../settings/terminal_font.dart';
+import 'terminal_zoom.dart';
 import 'frame.dart';
 import 'frame_terminal.dart';
 import 'perf_monitor.dart';
@@ -63,8 +64,10 @@ class TerminalPaneController extends ChangeNotifier {
 
   final SessionTarget target;
   final FrameTerminal terminal = FrameTerminal();
-  final TerminalController selection =
-      TerminalController(pointerInputs: const PointerInputs.all());
+  final TerminalController selection = TerminalController(
+    pointerInputs: const PointerInputs.all(),
+  );
+
   /// 软键盘的开关靠它：焦点在终端上 = 键盘起，unfocus = 收起。
   final FocusNode focusNode = FocusNode();
 
@@ -89,6 +92,8 @@ class TerminalPaneController extends ChangeNotifier {
   /// 复制选区（取文在引擎里）。
   void copy() => _pane?._copySelection();
 
+  TerminalZoom? get zoom => _pane?._zoom;
+
   /// 系统剪贴板 → 远端。
   Future<void> paste() async => _pane?._pasteClipboard();
 
@@ -102,7 +107,9 @@ class TerminalPaneController extends ChangeNotifier {
   }
 
   void _report({SessionState? state, String? title}) {
-    final changed = (state != null && state != _state) || (title != null && title != _remoteTitle);
+    final changed =
+        (state != null && state != _state) ||
+        (title != null && title != _remoteTitle);
     if (state != null) _state = state;
     if (title != null) _remoteTitle = title;
     if (changed) notifyListeners();
@@ -151,18 +158,34 @@ class _TerminalPaneState extends State<TerminalPane> {
   FrameTerminal get _terminal => widget.controller.terminal;
   TerminalController get _terminalController => widget.controller.selection;
   FocusNode get _terminalFocus => widget.controller.focusNode;
+
   /// 滚回的滚动位置（fork 的 Scrollable 用它）；滚动时按位置向 Rust 要窗口。
   final ScrollController _scroll = ScrollController();
+
   /// 跟着屏幕（随输出滚动）；滚进滚回后为 false，[_window] 是已请求的窗口。
   bool _followBottom = true;
   ({int top, int rows})? _window;
+
   /// 选区菜单锚点定位用（终端渲染区的屏幕坐标）。
   final GlobalKey _terminalSurfaceKey = GlobalKey();
+
   /// Flutter 自带的选区菜单（iOS 上是系统风格气垫）。
   final ContextMenuController _selectionMenu = ContextMenuController();
 
-  /// 终端样式：视图渲染与选区菜单锚点定位共用同一份（取自设置，页面内不变）。
-  late final TerminalStyle _style = terminalStyle(SettingsState.latestRustSignal!.message);
+  /// 样式与选区菜单锚点共用缩放后的度量，实际尺寸照常传给远端 PTY。
+  late final _settings = SettingsState.latestRustSignal!.message;
+  late final TerminalStyle _baseStyle = terminalStyle(_settings);
+  late final TerminalZoom _zoom = TerminalZoom(
+    defaultSize: _settings.fontSize,
+    minSize: _settings.minFontSize,
+    maxSize: _settings.maxFontSize,
+  );
+  TerminalStyle get _style => _baseStyle.copyWith(fontSize: _zoom.size);
+
+  void _onZoomChanged() {
+    _selectionMenu.remove();
+    if (mounted) setState(() {});
+  }
 
   StreamSubscription? _statusSub;
   StreamSubscription? _frameSub;
@@ -179,6 +202,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   /// 引擎最近一次选区回显（绝对行坐标）。行号映射一变就要拿它重新投影。
   SelectionState? _selectionEcho;
+
   /// 上次投影时的行号起点（最早一行的绝对行）。变了才重新投影——
   /// 拖动中的乐观更新不会被迟到的回显顶掉。
   int? _projectedFirstStable;
@@ -208,6 +232,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       ..onSelectionIntent = _onSelectionIntent;
     _scroll.addListener(_onScroll);
     _controller._pane = this;
+    _zoom.addListener(_onZoomChanged);
     _startSession();
   }
 
@@ -231,6 +256,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       ..onSelectionIntent = null;
     _selectionMenu.remove();
     _resizeTimer?.cancel();
+    _zoom.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -319,7 +345,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     } finally {
       // 流控：Rust 等到这一帧的 ACK 才发下一帧（解码失败也要回，免得它空等）。
       FrameAck(sessionId: msg.sessionId, seq: msg.seq).sendSignalToRust();
-      if (!kReleaseMode) PerfMonitor.instance.recordApply(msg.sessionId, watch.elapsedMicroseconds);
+      if (!kReleaseMode) {
+        PerfMonitor.instance.recordApply(
+          msg.sessionId,
+          watch.elapsedMicroseconds,
+        );
+      }
     }
   }
 
@@ -349,7 +380,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     final last = first + _terminal.height - 1;
 
     // 排序出首端/尾端（首端 = 早的那个），角色保留给 begin/end。
-    final anchorIsFirst = echo.anchorRow < echo.focusRow ||
+    final anchorIsFirst =
+        echo.anchorRow < echo.focusRow ||
         (echo.anchorRow == echo.focusRow && echo.anchorCol <= echo.focusCol);
     final firstStableRow = anchorIsFirst ? echo.anchorRow : echo.focusRow;
     final lastStableRow = anchorIsFirst ? echo.focusRow : echo.anchorRow;
@@ -373,18 +405,23 @@ class _TerminalPaneState extends State<TerminalPane> {
     );
   }
 
-  double get _lineHeight => calcCharSize(_style, MediaQuery.textScalerOf(context)).height;
+  double get _lineHeight =>
+      calcCharSize(_style, MediaQuery.textScalerOf(context)).height;
 
   /// 滚动位置 → 要显示的窗口。在底部就跟着屏幕；滚进滚回后要一段上下各多一屏的窗口，
   /// 已有的窗口还盖得住可见区（各留半屏余量）就不重发。只有用户的滚动才离开底部：
   /// 内容变矮后的回弹、尺寸变化的校正这些没人要的位移只会回到底部（回弹动画还瞄着旧的
   /// 底部时输出继续增长，按位置判断就会误以为用户滚上去了，从此不再跟着屏幕）。
   void _onScroll() {
-    if (!mounted || !_scroll.hasClients || _state != SessionState.connected) return;
+    if (!mounted || !_scroll.hasClients || _state != SessionState.connected) {
+      return;
+    }
     final position = _scroll.position;
     final lineHeight = _lineHeight;
     if (lineHeight <= 0 || !position.hasContentDimensions) return;
-    if (_followBottom && position.userScrollDirection == ScrollDirection.idle) return;
+    if (_followBottom && position.userScrollDirection == ScrollDirection.idle) {
+      return;
+    }
     if (position.pixels >= position.maxScrollExtent - lineHeight / 2) {
       if (!_followBottom) {
         _followBottom = true;
@@ -407,7 +444,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       return;
     }
     final topIndex = math.max(0, visibleTop - visibleRows);
-    final window = (top: _terminal.firstStableRow + topIndex, rows: visibleRows * 3);
+    final window = (
+      top: _terminal.firstStableRow + topIndex,
+      rows: visibleRows * 3,
+    );
     if (!_followBottom && window == _window) return;
     _followBottom = false;
     _window = window;
@@ -494,7 +534,9 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// fork 的输入口 → rinf → Rust（键编码权威在 encode_input）。
   /// 连接中的输入也照发：Rust 连上后按顺序补上（type-ahead）。
   bool _onTerminalInput(TerminalInputEvent event) {
-    if (_state != SessionState.connected && _state != SessionState.connecting) return false;
+    if (_state != SessionState.connected && _state != SessionState.connecting) {
+      return false;
+    }
     if (event is! MouseInputEvent) _scrollToBottom();
     switch (event) {
       case KeyInputEvent(:final key, :final shift, :final control, :final alt):
@@ -518,13 +560,13 @@ class _TerminalPaneState extends State<TerminalPane> {
       case PasteInputEvent(:final text):
         PasteRequest(sessionId: _sessionId, text: text).sendSignalToRust();
       case MouseInputEvent(
-          :final button,
-          :final action,
-          :final position,
-          :final shift,
-          :final alt,
-          :final ctrl,
-        ):
+        :final button,
+        :final action,
+        :final position,
+        :final shift,
+        :final alt,
+        :final ctrl,
+      ):
         // 滚轮走 Scroll（上游 validate 拒绝「滚轮走 press」）。
         MouseRequest(
           sessionId: _sessionId,
@@ -541,7 +583,9 @@ class _TerminalPaneState extends State<TerminalPane> {
             TerminalMouseButton.right => 'right',
             TerminalMouseButton.wheelUp => 'wheel_up',
             TerminalMouseButton.wheelDown => 'wheel_down',
-            TerminalMouseButton.wheelLeft || TerminalMouseButton.wheelRight || null => '',
+            TerminalMouseButton.wheelLeft ||
+            TerminalMouseButton.wheelRight ||
+            null => '',
           },
           col: position.x,
           row: position.y,
@@ -669,7 +713,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     return TextSelectionToolbarAnchors(
       primaryAnchor:
           origin + Offset(begin.x * cell.width, clampY(begin.y * cell.height)),
-      secondaryAnchor: origin +
+      secondaryAnchor:
+          origin +
           Offset((end.x + 1) * cell.width, clampY((end.y + 1) * cell.height)),
     );
   }
@@ -737,7 +782,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     });
     // 布局后几何变了 → fork 回调 _onTerminalResize 已经发出；没变（重连时
     // 视图尺寸通常不变，fork 不再回调）→ 这里用已量到的几何发出。
-    SchedulerBinding.instance.addPostFrameCallback((_) => _flushPendingConnect());
+    SchedulerBinding.instance.addPostFrameCallback(
+      (_) => _flushPendingConnect(),
+    );
   }
 
   bool _connectPending = false;
@@ -751,53 +798,50 @@ class _TerminalPaneState extends State<TerminalPane> {
     final title = _controller.target.title;
     final banner = switch (_state) {
       SessionState.connecting => switch (_hint) {
-          ConnectHint.touchCard => _Banner(
-              icon: Icons.touch_app_outlined,
-              text: '请按一下 OpenPGP 卡上的按键',
-              detail: '正在连接 $title',
-            ),
-          ConnectHint.tapCard => _Banner(
-              icon: Icons.contactless_outlined,
-              text: '请把 OpenPGP 卡靠近设备',
-              detail: '正在连接 $title',
-            ),
-          ConnectHint.securityKey => _Banner(
-              icon: Icons.usb,
-              text: '请按系统提示插上（或靠近）安全密钥，并触摸它',
-              detail: '正在连接 $title',
-            ),
-          ConnectHint.none => _Banner(
-              icon: Icons.sync,
-              text: '正在连接 $title…',
-            ),
-        },
+        ConnectHint.touchCard => _Banner(
+          icon: Icons.touch_app_outlined,
+          text: '请按一下 OpenPGP 卡上的按键',
+          detail: '正在连接 $title',
+        ),
+        ConnectHint.tapCard => _Banner(
+          icon: Icons.contactless_outlined,
+          text: '请把 OpenPGP 卡靠近设备',
+          detail: '正在连接 $title',
+        ),
+        ConnectHint.securityKey => _Banner(
+          icon: Icons.usb,
+          text: '请按系统提示插上（或靠近）安全密钥，并触摸它',
+          detail: '正在连接 $title',
+        ),
+        ConnectHint.none => _Banner(icon: Icons.sync, text: '正在连接 $title…'),
+      },
       SessionState.failed => _Banner(
-          icon: Icons.error_outline,
-          text: _failureText(_failure),
-          detail: _detail,
-          error: true,
-          actions: [
-            if (_localNetworkSettingsUrl.isNotEmpty)
-              TextButton(
-                onPressed: () => _openSettings(_localNetworkSettingsUrl),
-                child: const Text('打开设置'),
-              ),
-            TextButton(onPressed: _reconnect, child: const Text('重试')),
-            TextButton(onPressed: widget.onClose, child: const Text('关闭')),
-          ],
-          hint: _localNetworkSettingsUrl.isEmpty
-              ? null
-              : '服务器在局域网内时，需要允许 GuoSSHell 访问本地网络。',
-        ),
+        icon: Icons.error_outline,
+        text: _failureText(_failure),
+        detail: _detail,
+        error: true,
+        actions: [
+          if (_localNetworkSettingsUrl.isNotEmpty)
+            TextButton(
+              onPressed: () => _openSettings(_localNetworkSettingsUrl),
+              child: const Text('打开设置'),
+            ),
+          TextButton(onPressed: _reconnect, child: const Text('重试')),
+          TextButton(onPressed: widget.onClose, child: const Text('关闭')),
+        ],
+        hint: _localNetworkSettingsUrl.isEmpty
+            ? null
+            : '服务器在局域网内时，需要允许 GuoSSHell 访问本地网络。',
+      ),
       SessionState.closed => _Banner(
-          icon: Icons.link_off,
-          text: '会话已结束',
-          detail: _detail,
-          actions: [
-            TextButton(onPressed: _reconnect, child: const Text('重新连接')),
-            TextButton(onPressed: widget.onClose, child: const Text('关闭')),
-          ],
-        ),
+        icon: Icons.link_off,
+        text: '会话已结束',
+        detail: _detail,
+        actions: [
+          TextButton(onPressed: _reconnect, child: const Text('重新连接')),
+          TextButton(onPressed: widget.onClose, child: const Text('关闭')),
+        ],
+      ),
       _ => null,
     };
 
@@ -808,7 +852,10 @@ class _TerminalPaneState extends State<TerminalPane> {
         position: DecorationPosition.foreground,
         decoration: BoxDecoration(
           border: widget.highlighted
-              ? Border.all(color: Theme.of(context).colorScheme.primary, width: 1.5)
+              ? Border.all(
+                  color: Theme.of(context).colorScheme.primary,
+                  width: 1.5,
+                )
               : null,
         ),
         child: ColoredBox(
@@ -821,23 +868,29 @@ class _TerminalPaneState extends State<TerminalPane> {
                     _EngineCopyIntent: CallbackAction<_EngineCopyIntent>(
                       onInvoke: (_) => _copySelection(),
                     ),
-                    _EngineSelectAllIntent: CallbackAction<_EngineSelectAllIntent>(
-                      onInvoke: (_) => _selectAll(),
-                    ),
+                    _EngineSelectAllIntent:
+                        CallbackAction<_EngineSelectAllIntent>(
+                          onInvoke: (_) => _selectAll(),
+                        ),
                   },
-                  child: _TerminalSurface(
-                    key: _terminalSurfaceKey,
-                    terminal: _terminal,
-                    controller: _terminalController,
-                    scrollController: _scroll,
-                    focusNode: _terminalFocus,
-                    style: _style,
-                    onKeyEvent: widget.onKeyEvent,
+                  child: TerminalZoomSurface(
+                    zoom: _zoom,
+                    onStart: widget.onActivate,
+                    child: _TerminalSurface(
+                      key: _terminalSurfaceKey,
+                      terminal: _terminal,
+                      controller: _terminalController,
+                      scrollController: _scroll,
+                      focusNode: _terminalFocus,
+                      style: _style,
+                      onKeyEvent: widget.onKeyEvent,
+                    ),
                   ),
                 ),
               ),
               // 不在终端上方悬浮控件：拖选区（尤其长选区）经过时会干扰触摸。
-              if (banner != null) Positioned(top: 0, left: 0, right: 0, child: banner),
+              if (banner != null)
+                Positioned(top: 0, left: 0, right: 0, child: banner),
             ],
           ),
         ),
@@ -869,10 +922,7 @@ class _TerminalSurface extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     // 滚动条跟着 fork 的 Scrollable（滚回）；远端接管滚动时 fork 不滚，也就不显示。
-    return Scrollbar(
-      controller: scrollController,
-      child: _terminalView(),
-    );
+    return Scrollbar(controller: scrollController, child: _terminalView());
   }
 
   Widget _terminalView() {
@@ -897,25 +947,26 @@ class _TerminalSurface extends StatelessWidget {
 
 /// 失败分类 → 文案。
 String _failureText(FailureKind failure) => switch (failure) {
-      FailureKind.none || FailureKind.other => '连接出错',
-      FailureKind.notFound => '这条连接已不存在',
-      FailureKind.invalidTarget => '连接目标无效：请检查主机、端口和用户名',
-      FailureKind.keyNotFound => '连接用的私钥不在钥匙串里了，请重新选择',
-      FailureKind.authentication => '认证失败：服务器不接受这个用户名的密码或密钥',
-      FailureKind.hostKeyRejected => '已拒绝服务器的主机密钥',
-      FailureKind.hostKeyChanged => '主机密钥已变更，连接已中止',
-      FailureKind.network => '无法连接到服务器',
-      FailureKind.timeout => '连接超时',
-      FailureKind.connectionLost => '连接已断开：网络中断，或服务器不再响应',
-      FailureKind.keychain => '读写钥匙串失败',
-      FailureKind.cardNotFound => '没有找到 OpenPGP 卡：请插上（或靠近）登记的那张卡后重试',
-      FailureKind.cardKeyMismatch => '卡上的密钥与登记时的不同，请检查是不是插错了卡',
-      FailureKind.cardUnsupported => '这张卡的认证密钥 SSH 用不了（支持 Ed25519、RSA 与 NIST P-256/384/521）',
-      FailureKind.cardPinBlocked => 'OpenPGP 卡的 PIN 已锁定，需要用管理 PIN 解锁',
-      FailureKind.cardTouchTimeout => '没有等到卡上的按键确认',
-      FailureKind.cardError => '读卡失败',
-      FailureKind.securityKeyFailed => '安全密钥没有完成签名：请确认用的是登记时的那把安全密钥',
-    };
+  FailureKind.none || FailureKind.other => '连接出错',
+  FailureKind.notFound => '这条连接已不存在',
+  FailureKind.invalidTarget => '连接目标无效：请检查主机、端口和用户名',
+  FailureKind.keyNotFound => '连接用的私钥不在钥匙串里了，请重新选择',
+  FailureKind.authentication => '认证失败：服务器不接受这个用户名的密码或密钥',
+  FailureKind.hostKeyRejected => '已拒绝服务器的主机密钥',
+  FailureKind.hostKeyChanged => '主机密钥已变更，连接已中止',
+  FailureKind.network => '无法连接到服务器',
+  FailureKind.timeout => '连接超时',
+  FailureKind.connectionLost => '连接已断开：网络中断，或服务器不再响应',
+  FailureKind.keychain => '读写钥匙串失败',
+  FailureKind.cardNotFound => '没有找到 OpenPGP 卡：请插上（或靠近）登记的那张卡后重试',
+  FailureKind.cardKeyMismatch => '卡上的密钥与登记时的不同，请检查是不是插错了卡',
+  FailureKind.cardUnsupported =>
+    '这张卡的认证密钥 SSH 用不了（支持 Ed25519、RSA 与 NIST P-256/384/521）',
+  FailureKind.cardPinBlocked => 'OpenPGP 卡的 PIN 已锁定，需要用管理 PIN 解锁',
+  FailureKind.cardTouchTimeout => '没有等到卡上的按键确认',
+  FailureKind.cardError => '读卡失败',
+  FailureKind.securityKeyFailed => '安全密钥没有完成签名：请确认用的是登记时的那把安全密钥',
+};
 
 class _Banner extends StatelessWidget {
   final IconData icon;
@@ -939,7 +990,9 @@ class _Banner extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final foreground = error ? scheme.onErrorContainer : scheme.onSurface;
     return Material(
-      color: error ? scheme.errorContainer : scheme.surface.withValues(alpha: 0.92),
+      color: error
+          ? scheme.errorContainer
+          : scheme.surface.withValues(alpha: 0.92),
       child: SafeArea(
         bottom: false,
         child: Padding(
@@ -960,7 +1013,10 @@ class _Banner extends StatelessWidget {
               if (hint != null)
                 Padding(
                   padding: const EdgeInsets.only(left: 32, top: 4),
-                  child: Text(hint!, style: TextStyle(color: foreground, fontSize: 13)),
+                  child: Text(
+                    hint!,
+                    style: TextStyle(color: foreground, fontSize: 13),
+                  ),
                 ),
               if (detail.isNotEmpty)
                 Padding(
@@ -980,7 +1036,10 @@ class _Banner extends StatelessWidget {
                   data: TextButtonThemeData(
                     style: TextButton.styleFrom(foregroundColor: foreground),
                   ),
-                  child: Row(mainAxisAlignment: MainAxisAlignment.end, children: actions),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: actions,
+                  ),
                 ),
             ],
           ),

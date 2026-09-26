@@ -64,6 +64,16 @@ void main() {
       expect(events.single, isA<TextInputEvent>().having((e) => e.text, 'text', 'A'));
     });
 
+    test('编辑键位条解除挂住与锁定的修饰键', () {
+      terminal.tapModifier('ctrl');
+      terminal.lockModifier('alt');
+      terminal.clearModifiers();
+      terminal.textInput('c');
+      expect(events.single, isA<TextInputEvent>());
+      expect(terminal.isModifierLatched('ctrl'), isFalse);
+      expect(terminal.isModifierLocked('alt'), isFalse);
+    });
+
     test('硬件 Ctrl 组合键以键的形式发出', () {
       expect(terminal.keyInput(TerminalKey.keyC, ctrl: true), isTrue);
       expect(

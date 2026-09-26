@@ -538,6 +538,14 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
   bool isModifierLatched(String modifier) => _latchedModifiers.contains(modifier);
   bool isModifierLocked(String modifier) => _lockedModifiers.contains(modifier);
 
+  /// 离开键位条去编辑配置时解除挂住状态，避免移除按钮后修饰键仍生效。
+  void clearModifiers() {
+    if (_latchedModifiers.isEmpty && _lockedModifiers.isEmpty) return;
+    _latchedModifiers.clear();
+    _lockedModifiers.clear();
+    notifyListeners();
+  }
+
   /// 下一个输入是否带着该修饰键；挂住态在此消耗（锁定态保留）。
   bool _consumeModifier(String modifier) {
     if (_lockedModifiers.contains(modifier)) return true;

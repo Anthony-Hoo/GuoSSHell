@@ -15,6 +15,18 @@ pub struct SaveSettings {
     pub show_key_bar: bool,
 }
 
+/// 键位条排布独立保存，避免覆盖同时修改的字体和滚回设置。
+#[derive(Deserialize, DartSignal)]
+pub struct SaveKeyBarLayout {
+    pub rows: Vec<Vec<String>>,
+}
+
+#[derive(Serialize, RustSignal)]
+pub struct KeyBarLayoutResult {
+    pub ok: bool,
+    pub detail: String,
+}
+
 /// 当前设置。设置变化后重发。
 #[derive(Serialize, RustSignal)]
 pub struct SettingsState {
@@ -30,4 +42,6 @@ pub struct SettingsState {
     pub max_scrollback_lines: u32,
     /// 终端下方显示键位条（Esc、Tab、方向键、Ctrl、Alt…）。
     pub show_key_bar: bool,
+    /// 两排按钮的稳定标识；空排允许保留。
+    pub key_bar_rows: Vec<Vec<String>>,
 }

@@ -1,8 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:multi_split_view/multi_split_view.dart';
 
 import '../bindings/bindings.dart';
+import '../settings/key_bar_editor.dart';
+import '../terminal/key_bar_layout.dart';
 import '../terminal/session_target.dart';
 import '../terminal/terminal_key_bar.dart';
 import '../terminal/terminal_pane.dart';
@@ -22,16 +26,22 @@ class WorkspacePage extends StatefulWidget {
 
 class _WorkspacePageState extends State<WorkspacePage> {
   final Workspace _workspace = Workspace();
+  StreamSubscription? _settingsSub;
+  SettingsState? _settings = SettingsState.latestRustSignal?.message;
 
   @override
   void initState() {
     super.initState();
     _workspace.openTab(widget.initial);
     _workspace.addListener(_onWorkspaceChanged);
+    _settingsSub = SettingsState.rustSignalStream.listen((pack) {
+      if (mounted) setState(() => _settings = pack.message);
+    });
   }
 
   @override
   void dispose() {
+    _settingsSub?.cancel();
     _workspace.removeListener(_onWorkspaceChanged);
     _workspace.dispose();
     super.dispose();
@@ -46,7 +56,8 @@ class _WorkspacePageState extends State<WorkspacePage> {
     setState(() {});
   }
 
-  int get _connectedCount => _workspace.panes.where((pane) => pane.controller.connected).length;
+  int get _connectedCount =>
+      _workspace.panes.where((pane) => pane.controller.connected).length;
 
   // ── 标签与分屏 ──
 
@@ -60,7 +71,10 @@ class _WorkspacePageState extends State<WorkspacePage> {
   Future<void> _split(Axis axis) async {
     final pane = _workspace.activePane;
     if (pane == null) return;
-    final target = await pickConnection(context, current: pane.controller.target);
+    final target = await pickConnection(
+      context,
+      current: pane.controller.target,
+    );
     if (target != null && mounted && _workspace.panes.contains(pane)) {
       _focus(_workspace.split(pane, axis, target));
     }
@@ -69,7 +83,9 @@ class _WorkspacePageState extends State<WorkspacePage> {
   /// 新窗格布局完成后接过键盘焦点（软键盘开着时跟过去）。
   void _focus(WorkspacePane pane) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _workspace.panes.contains(pane)) pane.controller.focusNode.requestFocus();
+      if (mounted && _workspace.panes.contains(pane)) {
+        pane.controller.focusNode.requestFocus();
+      }
     });
   }
 
@@ -86,7 +102,9 @@ class _WorkspacePageState extends State<WorkspacePage> {
   }
 
   Future<void> _closeTab(WorkspaceTab tab) async {
-    final connected = tab.panes.where((pane) => pane.controller.connected).length;
+    final connected = tab.panes
+        .where((pane) => pane.controller.connected)
+        .length;
     if (connected > 0) {
       final confirmed = await _confirm(
         connected == 1 ? '断开这个标签里的会话？' : '断开这个标签里的 $connected 个会话？',
@@ -116,12 +134,32 @@ class _WorkspacePageState extends State<WorkspacePage> {
       builder: (context) => AlertDialog(
         title: Text(title),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: Text(action)),
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(action),
+          ),
         ],
       ),
     );
     return confirmed == true;
+  }
+
+  Future<void> _editKeyBar() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => KeyBarEditor(
+          initialRows: _settings?.keyBarRows ?? defaultKeyBarRows,
+          onSave: saveKeyBarLayout,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    final pane = _workspace.activePane;
+    if (pane != null) _focus(pane);
   }
 
   // ── 硬件键盘快捷键 ──
@@ -130,10 +168,20 @@ class _WorkspacePageState extends State<WorkspacePage> {
   /// ⌘⇧[ / ⌘⇧] 前后标签、⌘[ / ⌘] 前后窗格。其余按键照常交给终端。
   KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
     final keyboard = HardwareKeyboard.instance;
-    if (event is! KeyDownEvent || !keyboard.isMetaPressed) return KeyEventResult.ignored;
+    if (_workspace.activePane?.controller.zoom?.handleKey(
+          event,
+          meta: keyboard.isMetaPressed,
+        ) ??
+        false) {
+      return KeyEventResult.handled;
+    }
+    if (event is! KeyDownEvent || !keyboard.isMetaPressed) {
+      return KeyEventResult.ignored;
+    }
     final key = event.logicalKey;
     final shift = keyboard.isShiftPressed;
-    void run(void Function() action) => WidgetsBinding.instance.addPostFrameCallback((_) {
+    void run(void Function() action) =>
+        WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) action();
         });
     if (key == LogicalKeyboardKey.keyT) {
@@ -143,7 +191,8 @@ class _WorkspacePageState extends State<WorkspacePage> {
       if (pane != null) run(() => _closePane(pane));
     } else if (key == LogicalKeyboardKey.keyD) {
       run(() => _split(shift ? Axis.vertical : Axis.horizontal));
-    } else if (key == LogicalKeyboardKey.bracketLeft || key == LogicalKeyboardKey.bracketRight) {
+    } else if (key == LogicalKeyboardKey.bracketLeft ||
+        key == LogicalKeyboardKey.bracketRight) {
       final step = key == LogicalKeyboardKey.bracketRight ? 1 : -1;
       if (shift) {
         final count = _workspace.tabs.length;
@@ -211,12 +260,16 @@ class _WorkspacePageState extends State<WorkspacePage> {
                     index: _workspace.activeIndex,
                     children: [
                       for (final tab in _workspace.tabs)
-                        _buildNode(tab.root, tab, multiple: tab.root is PaneSplit),
+                        _buildNode(
+                          tab.root,
+                          tab,
+                          multiple: tab.root is PaneSplit,
+                        ),
                     ],
                   ),
                 ),
               ),
-              if (active != null && (SettingsState.latestRustSignal?.message.showKeyBar ?? true))
+              if (active != null && (_settings?.showKeyBar ?? true))
                 TerminalKeyBar(
                   key: ObjectKey(active),
                   terminal: active.controller.terminal,
@@ -226,6 +279,11 @@ class _WorkspacePageState extends State<WorkspacePage> {
                   onPaste: active.controller.paste,
                   onToggleKeyboard: active.controller.toggleKeyboard,
                   onDisconnect: () => _closePane(active),
+                  rows: _settings?.keyBarRows ?? defaultKeyBarRows,
+                  onEdit: _editKeyBar,
+                  onZoomIn: () => active.controller.zoom?.step(1),
+                  onZoomOut: () => active.controller.zoom?.step(-1),
+                  onZoomReset: () => active.controller.zoom?.reset(),
                 ),
             ],
           ),
@@ -237,20 +295,20 @@ class _WorkspacePageState extends State<WorkspacePage> {
   Widget _buildNode(PaneNode node, WorkspaceTab tab, {required bool multiple}) {
     return switch (node) {
       PaneLeaf(:final pane) => TerminalPane(
-          key: pane.key,
-          controller: pane.controller,
-          highlighted: multiple && tab.active == pane,
-          onActivate: () => _workspace.activate(pane),
-          onClose: () => _workspace.close(pane),
-          onKeyEvent: _onKeyEvent,
-        ),
+        key: pane.key,
+        controller: pane.controller,
+        highlighted: multiple && tab.active == pane,
+        onActivate: () => _workspace.activate(pane),
+        onClose: () => _workspace.close(pane),
+        onKeyEvent: _onKeyEvent,
+      ),
       PaneSplit(:final axis, :final layout) => MultiSplitView(
-          key: ObjectKey(node),
-          axis: axis,
-          controller: layout,
-          builder: (context, area) =>
-              _buildNode(area.data as PaneNode, tab, multiple: multiple),
-        ),
+        key: ObjectKey(node),
+        axis: axis,
+        controller: layout,
+        builder: (context, area) =>
+            _buildNode(area.data as PaneNode, tab, multiple: multiple),
+      ),
     };
   }
 }
@@ -358,7 +416,10 @@ class _TabChip extends StatelessWidget {
         decoration: BoxDecoration(
           color: selected ? Colors.black : null,
           border: Border(
-            top: BorderSide(color: selected ? selectedColor : Colors.transparent, width: 2),
+            top: BorderSide(
+              color: selected ? selectedColor : Colors.transparent,
+              width: 2,
+            ),
           ),
         ),
         child: Row(

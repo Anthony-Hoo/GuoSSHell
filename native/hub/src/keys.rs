@@ -218,7 +218,7 @@ impl KeyStore for KeychainKeyStore {
 }
 
 /// 应用偏好（上游设置里没有对应字段的），存在数据目录的 `preferences.json`。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Preferences {
     /// 私钥经 iCloud 钥匙串同步。默认关（PLAN §5 M3a）。
     #[serde(default)]
@@ -226,6 +226,9 @@ pub struct Preferences {
     /// 终端下方显示键位条；没设置过时按平台（见 `settings::default_show_key_bar`）。
     #[serde(default)]
     pub show_key_bar: Option<bool>,
+    /// 未配置时使用默认排布；空排与未配置有不同含义。
+    #[serde(default)]
+    pub key_bar_rows: Option<Vec<Vec<String>>>,
 }
 
 pub struct PreferenceFile {
@@ -246,16 +249,22 @@ impl PreferenceFile {
     }
 
     pub fn get(&self) -> Preferences {
-        *self.value.lock().unwrap_or_else(|error| error.into_inner())
+        self.value
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     /// 写临时文件再改名，不会留下半截文件。
-    pub fn set(&self, preferences: Preferences) -> Result<(), String> {
+    pub fn update(&self, change: impl FnOnce(&mut Preferences)) -> Result<(), String> {
+        let mut value = self.value.lock().unwrap_or_else(|error| error.into_inner());
+        let mut preferences = value.clone();
+        change(&mut preferences);
         let bytes = serde_json::to_vec_pretty(&preferences).map_err(|error| error.to_string())?;
         let temporary = self.path.with_extension("json.tmp");
         std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
         std::fs::rename(&temporary, &self.path).map_err(|error| error.to_string())?;
-        *self.value.lock().unwrap_or_else(|error| error.into_inner()) = preferences;
+        *value = preferences;
         Ok(())
     }
 }
@@ -612,8 +621,7 @@ fn remove(store: &dyn KeyStore, item: Item, id: &str) -> Result<(), KeyError> {
 /// 开关 iCloud 同步：私钥与口令整体搬到另一个存储——先全部写进目标，
 /// 有一项写不进就撤回已写的，全部成功后才删原处的。
 pub fn set_sync(context: &AppContext, enabled: bool) -> Result<(), KeyError> {
-    let mut preferences = context.preferences.get();
-    if preferences.sync_keys == enabled {
+    if context.preferences.get().sync_keys == enabled {
         return Ok(());
     }
     if enabled && !context.keys.sync_available() {
@@ -650,11 +658,13 @@ pub fn set_sync(context: &AppContext, enabled: bool) -> Result<(), KeyError> {
             .delete(*item, id, !enabled)
             .map_err(store_error(false))?;
     }
-    preferences.sync_keys = enabled;
-    context.preferences.set(preferences).map_err(|error| {
-        debug_print!("[keys] preferences: {error}");
-        KeyError::Keychain
-    })
+    context
+        .preferences
+        .update(|preferences| preferences.sync_keys = enabled)
+        .map_err(|error| {
+            debug_print!("[keys] preferences: {error}");
+            KeyError::Keychain
+        })
 }
 
 /// 连接用：读出私钥与存下的口令。

@@ -1,11 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:terminal_view/terminal_view.dart' show TerminalKey;
 
 import 'frame_terminal.dart';
+import 'key_bar_layout.dart';
 
-/// M2 键位条：双排固定布局。
+/// 可编辑的双排键位条。
 ///
 /// * 修饰键（Ctrl/Alt）：点按挂住一次、长按锁定、锁定后再点解除——
 ///   状态存于 [FrameTerminal]，软键盘的下一个按键同样带得上修饰键。
@@ -14,7 +14,7 @@ import 'frame_terminal.dart';
 /// * 复制/粘贴：动作键，不参与自动重复；复制键在无选区时置灰
 ///   （[canCopy] 由页面的 TerminalController 驱动，[extraListen] 带它重建）。
 /// * 断开：关掉活动窗格（连着时先确认）。
-/// 用户自定义排布留给设置体系（M3+）。
+/// 编辑入口始终保留，即使用户移除了所有按钮。
 class TerminalKeyBar extends StatefulWidget {
   final FrameTerminal terminal;
   final Listenable? extraListen;
@@ -23,6 +23,11 @@ class TerminalKeyBar extends StatefulWidget {
   final VoidCallback onPaste;
   final VoidCallback onToggleKeyboard;
   final VoidCallback onDisconnect;
+  final List<List<String>> rows;
+  final VoidCallback onEdit;
+  final VoidCallback onZoomIn;
+  final VoidCallback onZoomOut;
+  final VoidCallback onZoomReset;
 
   const TerminalKeyBar({
     super.key,
@@ -32,6 +37,11 @@ class TerminalKeyBar extends StatefulWidget {
     required this.onPaste,
     required this.onToggleKeyboard,
     required this.onDisconnect,
+    required this.rows,
+    required this.onEdit,
+    required this.onZoomIn,
+    required this.onZoomOut,
+    required this.onZoomReset,
     this.extraListen,
   });
 
@@ -40,17 +50,6 @@ class TerminalKeyBar extends StatefulWidget {
 }
 
 class _TerminalKeyBarState extends State<TerminalKeyBar> {
-  static const List<TerminalKey> _functionRow = [
-    TerminalKey.escape,
-    TerminalKey.tab,
-    TerminalKey.arrowUp,
-    TerminalKey.arrowDown,
-    TerminalKey.arrowLeft,
-    TerminalKey.arrowRight,
-  ];
-
-  static const List<String> _symbolRow = ['|', '/', '-', '~', '.'];
-
   /// 长按自动重复的间隔。长按的触发阈值不在这里写死——
   /// 用 GestureDetector 长按识别器的默认时长。
   static const Duration _keyRepeatInterval = Duration(milliseconds: 200);
@@ -93,6 +92,18 @@ class _TerminalKeyBarState extends State<TerminalKeyBar> {
   }
 
   @override
+  void didUpdateWidget(covariant TerminalKeyBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.rows != widget.rows ||
+        oldWidget.terminal != widget.terminal) {
+      _repeatTimer?.cancel();
+      _repeatTimer = null;
+      _pressedId = null;
+      _repeatingId = null;
+    }
+  }
+
+  @override
   void dispose() {
     _repeatTimer?.cancel();
     super.dispose();
@@ -107,54 +118,35 @@ class _TerminalKeyBarState extends State<TerminalKeyBar> {
         top: false,
         child: ListenableBuilder(
           listenable: Listenable.merge([widget.terminal, widget.extraListen]),
-          builder: (context, _) => Column(
-            mainAxisSize: MainAxisSize.min,
+          builder: (context, _) => Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _buildRow([
-                for (final key in _functionRow)
-                  _cap(
-                    context,
-                    scheme,
-                    'key:${key.name}',
-                    48,
-                    () => widget.terminal.keyInput(key),
-                    Text(_label(key), style: _capStyle(scheme)),
-                  ),
-                _modifierCap(context, scheme, 'ctrl', 'Ctrl'),
-                _modifierCap(context, scheme, 'alt', 'Alt'),
-                _actionCap(context, scheme, '⌨', widget.onToggleKeyboard),
-                _cap(
-                  context,
-                  scheme,
-                  'key:backspace',
-                  40,
-                  () => widget.terminal.keyInput(TerminalKey.backspace),
-                  Text('⌫', style: _capStyle(scheme)),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final row in widget.rows)
+                      if (row.isNotEmpty)
+                        _buildRow([
+                          for (final id in row)
+                            if (keyBarButton(id) case final button?)
+                              _buttonCap(context, scheme, button),
+                        ]),
+                  ],
                 ),
-              ]),
-              _buildRow([
-                _actionCap(context, scheme, '断开', widget.onDisconnect),
-                _actionCap(
-                  context,
-                  scheme,
-                  '复制',
-                  widget.canCopy() ? widget.onCopy : null,
-                ),
-                _actionCap(context, scheme, '粘贴', widget.onPaste),
-                for (final char in _symbolRow)
-                  _cap(
-                    context,
-                    scheme,
-                    'sym:$char',
-                    40,
-                    () => widget.terminal.textInput(char),
-                    Text(
-                      char,
-                      style:
-                          _capStyle(scheme, fontFamily: 'Menlo', fontSize: 13),
-                    ),
-                  ),
-              ]),
+              ),
+              IconButton(
+                tooltip: '编辑功能按钮',
+                onPressed: () {
+                  _repeatTimer?.cancel();
+                  _repeatTimer = null;
+                  _pressedId = null;
+                  _repeatingId = null;
+                  widget.terminal.clearModifiers();
+                  widget.onEdit();
+                },
+                icon: const Icon(Icons.tune, size: 20),
+              ),
             ],
           ),
         ),
@@ -166,9 +158,11 @@ class _TerminalKeyBarState extends State<TerminalKeyBar> {
     ColorScheme scheme, {
     String? fontFamily,
     double fontSize = 12,
-  }) =>
-      TextStyle(
-          fontSize: fontSize, fontFamily: fontFamily, color: scheme.onSurface);
+  }) => TextStyle(
+    fontSize: fontSize,
+    fontFamily: fontFamily,
+    color: scheme.onSurface,
+  );
 
   /// Wrap 而不是 Row+Spacer：窄屏（iPhone 13 mini 级别）自动换行，
   /// 不会溢出；也不用把 Spacer 塞进 Padding（ParentData 会炸）。
@@ -231,7 +225,9 @@ class _TerminalKeyBarState extends State<TerminalKeyBar> {
         alignment: Alignment.center,
         decoration: BoxDecoration(
           border: Border.all(
-            color: enabled ? scheme.outline : scheme.outline.withValues(alpha: 0.4),
+            color: enabled
+                ? scheme.outline
+                : scheme.outline.withValues(alpha: 0.4),
           ),
           borderRadius: BorderRadius.circular(17),
         ),
@@ -239,22 +235,59 @@ class _TerminalKeyBarState extends State<TerminalKeyBar> {
           label,
           style: TextStyle(
             fontSize: 12,
-            color: enabled ? scheme.onSurface : scheme.onSurface.withValues(alpha: 0.4),
+            color: enabled
+                ? scheme.onSurface
+                : scheme.onSurface.withValues(alpha: 0.4),
           ),
         ),
       ),
     );
   }
 
-  String _label(TerminalKey key) => switch (key) {
-        TerminalKey.escape => 'Esc',
-        TerminalKey.tab => 'Tab',
-        TerminalKey.arrowUp => '↑',
-        TerminalKey.arrowDown => '↓',
-        TerminalKey.arrowLeft => '←',
-        TerminalKey.arrowRight => '→',
-        _ => key.name,
-      };
+  Widget _buttonCap(
+    BuildContext context,
+    ColorScheme scheme,
+    KeyBarButton button,
+  ) {
+    if (button.id == 'ctrl' || button.id == 'alt') {
+      return _modifierCap(context, scheme, button.id, button.label);
+    }
+    final action = switch (button.id) {
+      'keyboard' => widget.onToggleKeyboard,
+      'disconnect' => widget.onDisconnect,
+      'copy' => widget.canCopy() ? widget.onCopy : null,
+      'paste' => widget.onPaste,
+      'zoomIn' => widget.onZoomIn,
+      'zoomOut' => widget.onZoomOut,
+      'zoomReset' => widget.onZoomReset,
+      _ => null,
+    };
+    if (button.key == null && button.text == null) {
+      return _actionCap(context, scheme, button.label, action);
+    }
+    return Tooltip(
+      message: button.label,
+      child: _cap(
+        context,
+        scheme,
+        button.id,
+        button.label.length > 4 ? 76 : 48,
+        () {
+          if (button.key case final key?) {
+            widget.terminal.keyInput(key, ctrl: button.ctrl);
+          } else {
+            widget.terminal.textInput(button.text!);
+          }
+        },
+        Text(
+          button.label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: _capStyle(scheme),
+        ),
+      ),
+    );
+  }
 
   /// 修饰键帽：点按循环（挂住 → 锁定 → 解除），长按直接锁定。
   /// 修饰键不参与自动重复。
@@ -280,8 +313,8 @@ class _TerminalKeyBarState extends State<TerminalKeyBar> {
           color: locked
               ? scheme.primary
               : latched
-                  ? scheme.primaryContainer
-                  : null,
+              ? scheme.primaryContainer
+              : null,
         ),
         child: Text(
           locked ? '$label 🔒' : label,

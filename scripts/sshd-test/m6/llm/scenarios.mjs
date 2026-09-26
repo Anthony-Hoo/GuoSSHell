@@ -9,13 +9,15 @@ import { demoFile, estimateTokens, makeText } from "./text.mjs";
 
 /**
  * 速率档：aimock 的 tps 是「每秒块数」，每块 chunkSize 个字符；1 token 约 4 个字符。
- * fast ≈ 2000 token/s，burst ≈ 8000 token/s。
+ * fast ≈ 2000 token/s，burst ≈ 8000 token/s，sub ≈ 250 token/s。
  */
 export const RATES = {
   aux: { chunkSize: 4096, tps: 1000, ttft: 20, jitter: 0 },
   normal: { chunkSize: 8, tps: 60, ttft: 300, jitter: 0.2 },
   fast: { chunkSize: 24, tps: 330, ttft: 250, jitter: 0.1 },
   burst: { chunkSize: 48, tps: 660, ttft: 200, jitter: 0.1 },
+  // subagent 的收尾：6 个并发各流约 8 秒，界面切换发生在它们还在刷新的时候。
+  sub: { chunkSize: 8, tps: 125, ttft: 200, jitter: 0.2 },
 };
 
 const SUBAGENTS = 6;
@@ -238,7 +240,7 @@ function subStep(step) {
   if (step < plan.length) {
     return { rate: "fast", say: { tokens: 300, style: "plain" }, calls: [plan[step]] };
   }
-  return { rate: "fast", say: { tokens: 1200, style: "markdown" }, done: true };
+  return { rate: "sub", say: { tokens: 2000, style: "markdown" }, done: true };
 }
 
 function usage(text) {

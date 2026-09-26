@@ -54,6 +54,11 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  # M6 验收：在模拟器 / macOS 上驱动真实 App（integration_test），flutter drive 收截图与报告。
+  integration_test:
+    sdk: flutter
+  flutter_driver:
+    sdk: flutter
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is

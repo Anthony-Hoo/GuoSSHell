@@ -25,7 +25,7 @@ def main() -> None:
     print("│ 名称   │ 状态       │")
     print("├────────┼────────────┤")
     print(f"│ 帧率   │ {GREEN}正常{RESET}       │")
-    print(f"│ render │ {RED}慢{RESET} 12 ms    │")
+    print(f"│ render │ {RED}慢{RESET} 12 ms   │")
     print("└────────┴────────────┘")
     print("M6-CJK-END")
 

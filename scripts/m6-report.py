@@ -99,12 +99,20 @@ def main() -> int:
                     + " |"
                 )
             out.append("")
+            for case, r in data["agents"].items():
+                perf = r.get("perf") if isinstance(r, dict) else None
+                if case.endswith("/long") and isinstance(perf, dict) and perf.get("windows"):
+                    out.append(
+                        f"- S4 长会话（{case}）：RSS {perf.get('rss_mb_first')} → {perf.get('rss_mb_last')} MB"
+                        f"（最高 {perf.get('rss_mb_max')}）"
+                    )
+            out.append("")
             panes = data["agents"].get("panes")
             if isinstance(panes, dict) and panes.get("echo_ms"):
                 busy = panes.get("busy_perf", {})
                 out += [
-                    f"- 多窗格：另一窗格 2000 行/秒输出时，本窗格回显 p95 {panes.get('echo_ms_p95')} ms"
-                    f"（样本 {panes.get('echo_ms')}）；输出窗格 fps {busy.get('fps', '-')}，"
+                    f"- 多窗格：shell 回显 p95 空闲时 {panes.get('echo_idle_ms_p95', '-')} ms，另一窗格 2000 行/秒输出时 "
+                    f"{panes.get('echo_ms_p95')} ms（样本 {panes.get('echo_ms')}）；输出窗格 fps {busy.get('fps', '-')}，"
                     f"延迟 p95 {ms(busy.get('latency_us_p95_max'))} ms，ACK 超时 {busy.get('ack_timeouts', '-')}",
                     "",
                 ]

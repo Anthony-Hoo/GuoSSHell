@@ -79,7 +79,9 @@ english_keyboard() {
   local udid="$1"
   local prefs="${HOME}/Library/Developer/CoreSimulator/Devices/${udid}/data/Library/Preferences/.GlobalPreferences.plist"
   local keyboard="en_US@sw=QWERTY;hw=Automatic"
-  if [ -f "${prefs}" ] && [ "$(plutil -extract AppleKeyboards json -o - "${prefs}" 2>/dev/null)" = "[\"${keyboard}\"]" ]; then
+  # 已经只有英文（系统开机后可能自己加回 emoji 键盘，不影响按键）就不动。
+  if [ -f "${prefs}" ] && plutil -extract AppleKeyboards json -o - "${prefs}" 2>/dev/null |
+    grep -Eq '^\["en_US@[^"]*"(,"emoji@[^"]*")?\]$'; then
     return
   fi
   xcrun simctl shutdown "${udid}" 2>/dev/null || true

@@ -45,9 +45,11 @@ void main() {
       await app.waitFor(() => tui.signature.any(app.screenText().contains), '$name 画出界面', timeout: const Duration(seconds: 15));
       expect(app.screenText(), isNot(contains('M6-BEFORE')), reason: '备用屏与主屏隔离');
 
-      // B2 运行：5 秒的度量（高刷新下的帧率与显示延迟）。
+      // B2 运行：6 秒的度量（高刷新下的帧率与显示延迟）。
+      await app.flushPerf();
       final mark = app.perfMark;
       await tester.pump(const Duration(seconds: 6));
+      await app.flushPerf();
       result['running'] = summarizePerf(app.perfSince(mark));
       await app.screenshot('tui-$name-running');
 

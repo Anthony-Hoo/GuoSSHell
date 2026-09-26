@@ -380,6 +380,10 @@ impl Screen {
                 self.flush(session_id)?;
             }
             SessionCommand::ScreenCheck => {
+                // 自检只在测试里用：顺带交出当前统计窗口（不等满 5 秒），几秒就结束的场景也有数据。
+                if let Some(perf) = self.stats.report(session_id) {
+                    perf.send_signal_to_dart();
+                }
                 if let Some((seq, frame)) = &self.last_sent {
                     screen_check(session_id, *seq, frame).send_signal_to_dart();
                 }
@@ -1214,10 +1218,18 @@ impl PerfWindow {
 
     /// 满 5 秒发一条汇总并重开窗口。
     fn maybe_report(&mut self, session_id: u32) -> Option<PerfStats> {
-        let elapsed = self.window_start.elapsed();
-        if elapsed < std::time::Duration::from_secs(5) || self.frames == 0 {
+        if self.window_start.elapsed() < std::time::Duration::from_secs(5) {
             return None;
         }
+        self.report(session_id)
+    }
+
+    /// 汇总当前窗口（有帧才发）并重开窗口。
+    fn report(&mut self, session_id: u32) -> Option<PerfStats> {
+        if self.frames == 0 {
+            return None;
+        }
+        let elapsed = self.window_start.elapsed();
         let frames = self.frames;
         self.latencies_us.sort_unstable();
         let percentile = |p: usize| -> u32 {

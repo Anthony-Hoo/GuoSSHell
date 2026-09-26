@@ -1,7 +1,8 @@
 // M6 A 类：coding agent 在 App 里跑剧本（docs/acceptance-m6-2026-09-26.md §3 A）。
 //
 // --dart-define=M6_AGENTS=claude,codex,opencode   跑哪些 agent（默认全部）
-// --dart-define=M6_SCENARIOS=stream,burst,…       跑哪些场景（默认全部；inline- 前缀 = 行内模式）
+// --dart-define=M6_SCENARIOS=stream,burst,…       跑哪些场景（默认全部；inline- 前缀 = 行内模式；
+//                                                 给空值则只跑多窗格与 S5）
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
@@ -26,8 +27,8 @@ void main() {
   // 截图也存在 reportData 里（screenshots）：合并，不覆盖。
   tearDownAll(() => binding.reportData = {...?binding.reportData, 'agents': report});
 
-  for (final agent in _agents.split(',')) {
-    for (final entry in _scenarios.split(',')) {
+  for (final agent in _agents.split(',').where((a) => a.isNotEmpty)) {
+    for (final entry in _scenarios.split(',').where((e) => e.isNotEmpty)) {
       final inline = entry.startsWith('inline-');
       final scenario = inline ? entry.substring('inline-'.length) : entry;
       testWidgets('A：$agent × $entry', (tester) async {
@@ -39,6 +40,7 @@ void main() {
         await app.type('clear\r');
         await app.waitIdle();
 
+        await app.flushPerf();
         final mark = app.perfMark;
         final started = DateTime.now();
         await app.type('m6-agent $agent $scenario${inline ? ' --inline' : ''}\r');
@@ -51,11 +53,7 @@ void main() {
             since: started,
           );
           await tester.pump(const Duration(milliseconds: 400));
-          const typed = 'zq6typ';
-          final echo = Stopwatch()..start();
-          await app.type(typed);
-          await app.waitScreen(typed, timeout: const Duration(seconds: 10));
-          result['typing_echo_ms'] = echo.elapsedMilliseconds;
+          result['typing_echo_ms'] = await app.echoMs('zq6typ');
         }
         if (scenario == 'subagents') {
           await app.waitForPlan(
@@ -70,10 +68,12 @@ void main() {
         await app.waitScreen('M6-DONE', timeout: Duration(seconds: scenario == 'long' ? 240 : 120));
         result['duration_ms'] = DateTime.now().difference(started).inMilliseconds;
         await app.waitIdle(quiet: const Duration(milliseconds: 1500));
+        // 自检顺带交出最后一个统计窗口，之后再汇总。
+        final problems = await app.screenMismatches();
+        await tester.pump(const Duration(milliseconds: 50));
         result['perf'] = summarizePerf(app.perfSince(mark));
         await app.screenshot('agent-$agent-$entry');
         final garbage = screenGarbage(app.screenText());
-        final problems = await app.screenMismatches();
         result['mismatches'] = problems;
         result['garbage'] = garbage;
 
@@ -106,9 +106,10 @@ void main() {
     // ⌘D 左右分屏，从选择器里再开一个同样的连接。
     app.pane.focusNode.requestFocus();
     await tester.pump(const Duration(milliseconds: 200));
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
-    await tester.sendKeyEvent(LogicalKeyboardKey.keyD);
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    // 物理键显式给出：profile 构建里按逻辑键反查物理键会失败（键名只在 debug 里有）。
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft, physicalKey: PhysicalKeyboardKey.metaLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyD, physicalKey: PhysicalKeyboardKey.keyD);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft, physicalKey: PhysicalKeyboardKey.metaLeft);
     await app.waitFor(() => find.textContaining('再开一个').evaluate().isNotEmpty, '连接选择器');
     await tester.tap(find.textContaining('再开一个'));
     await app.waitFor(() => app.panes.length == 2 && app.panes.every((p) => p.connected), '第二个窗格连上');
@@ -116,28 +117,36 @@ void main() {
     final quiet = app.panes[1];
     await app.waitScreen('probe@', pane: quiet);
 
-    // 左边：2000 行 / 秒的彩色输出，持续 20 秒。
+    // 右边先量一组不受干扰的回显作对照。
+    Future<List<int>> echoes(String prefix) async {
+      final samples = <int>[];
+      var typed = '';
+      for (var i = 0; i < 12; i++) {
+        typed += String.fromCharCode(0x61 + i);
+        samples.add(await app.echoMs(typed.substring(typed.length - 1), expect: '$prefix$typed', pane: quiet));
+        await tester.pump(const Duration(milliseconds: 300));
+      }
+      await app.type('\x15', pane: quiet); // Ctrl-U 清掉这一行
+      return samples..sort();
+    }
+
+    int p95(List<int> sorted) => sorted[(sorted.length * 95 ~/ 100).clamp(0, sorted.length - 1)];
+    await app.type('#', pane: quiet);
+    final idle = await echoes('#');
+    result['echo_idle_ms'] = idle;
+    result['echo_idle_ms_p95'] = p95(idle);
+
+    // 左边：2000 行 / 秒的彩色输出，持续 20 秒；右边逐个字符敲，量从送出到它出现在屏幕上。
+    await app.flushPerf(pane: busy);
     final mark = app.perfMark;
     await app.type('m6-flood 2000 20\r', pane: busy);
     await tester.pump(const Duration(seconds: 2));
-
-    // 右边：逐个字符敲，量从敲下到它出现在屏幕上。
-    final samples = <int>[];
-    var typed = '';
-    for (var i = 0; i < 12; i++) {
-      final ch = String.fromCharCode(0x61 + i);
-      typed += ch;
-      final watch = Stopwatch()..start();
-      await app.type(ch, pane: quiet);
-      await app.waitScreen('probe@', pane: quiet);
-      await app.waitFor(() => app.screenText(pane: quiet).contains(typed), '右窗格回显「$typed」', timeout: const Duration(seconds: 10));
-      samples.add(watch.elapsedMilliseconds);
-      await tester.pump(const Duration(milliseconds: 300));
-    }
-    samples.sort();
+    await app.type('#', pane: quiet);
+    final samples = await echoes('#');
     result['echo_ms'] = samples;
-    result['echo_ms_p95'] = samples[(samples.length * 95 ~/ 100).clamp(0, samples.length - 1)];
+    result['echo_ms_p95'] = p95(samples);
     await app.waitScreen('M6-FLOOD-DONE', pane: busy, timeout: const Duration(seconds: 60));
+    await app.flushPerf(pane: busy);
     result['busy_perf'] = summarizePerf(app.perfSince(mark, pane: busy));
     await app.screenshot('panes-flood');
     await app.dispose();
@@ -147,8 +156,10 @@ void main() {
     final app = M6App(tester, binding);
     await app.open();
     await app.waitScreen('probe@');
-    await app.type("clear; timeout --foreground -s KILL 4 m6-agent codex burst; echo M6-AGENT-KILLED-\$?\r");
-    await app.waitScreen('M6-AGENT-KILLED-137', timeout: const Duration(seconds: 20));
+    // 杀的是 agent 本身（Codex 的原生进程）：只杀 npm 的启动器，原生进程会成孤儿接着跑。
+    await app.type("clear; (sleep 4; pkill -KILL -f 'codex-linux-.*\\[m6:burst\\]') & m6-agent codex burst; "
+        "echo M6-AGENT-KILLED-\$?\r");
+    await app.waitScreen('M6-AGENT-KILLED-', timeout: const Duration(seconds: 20));
     report['killed_left_alt_screen'] = app.pane.terminal.isUsingAltBuffer;
     await app.screenshot('agent-codex-killed');
     await app.type('reset; echo M6-RESET-DONE\r');

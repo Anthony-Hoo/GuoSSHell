@@ -107,6 +107,33 @@ class M6App {
     }
   }
 
+  /// 送出 [text]（直接交给终端的文本输入，不先 pump），量到屏幕上出现 [expect]（默认就是
+  /// [text]）的毫秒数；每帧查一次。
+  Future<int> echoMs(String text, {String? expect, TerminalPaneController? pane}) async {
+    final controller = pane ?? this.pane;
+    final target = expect ?? text;
+    final watch = Stopwatch()..start();
+    controller.terminal.textInput(text);
+    while (!screenText(pane: controller).contains(target)) {
+      if (watch.elapsed > const Duration(seconds: 10)) {
+        await screenshot('timeout-${DateTime.now().millisecondsSinceEpoch}');
+        throw TestFailure('等回显「$target」超时。${describe(pane: controller)}\n当前屏幕：\n${screenText(pane: controller)}');
+      }
+      await tester.pump(const Duration(milliseconds: 1));
+    }
+    return watch.elapsedMilliseconds;
+  }
+
+  /// 让 Rust 交出当前的统计窗口（画面一致性自检的请求顺带交出，不等满 5 秒）：
+  /// 量一段之前调一次丢掉旧窗口，量完再调一次收齐。
+  Future<void> flushPerf({TerminalPaneController? pane}) async {
+    final controller = pane ?? this.pane;
+    final reply = ScreenCheck.rustSignalStream.firstWhere((p) => p.message.sessionId == controller.sessionId);
+    ScreenCheckRequest(sessionId: controller.sessionId).sendSignalToRust();
+    await reply.timeout(const Duration(seconds: 10));
+    await tester.pump(const Duration(milliseconds: 50));
+  }
+
   /// 在窗格里敲一段文本（经 App 的文本输入通道，等同软键盘提交）；`\r` 即回车。
   Future<void> type(String text, {TerminalPaneController? pane}) async {
     (pane ?? this.pane).terminal.textInput(text);
@@ -353,6 +380,8 @@ Map<String, Object> summarizePerf(List<PerfRecord> records) {
     'flutter_frames': sumOf((r) => r.flutterFrames),
     'input_bytes': sumOf((r) => r.inputBytes),
     'rss_mb_max': maxOf((r) => r.rssBytes ~/ (1 << 20)),
+    'rss_mb_first': records.first.rssBytes ~/ (1 << 20),
+    'rss_mb_last': records.last.rssBytes ~/ (1 << 20),
   };
 }
 

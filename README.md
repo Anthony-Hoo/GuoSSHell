@@ -29,7 +29,7 @@ GuoSSHell/
 │   └── examples/        m0.rs · m0_loopback.rs · bench_frame.rs · demo_server.rs
 ├── Cargo.toml           根 workspace（members = native/*, rust）+ release profile
 ├── ios/                 Flutter 的 iOS 宿主（Runner；PrivacyInfo.xcprivacy）
-│   └── RunnerUITests/   XCUITest：iPad 硬件键盘与指针事件、真实旋转（M6）
+│   └── RunnerUITests/   XCUITest：iPad 键鼠、后台恢复与真实旋转；真机使用 profile（M6）
 ├── macos/               Flutter 的 macOS 宿主（沙箱 entitlements）
 ├── integration_test/    M6 集成测试：终端协议、全屏 TUI、coding agent（m6_harness.dart 是公共部分）
 ├── test_driver/         flutter drive 的驱动：截图与报告写进 build/m6/
@@ -39,7 +39,7 @@ GuoSSHell/
     ├── setup.sh         幂等环境准备
     ├── sshd-test.sh     本地验收 SSH 服务器（Docker：vim / htop / 主机密钥变更 / 私钥与安全密钥授权）
     ├── sshd-test/m6/    M6 验收服务器的内容：假 AI 上游（aimock + 剧本）、m6-* 辅助程序、agent 配置
-    ├── m6.sh            M6 编排：模拟器矩阵、集成测试、XCUITest、macOS profile、报告汇总
+    ├── m6.sh            M6 编排：模拟器矩阵、真机、集成测试、XCUITest、macOS profile、报告汇总
     ├── m6-report.py     把 M6 的测试报告汇总成 markdown
     ├── m1bar.sh         60Hz 帧率自检进度条
     └── licenses.sh      重新生成许可页里的 Rust 依赖许可
@@ -83,6 +83,11 @@ flutter run -d <模拟器id 或 macos> \
 # 同名的进程环境变量也认（没有 --dart-define 时）：XCUITest 的 launchEnvironment、
 # simctl launch 的 SIMCTL_CHILD_GUOSH_* 都走这条。
 ```
+
+## 真机验收
+
+真机的覆盖、结果、限制与复测命令见 [真机 E2E 补充验收](docs/acceptance-device-2026-09-27.md)。
+签名覆盖、设备标识与测试地址只保存在本机；日志、截图和报告位于 `build/m6/`。
 
 ## 上游与许可
 

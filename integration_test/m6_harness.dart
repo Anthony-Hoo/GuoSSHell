@@ -1,4 +1,4 @@
-// M6 集成测试的公共部分（docs/acceptance-m6-2026-09-26.md §2.6）：在模拟器 / macOS 上驱动
+// M6 集成测试的公共部分（docs/acceptance-m6-2026-09-26.md §2.6）：在真机 / 模拟器 / macOS 上驱动
 // 真实 App，连验收服务器（scripts/sshd-test.sh up），读 App 自己的终端缓冲断言。
 //
 // 由 scripts/m6.sh 经 flutter drive 运行；--dart-define：
@@ -24,9 +24,15 @@ import 'package:terminal_view/terminal_view.dart' show BufferLine, TerminalKey;
 const m6Host = String.fromEnvironment('M6_HOST', defaultValue: '127.0.0.1');
 const m6Port = int.fromEnvironment('M6_PORT', defaultValue: 2223);
 const m6Device = String.fromEnvironment('M6_DEVICE', defaultValue: 'device');
+// iOS 测试插件会保留截图原图；内存与卡顿门槛用关闭截图的独立轮次判定。
+const m6CaptureScreenshots = bool.fromEnvironment('M6_SCREENSHOTS', defaultValue: true);
 
-/// 验收服务器上假 AI 上游的端口（映射到本机回环，见 scripts/sshd-test.sh）。
+/// 验收服务器上假 AI 上游的地址；默认与 SSH 使用同一主机，真机可以访问局域网测试台。
+const m6LlmHost = String.fromEnvironment('M6_LLM_HOST', defaultValue: m6Host);
 const m6LlmPort = int.fromEnvironment('M6_LLM_PORT', defaultValue: 2224);
+
+Uri m6Api(String path, {Map<String, String>? query}) =>
+    Uri(scheme: 'http', host: m6LlmHost, port: m6LlmPort, path: path, queryParameters: query);
 
 bool _rustStarted = false;
 
@@ -84,6 +90,7 @@ class M6App {
   /// 等窗格连上；路上遇到主机密钥确认就替用户点掉。
   Future<TerminalPaneController> waitConnected({TerminalPaneController? of}) async {
     final deadline = DateTime.now().add(const Duration(seconds: 60));
+    var retries = 0;
     while (true) {
       await tester.pump(const Duration(milliseconds: 100));
       if (find.text('信任并连接').evaluate().isNotEmpty) {
@@ -96,6 +103,14 @@ class M6App {
         await tester.pump(const Duration(milliseconds: 300));
         final replace = find.text('替换旧密钥并连接');
         if (replace.evaluate().isNotEmpty) await tester.tap(replace.first);
+        continue;
+      }
+      // 首次局域网授权完成后，系统可能已让原来的连接失败；从界面重新发起连接。
+      final retry = find.text('重试');
+      if (retry.evaluate().isNotEmpty && retries < 3) {
+        retries++;
+        await tester.tap(retry.first);
+        await tester.pump(const Duration(milliseconds: 500));
         continue;
       }
       final panes = this.panes;
@@ -220,7 +235,7 @@ class M6App {
     try {
       while (true) {
         try {
-          final request = await client.getUrl(Uri.parse('http://127.0.0.1:$m6LlmPort/m6/plans?limit=200'));
+          final request = await client.getUrl(m6Api('/m6/plans', query: {'limit': '200'}));
           final response = await request.close();
           final plans = jsonDecode(await response.transform(utf8.decoder).join()) as List<dynamic>;
           final hit = plans.cast<Map<String, dynamic>>().any(
@@ -298,6 +313,9 @@ class M6App {
   /// 截图（flutter drive 的驱动端落盘到 build/m6/screenshots/<设备>/）。平台不支持截图时
   /// （macOS 的 integration_test）跳过，不影响断言。
   Future<void> screenshot(String name) async {
+    binding.reportData ??= <String, dynamic>{};
+    binding.reportData!['capture_screenshots'] = m6CaptureScreenshots;
+    if (!m6CaptureScreenshots) return;
     await tester.pump();
     try {
       await binding.takeScreenshot('$m6Device/$name');
@@ -325,7 +343,7 @@ class M6App {
 Future<void> resetInput() async {
   final client = HttpClient();
   try {
-    final request = await client.postUrl(Uri.parse('http://127.0.0.1:$m6LlmPort/m6/input/reset'));
+    final request = await client.postUrl(m6Api('/m6/input/reset'));
     await (await request.close()).drain<void>();
   } finally {
     client.close(force: true);
@@ -336,7 +354,7 @@ Future<void> resetInput() async {
 Future<List<int>> inputBytes() async {
   final client = HttpClient();
   try {
-    final request = await client.getUrl(Uri.parse('http://127.0.0.1:$m6LlmPort/m6/input'));
+    final request = await client.getUrl(m6Api('/m6/input'));
     final body = await (await request.close()).transform(utf8.decoder).join();
     final bytes = <int>[];
     for (final line in const LineSplitter().convert(body)) {

@@ -252,13 +252,13 @@ D1 与 D7 逐键合成（终端的文本输入不在无障碍树里，XCUITest �
 
 ## 6. 范围排除与限制
 
-- 真机：本机没有设备，§7 列给你验；
+- 真机补充结果见 [真机 E2E 补充验收](acceptance-device-2026-09-27.md)，未覆盖部分保留在 §7；
 - 模拟器只能跑 debug 构建，性能门槛在 macOS profile 与真机上判；
 - agent 自身的 bug 不修，只记录终端这一侧的问题；
 - nvtop 用假 NVML，网速监控只看容器内回环流量；
 - 假上游不模拟真实模型的行为，只模拟输出的节奏与形态。
 
-## 7. 真机清单（你来验）
+## 7. 真机清单（状态见补充验收）
 
 1. **性能**（profile 构建，`flutter run --profile`）：iPhone 与 iPad 上各跑三个 agent 的 `burst` 与
    `subagents`、btop，看日志里的 `[m6-perf]`；ProMotion 设备看出帧能否到 120 Hz；

@@ -7,8 +7,46 @@
 // 前提：./scripts/sshd-test.sh up。运行：./scripts/m6.sh ui <设备>
 import XCTest
 
+/// Xcode 将 TEST_RUNNER_M6_* 环境变量传给测试进程；设备地址不写进代码。
+private enum M6Configuration {
+    static let environment = ProcessInfo.processInfo.environment
+    static let host = environment["M6_HOST"] ?? "127.0.0.1"
+    static let port = environment["M6_PORT"] ?? "2223"
+    static var server: URL {
+        var url = URLComponents()
+        url.scheme = "http"
+        let apiHost = environment["M6_LLM_HOST"] ?? host
+        url.host = apiHost.contains(":") && !apiHost.hasPrefix("[") ? "[\(apiHost)]" : apiHost
+        url.port = Int(environment["M6_LLM_PORT"] ?? "2224")
+        return url.url!
+    }
+
+    static func launchEnvironment(command: String) -> [String: String] {
+        ["GUOSH_HOST": host, "GUOSH_PORT": port, "GUOSH_USER": "probe",
+         "GUOSH_PASS": "probe", "GUOSH_CMD": command]
+    }
+}
+
+/// 只确认验收 App 和测试进程访问局域网所需的系统提示。
+private func allowLocalNetworkIfAsked() {
+    let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+    let alert = springboard.alerts.firstMatch
+    guard alert.exists else { return }
+    let networkText = alert.staticTexts.matching(NSPredicate(
+        format: "label CONTAINS %@ OR label CONTAINS[c] %@", "本地网络", "local network"
+    )).firstMatch
+    let testAppText = alert.staticTexts.matching(NSPredicate(
+        format: "label CONTAINS[c] %@ OR label CONTAINS[c] %@", "GuoSSHell", "RunnerUITests"
+    )).firstMatch
+    guard networkText.exists && testAppText.exists else { return }
+    for label in ["允许", "Allow"] where alert.buttons[label].exists {
+        alert.buttons[label].tap()
+        return
+    }
+}
+
 final class KeyboardMouseUITests: XCTestCase {
-    private let server = URL(string: "http://127.0.0.1:2224")!
+    private let server = M6Configuration.server
     private var app: XCUIApplication!
 
     override func setUpWithError() throws {
@@ -25,6 +63,7 @@ final class KeyboardMouseUITests: XCTestCase {
 
     func testHardwareKeyboard() throws {
         try launch(modes: "")
+        try ensureAsciiInput()
 
         // D1 可打印字符（含 Shift 大小写）与空格。
         try expectBytes("aZ09-=[];',./ ".utf8.map { $0 }) { typeKeys("aZ09-=[];',./ ") }
@@ -65,10 +104,28 @@ final class KeyboardMouseUITests: XCTestCase {
 
     // MARK: - D8–D12 鼠标 / 触控板
 
+    /// 真机生命周期：切到主屏幕后返回，原 SSH 会话仍能接收控制字符。
+    func testSessionSurvivesBackground() throws {
+        try launch(modes: "")
+        XCUIDevice.shared.press(.home)
+        let backgrounded = app.wait(for: .runningBackground, timeout: 10)
+            || app.state == .runningBackgroundSuspended
+        XCTAssertTrue(backgrounded, "App 应进入后台")
+        Thread.sleep(forTimeInterval: 5)
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10), "App 应回到前台")
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2)).tap()
+        try expectBytes([0x0d], "后台恢复") { app.typeKey("m", modifierFlags: .control) }
+        let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screenshot.name = "后台恢复"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
     func testPointerClicksDragsAndWheel() throws {
         try launch(modes: "mouse drag")
-        let center = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-        let lower = app.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.62))
+        let center = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2))
+        let lower = app.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.28))
 
         // D8 单击、右键、双击：SGR 按下 / 松开（按钮 0 左、2 右）。
         var events = try mouseEvents { center.click() }
@@ -107,14 +164,7 @@ final class KeyboardMouseUITests: XCTestCase {
     /// 再用探测键等回显程序就绪。
     private func launch(modes: String) throws {
         app = XCUIApplication()
-        app.launchEnvironment = [
-            "GUOSH_HOST": "127.0.0.1",
-            "GUOSH_PORT": "2223",
-            "GUOSH_USER": "probe",
-            "GUOSH_PASS": "probe",
-            "GUOSH_CMD": "m6-keyecho \(modes) --seconds 900",
-        ]
-        app.launch()
+        app.launchM6(command: "m6-keyecho \(modes) --seconds 900")
         guard app.waitConnected() else {
             XCTFail("App 没连上验收服务器")
             throw XCTSkip("未连接")
@@ -124,7 +174,7 @@ final class KeyboardMouseUITests: XCTestCase {
         repeat {
             app.acceptHostKeyIfAsked()
             try resetLog()
-            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2)).tap()
             app.typeKey("~", modifierFlags: [])
             Thread.sleep(forTimeInterval: 1.0)
             if try readLog().contains(0x7e) {
@@ -134,6 +184,22 @@ final class KeyboardMouseUITests: XCTestCase {
         } while Date() < deadline
         XCTFail("m6-keyecho 没有就绪")
         throw XCTSkip("回显程序未就绪")
+    }
+
+    /// 字节断言需要英文输入；用回显核对，并通过系统切换键切换输入法，不修改键盘配置。
+    private func ensureAsciiInput() throws {
+        for _ in 0..<4 {
+            try resetLog()
+            app.typeKey("a", modifierFlags: [])
+            Thread.sleep(forTimeInterval: 0.4)
+            if try readLog() == [0x61] {
+                try resetLog()
+                return
+            }
+            app.typeKey(" ", modifierFlags: .control)
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        throw XCTSkip("系统输入法没有进入英文，原始按键字节断言需要英文输入法")
     }
 
     /// 逐键敲出 [text]（大写字母带 Shift）。终端的文本输入不在无障碍树里，XCUITest 的 typeText
@@ -212,7 +278,10 @@ final class KeyboardMouseUITests: XCTestCase {
             result = error.map { .failure($0) } ?? .success(data ?? Data())
             done.signal()
         }.resume()
-        _ = done.wait(timeout: .now() + 10)
+        let deadline = Date().addingTimeInterval(10)
+        while done.wait(timeout: .now() + 0.2) == .timedOut && Date() < deadline {
+            allowLocalNetworkIfAsked()
+        }
         return try result.get()
     }
 
@@ -235,15 +304,8 @@ private struct MouseEvent: CustomStringConvertible {
 final class RotationUITests: XCTestCase {
     func testFullScreenTUIAcrossRotations() throws {
         let app = XCUIApplication()
-        app.launchEnvironment = [
-            "GUOSH_HOST": "127.0.0.1",
-            "GUOSH_PORT": "2223",
-            "GUOSH_USER": "probe",
-            "GUOSH_PASS": "probe",
-            "GUOSH_CMD": "m6-tui btop",
-        ]
         XCUIDevice.shared.orientation = .portrait
-        app.launch()
+        app.launchM6(command: "m6-tui btop")
         XCTAssertTrue(app.waitConnected(), "App 没连上验收服务器")
         Thread.sleep(forTimeInterval: 6)
         attach("竖屏")
@@ -265,6 +327,35 @@ final class RotationUITests: XCTestCase {
 }
 
 extension XCUIApplication {
+    /// 真机的 profile 构建走实际快速连接表单；模拟器保留 debug 自动连接。
+    func launchM6(command: String) {
+        launchEnvironment = M6Configuration.launchEnvironment(command: command)
+        launch()
+        guard M6Configuration.environment["M6_USE_FORM"] == "1" else { return }
+        let quick = buttons["快速连接"]
+        XCTAssertTrue(quick.waitForExistence(timeout: 20), "应显示连接列表")
+        quick.tap()
+        func fill(_ label: String, _ value: String) {
+            let predicate = NSPredicate(format: "label BEGINSWITH %@", label)
+            // Flutter 密码框聚焦时的无障碍类型会变化，按标签查找以保持定位稳定。
+            let field = descendants(matching: .any).matching(predicate).firstMatch
+            XCTAssertTrue(field.waitForExistence(timeout: 10), "应显示表单项：\(label)")
+            // 妙控键盘下，数字输入会弹出悬浮数字键盘；先关闭它，再切换到下一项。
+            let dismiss = otherElements["PopoverDismissRegion"]
+            if dismiss.exists { dismiss.tap() }
+            // Flutter 文本框有时被 AX 标为不可点击；用它的实际边界发送系统点按。
+            let previous = field.value as? String ?? ""
+            field.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: previous.count) + value)
+        }
+        fill("主机", M6Configuration.host)
+        fill("端口", M6Configuration.port)
+        fill("用户名", "probe")
+        fill("密码", "probe")
+        fill("命令", command)
+        buttons["连接"].tap()
+    }
+
     /// 首次连接或服务器换了主机密钥时 App 请用户确认——验收服务器是自己起的，照单信任。
     /// 点掉了对话框返回 true。
     @discardableResult
@@ -290,9 +381,17 @@ extension XCUIApplication {
         let tab = labeled("label CONTAINS %@", "probe@")
         let deadline = Date().addingTimeInterval(timeout)
         var settled = 0
+        var retries = 0
         repeat {
+            allowLocalNetworkIfAsked()
             if acceptHostKeyIfAsked() {
                 settled = 0
+            } else if buttons["重试"].exists {
+                settled = 0
+                if retries < 3 {
+                    retries += 1
+                    buttons["重试"].tap()
+                }
             } else if tab.exists && !connecting.exists {
                 settled += 1
                 if settled >= 6 { return true }

@@ -9,9 +9,13 @@
 #   ./scripts/m6.sh ui <设备>                   XCUITest：iPad 上系统合成的硬件键盘与指针事件（D 类），
 #                                               各设备上真实旋转下的全屏 TUI
 #   ./scripts/m6.sh macos <套件> [参数…]        macOS 的 profile 构建上跑（性能门槛在这里判）
+#   ./scripts/m6.sh device <套件> <udid> [参数…] 真机集成测试，默认 profile；M6_MODE=debug 可改为功能验证
+#   ./scripts/m6.sh ui-device <udid> [参数…]    真机 XCUITest，额外参数传给 xcodebuild
 #   ./scripts/m6.sh report                      汇总 build/m6/reports/*.json → build/m6/summary.md
 #
 # M6_REPORT=<名字> 改报告与日志的名字（默认 <套件>-<设备>）：只补跑一部分时不覆盖整套的结果。
+# 真机必填 M6_HOST；M6_PORT / M6_LLM_HOST / M6_LLM_PORT 指定测试台，M6_DEVICE 指定报告标签。
+# 本机签名覆盖放在不入库的 xcconfig，经 XCODE_XCCONFIG_FILE 指定。
 #
 # 设备：iphone-17-pro-max、iphone-17、ipad-pro-13、ipad-pro-11（iOS 模拟器，没有就按机型新建）。
 # 模拟器跑在主机上，主机忙时帧率与计时都会失真（PLAN 陷阱 36）：构建之后、测试之前等 1 分钟
@@ -29,6 +33,11 @@ export PATH
 
 DEVICES=(iphone-17-pro-max iphone-17 ipad-pro-13 ipad-pro-11)
 SUITES=(protocol tui agents)
+
+# 调试服务和验收服务器走直连，避免本机 HTTP 代理拦截回环与局域网请求。
+m6_no_proxy="${no_proxy:-${NO_PROXY:-}}"
+m6_no_proxy="${m6_no_proxy:+${m6_no_proxy},}localhost,127.0.0.1,::1,${M6_HOST:-127.0.0.1}"
+export no_proxy="${m6_no_proxy}" NO_PROXY="${m6_no_proxy}"
 
 usage() {
   sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -124,8 +133,8 @@ wait_for_load() {
 
 target_of() {
   case "$1" in
-    protocol | tui | agents) echo "integration_test/m6_$1_test.dart" ;;
-    *) echo "未知套件：$1（可选：${SUITES[*]}）" >&2; exit 2 ;;
+    protocol | tui | agents | performance | network) echo "integration_test/m6_$1_test.dart" ;;
+    *) echo "未知套件：$1（可选：protocol / tui / agents / performance / network）" >&2; exit 2 ;;
   esac
 }
 
@@ -211,6 +220,55 @@ case "${1:-}" in
       --dart-define=M6_DEVICE=macos "$@" >>"${log}" 2>&1 || status=$?
     grep -E 'All tests passed|Some tests failed|Failure in method' "${log}" | sed 's/^/   /' || true
     exit "${status:-0}"
+    ;;
+  device)
+    [ $# -ge 3 ] || usage
+    : "${M6_HOST:?真机测试需要 M6_HOST 指向设备可达的验收服务器}"
+    suite="$2"
+    udid="$3"
+    shift 3
+    target="$(target_of "${suite}")"
+    device="${M6_DEVICE:-physical-device}"
+    report="${M6_REPORT:-${suite}-${device}}"
+    mode="${M6_MODE:-profile}"
+    case "${mode}" in debug | profile) ;; *) echo "M6_MODE 只支持 debug 或 profile" >&2; exit 2 ;; esac
+    mkdir -p build/m6/logs
+    log="build/m6/logs/${report}.log"
+    echo "== ${suite} @ 真机（${mode}）→ ${log}"
+    status=0
+    M6_REPORT="${report}" flutter drive "--${mode}" -d "${udid}" \
+      --driver=test_driver/integration_test.dart --target="${target}" \
+      --dart-define=M6_DEVICE="${device}" --dart-define=M6_HOST="${M6_HOST}" \
+      --dart-define=M6_PORT="${M6_PORT:-2223}" \
+      --dart-define=M6_LLM_HOST="${M6_LLM_HOST:-${M6_HOST}}" \
+      --dart-define=M6_LLM_PORT="${M6_LLM_PORT:-2224}" \
+      "$@" >"${log}" 2>&1 || status=$?
+    grep -E 'All tests passed|Some tests failed|Failure in method|Error|Exception' "${log}" | tail -30 || true
+    exit "${status}"
+    ;;
+  ui-device)
+    [ $# -ge 2 ] || usage
+    : "${M6_HOST:?真机测试需要 M6_HOST 指向设备可达的验收服务器}"
+    udid="$2"
+    shift 2
+    device="${M6_DEVICE:-physical-device}"
+    report="${M6_REPORT:-ui-${device}}"
+    mkdir -p build/m6/logs
+    log="build/m6/logs/${report}.log"
+    result="build/m6/${report}-$(date +%Y%m%d-%H%M%S).xcresult"
+    echo "== UI @ 真机 → ${log} / ${result}"
+    flutter build ios --profile >"${log}" 2>&1
+    status=0
+    TEST_RUNNER_M6_USE_FORM=1 TEST_RUNNER_M6_HOST="${M6_HOST}" TEST_RUNNER_M6_PORT="${M6_PORT:-2223}" \
+      TEST_RUNNER_M6_LLM_HOST="${M6_LLM_HOST:-${M6_HOST}}" \
+      TEST_RUNNER_M6_LLM_PORT="${M6_LLM_PORT:-2224}" \
+      xcodebuild test -workspace ios/Runner.xcworkspace -scheme Runner -configuration Profile \
+      -destination "platform=iOS,id=${udid}" "-only-testing:${M6_UI_TESTS:-RunnerUITests}" \
+      -parallel-testing-enabled NO -collect-test-diagnostics never \
+      -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
+      -resultBundlePath "${result}" "BUILD_DIR=${ROOT}/build/ios" "$@" >>"${log}" 2>&1 || status=$?
+    grep -E "Test Case .*(passed|failed)|error: -\\[|XCTAssert|Executed|error:" "${log}" | tail -40 || true
+    exit "${status}"
     ;;
   report)
     python3 "${HERE}/m6-report.py" build/m6/reports > build/m6/summary.md

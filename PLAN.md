@@ -15,6 +15,7 @@
   - `docs/feasibility-2026-09-14.html`（可行性：alacritty 四层判定、rinf 事实纠正）
   - `docs/mvp-plan-2026-09-14.html`（里程碑与 M0 交接单）
   - `docs/acceptance-m6-2026-09-26.md`（M6 验收计划：coding agent、全屏 TUI、设备矩阵）
+  - `docs/acceptance-device-2026-09-27.md`（真机 E2E 结果、性能门槛与修饰键问题）
   - `rust/`（可运行的 M0 代码 + `bench_frame` 性能基准 + `UPSTREAM.md`）
 
 ---
@@ -1299,7 +1300,7 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
 - [x] C：四台模拟器上三套集成测试与真实旋转
 - [x] D：iPad 键盘与鼠标 D1–D12（XCUITest 合成事件 + Flutter 层注入）
 - [x] E：终端协议 E1–E4；待定的几项记 followup（XTVERSION、颜色查询、kitty 键盘、OSC 52、焦点上报）
-- [ ] 真机（你来验，验收文档 §7；含没有自动化的 agent 手动部分）
+- [ ] 真机：38 个集成场景、后台恢复、系统旋转及实体滚轮已通过；实体修饰键与部分性能门槛未通过，见真机补充验收文档
 
 **关于提交**
 

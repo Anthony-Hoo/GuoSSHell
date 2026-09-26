@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:rinf/rinf.dart';
@@ -370,12 +371,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   double get _lineHeight => calcCharSize(_style, MediaQuery.textScalerOf(context)).height;
 
   /// 滚动位置 → 要显示的窗口。在底部就跟着屏幕；滚进滚回后要一段上下各多一屏的窗口，
-  /// 已有的窗口还盖得住可见区（各留半屏余量）就不重发。
+  /// 已有的窗口还盖得住可见区（各留半屏余量）就不重发。只有用户的滚动才离开底部：
+  /// 内容变矮后的回弹、尺寸变化的校正这些没人要的位移只会回到底部（回弹动画还瞄着旧的
+  /// 底部时输出继续增长，按位置判断就会误以为用户滚上去了，从此不再跟着屏幕）。
   void _onScroll() {
     if (!mounted || !_scroll.hasClients || _state != SessionState.connected) return;
     final position = _scroll.position;
     final lineHeight = _lineHeight;
     if (lineHeight <= 0 || !position.hasContentDimensions) return;
+    if (_followBottom && position.userScrollDirection == ScrollDirection.idle) return;
     if (position.pixels >= position.maxScrollExtent - lineHeight / 2) {
       if (!_followBottom) {
         _followBottom = true;

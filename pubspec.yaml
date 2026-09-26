@@ -43,7 +43,7 @@ dependencies:
   terminal_view:
     git:
       url: https://github.com/Anthony-Hoo/terminal_view.git
-      ref: "0e71e5247af414f2d9134f2f0b7c0be1f0dcbfc5"
+      ref: "f0a1e0d9a717311ab622581508bdbacdf65f19de"
   rinf: ^8.10.1
   path_provider: ^2.1.6
   url_launcher: ^6.3.2

@@ -14,6 +14,7 @@
 - 相关文档：
   - `docs/feasibility-2026-09-14.html`（可行性：alacritty 四层判定、rinf 事实纠正）
   - `docs/mvp-plan-2026-09-14.html`（里程碑与 M0 交接单）
+  - `docs/acceptance-m6-2026-09-26.md`（M6 验收计划：coding agent、全屏 TUI、设备矩阵）
   - `rust/`（可运行的 M0 代码 + `bench_frame` 性能基准 + `UPSTREAM.md`）
 
 ---
@@ -546,6 +547,30 @@ rinf 单向信号流、Flutter 只画不解析）本身就与平台无关。
 **先做哪一步的证据**：等 M1 在 iPad 上绿了，先只做一件事——
 `cargo check --target aarch64-linux-android` 配上 NDK，把 Rust 侧的不确定量消掉。
 Android 的 Flutter 侧产物在 M1 之后基本是免费的。
+
+### M6 — 兼容性与性能验收（coding agent / 全屏 TUI / 设备矩阵）—— 进行中（2026-09-26 立项）
+
+验收定义、测试台、用例与通过标准见 `docs/acceptance-m6-2026-09-26.md`，本节只放摘要。
+
+**要回答**：Claude Code、Codex CLI、opencode 在高速流式输出、连续工具调用、多个 subagent 并发与
+视图切换下，有没有性能问题与显示 bug；btop、nvtop、网速监控（nload / bmon / iftop）进出全屏有没有
+问题；iPhone 17 Pro Max、iPhone 17、iPad Pro 13 / 11 英寸上运行正常，iPad 的硬件键盘与鼠标 /
+触控板事件正常。
+
+**测试台**：验收服务器扩展为 M6 全套（Debian trixie；三个 agent 预置配置、指向容器内的假上游；
+全屏 TUI、nvtop 的假 GPU、回环流量、`m6-*` 辅助程序）。假 AI 上游复用 aimock（三种协议的流式应答与
+工具调用），我们只写剧本：按用户消息里的标记选场景、按工具调用 id 定轮次，subagent 靠派发时写进
+prompt 的标记识别。App 侧新增显示延迟、ACK 超时、Flutter 帧耗时、RSS 与画面一致性自检（引擎与 Dart
+逐列比对）。自动化用 Flutter integration_test（模拟器与 macOS）和 XCUITest（iPad 上系统合成的硬件
+键盘与指针事件），`scripts/m6.sh` 编排。
+
+**通过标准**（摘要）：macOS profile 构建上显示延迟 p95 ≤ 50 ms、max ≤ 250 ms、无 ACK 超时、卡顿帧
+≤ 1%；场景结束时画面一致性通过；全屏 TUI 进出的断言全过；iPad 键鼠每个事件远端收到的字节与期望一致。
+模拟器只有 debug 构建，只判功能与相对值；真机清单列给你。
+
+**立项时已确认的问题**（M6 当场修）：帧编码按「格」而不是「列」记位置（整行中文只画出一半、宽字符
+后的着色段错位）；同步输出（DEC 2026）没有超时（BSU 之后没有 ESU 画面就卡死）；硬件键盘快速连续
+输入时回车越过前面的字符。
 
 ---
 
@@ -1178,6 +1203,21 @@ flutter/Cargokit 全权负责。M0b 的 Xcode 工程建法在 git 历史的
 - [ ] 你来验：macOS 上的键盘与菜单（⌘C / ⌘V / ⌘A 在终端里、⌘T / ⌘W / ⌘D）、触控板滚动与选区、
       窗口缩放；CanoKey 经 USB 读卡登录；带团队签名的构建上 iCloud 钥匙串同步
       （followup「macOS 键盘菜单与签名构建待验」）
+
+**M6 —— 兼容性与性能验收 —— 进行中（2026-09-26 立项）**
+
+- [x] 立项：验收文档（用例、测试台、通过标准、真机清单）
+- [ ] 测试台：验收服务器（trixie、三个 agent、全屏 TUI、假 GPU、回环流量、`m6-*` 辅助程序）
+- [ ] 测试台：假上游剧本（aimock）
+- [ ] App：度量（显示延迟、ACK 超时、Flutter 帧耗时、RSS）与画面一致性自检
+- [ ] 自动化：integration_test、XCUITest、`scripts/m6.sh`
+- [ ] 修复：帧编码按列；同步输出超时（rsHell 补丁）；硬件键盘快速输入保序
+- [ ] A：三个 agent × S1–S7，多窗格
+- [ ] B：全屏 TUI B1–B5
+- [ ] C：四台模拟器
+- [ ] D：iPad 键盘与鼠标 D1–D12
+- [ ] E：终端协议 E1–E4
+- [ ] 真机（你来验，验收文档 §7）
 
 **关于提交**
 

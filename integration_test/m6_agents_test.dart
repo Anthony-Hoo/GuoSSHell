@@ -111,7 +111,12 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.keyD, physicalKey: PhysicalKeyboardKey.keyD);
     await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft, physicalKey: PhysicalKeyboardKey.metaLeft);
     await app.waitFor(() => find.textContaining('再开一个').evaluate().isNotEmpty, '连接选择器');
-    await tester.tap(find.textContaining('再开一个'));
+    // 等选择器弹出的动画走完再点；没点中（选择器还在）就再点。
+    for (var attempt = 0; attempt < 3 && find.textContaining('再开一个').evaluate().isNotEmpty; attempt++) {
+      await tester.pump(const Duration(milliseconds: 600));
+      await tester.tap(find.textContaining('再开一个'), warnIfMissed: false);
+      await tester.pump(const Duration(milliseconds: 600));
+    }
     await app.waitFor(() => app.panes.length == 2 && app.panes.every((p) => p.connected), '第二个窗格连上');
     final busy = app.panes[0];
     final quiet = app.panes[1];

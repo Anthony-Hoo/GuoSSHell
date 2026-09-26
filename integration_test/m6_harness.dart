@@ -108,13 +108,13 @@ class M6App {
   }
 
   /// 送出 [text]（直接交给终端的文本输入，不先 pump），量到屏幕上出现 [expect]（默认就是
-  /// [text]）的毫秒数；每帧查一次。
+  /// [text]）的毫秒数；每帧查一次。按软换行接回的逻辑行找（窄窗格里一行会折开）。
   Future<int> echoMs(String text, {String? expect, TerminalPaneController? pane}) async {
     final controller = pane ?? this.pane;
     final target = expect ?? text;
     final watch = Stopwatch()..start();
     controller.terminal.textInput(text);
-    while (!screenText(pane: controller).contains(target)) {
+    while (!logicalLines(pane: controller).any((line) => line.contains(target))) {
       if (watch.elapsed > const Duration(seconds: 10)) {
         await screenshot('timeout-${DateTime.now().millisecondsSinceEpoch}');
         throw TestFailure('等回显「$target」超时。${describe(pane: controller)}\n当前屏幕：\n${screenText(pane: controller)}');
@@ -391,8 +391,12 @@ List<String> screenGarbage(String screen) => [
       for (final m in RegExp(r'\[\?\d+[hl]|\]\d+;|\[\d+;\d+[Hr]').allMatches(screen).take(3)) '疑似转义序列泄漏：「${m.group(0)}」',
     ];
 
-/// 旋转 / 改窗口的替身：改视图的物理尺寸（框架层；真实旋转在 XCUITest 与 iPhone 上验）。
+/// 旋转 / 改窗口的替身：改视图的物理尺寸（框架层；真实旋转在 XCUITest 里验）。系统键盘与安全区
+/// 不跟着这个替身变——竖屏的软键盘还占着时宽高对调，工作区只剩几十像素，标签条与键位条放不下——
+/// 所以先收起软键盘。
 Future<void> resizeView(WidgetTester tester, Size logical) async {
+  FocusManager.instance.primaryFocus?.unfocus();
+  await tester.pump(const Duration(milliseconds: 600));
   final view = tester.view;
   view.physicalSize = logical * view.devicePixelRatio;
   await tester.pump(const Duration(milliseconds: 600));

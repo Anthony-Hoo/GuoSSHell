@@ -7,12 +7,12 @@ import 'package:integration_test/integration_test.dart';
 
 import 'm6_harness.dart';
 
-/// 程序 → 进入全屏后屏幕上必有的字样、退出按键。
+/// 程序 → 进入全屏后屏幕上必有的字样（含窗格小于程序最小尺寸时它自己的提示）、退出按键。
 const _tuis = <String, ({List<String> signature, List<String> quit})>{
   'btop': (signature: ['cpu', 'too small'], quit: ['q']),
   'nvtop': (signature: ['NVIDIA L40S'], quit: ['q']),
   'nload': (signature: ['Incoming'], quit: ['q']),
-  'bmon': (signature: ['Interfaces', 'lo'], quit: ['q', 'y']),
+  'bmon': (signature: ['Interfaces', 'at least 48 columns'], quit: ['q', 'y']),
   'iftop': (signature: ['TX:', 'RX:'], quit: ['q']),
   'htop': (signature: ['PID', 'Load average'], quit: ['q']),
 };
@@ -66,7 +66,9 @@ void main() {
       await restoreView(tester);
       await tester.pump(const Duration(seconds: 2));
 
-      // B4 退出：主屏原样回来，模式都复位，滚回里没有 TUI 画面。
+      // B4 退出：主屏原样回来，模式都复位，滚回里没有 TUI 画面。滚回只量退出这一段：窄屏上
+      // 改尺寸时主屏的长行会按新宽度重新折行、挤进滚回，那不是 TUI 的画面。
+      final heightBeforeQuit = app.pane.terminal.height;
       for (final key in tui.quit) {
         await app.type(key);
         await tester.pump(const Duration(milliseconds: 300));
@@ -77,7 +79,8 @@ void main() {
       final line = app.logicalLines().firstWhere((l) => l.contains('M6-MODES'));
       final modes = jsonDecode(line.substring(line.indexOf('{'))) as Map<String, dynamic>;
       result['modes_after'] = modes;
-      result['scrollback_growth'] = terminal.height - heightBefore;
+      result['scrollback_growth'] = terminal.height - heightBeforeQuit;
+      result['scrollback_growth_total'] = terminal.height - heightBefore;
       await app.screenshot('tui-$name-exited');
       expect(terminal.isUsingAltBuffer, isFalse);
       expect(app.screenText(), contains('M6-BEFORE $name'), reason: '进入前的画面要回来');
@@ -86,7 +89,7 @@ void main() {
         expect(modes[mouse], 2, reason: '鼠标上报 $mouse 应已关闭');
       }
       expect(modes['25'], 1, reason: '光标可见');
-      expect(terminal.height - heightBefore, lessThan(12), reason: 'TUI 的画面不该进滚回');
+      expect(terminal.height - heightBeforeQuit, lessThan(12), reason: 'TUI 的画面不该进滚回');
       final problems = await app.screenMismatches();
       expect(problems, isEmpty, reason: problems.join('\n'));
       expect(resized, isEmpty, reason: '改尺寸后：${resized.join('\n')}');

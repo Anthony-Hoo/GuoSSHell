@@ -122,6 +122,7 @@ final class KeyboardMouseUITests: XCTestCase {
         // XCUITest 每个动作前等 App 空闲，最多 60 秒；给就绪留出几轮的余量。
         let deadline = Date().addingTimeInterval(180)
         repeat {
+            app.acceptHostKeyIfAsked()
             try resetLog()
             app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
             app.typeKey("~", modifierFlags: [])
@@ -264,29 +265,46 @@ final class RotationUITests: XCTestCase {
 }
 
 extension XCUIApplication {
-    /// 等 App 连上验收服务器（终端标签在、「正在连接」的提示已消失）。首次连接或服务器换了主机
-    /// 密钥时 App 请用户确认——验收服务器是自己起的，照单信任。
-    func waitConnected(timeout: TimeInterval = 60) -> Bool {
-        func labeled(_ format: String, _ text: String) -> XCUIElement {
-            descendants(matching: .any).matching(NSPredicate(format: format, text)).firstMatch
-        }
+    /// 首次连接或服务器换了主机密钥时 App 请用户确认——验收服务器是自己起的，照单信任。
+    /// 点掉了对话框返回 true。
+    @discardableResult
+    func acceptHostKeyIfAsked() -> Bool {
         let trust = buttons["信任并连接"]
+        if trust.exists {
+            trust.tap()
+            return true
+        }
         let replace = buttons["替换旧密钥并连接"]
-        let verified = labeled("label CONTAINS %@", "核对新指纹")
+        if replace.exists {
+            labeled("label CONTAINS %@", "核对新指纹").tap()
+            replace.tap()
+            return true
+        }
+        return false
+    }
+
+    /// 等 App 连上验收服务器：连续 3 秒终端标签在、没有「正在连接」、没有确认对话框（刚启动时
+    /// 标签先于「正在连接」出现，只看一眼会误判）。
+    func waitConnected(timeout: TimeInterval = 60) -> Bool {
         let connecting = labeled("label BEGINSWITH %@", "正在连接")
         let tab = labeled("label CONTAINS %@", "probe@")
         let deadline = Date().addingTimeInterval(timeout)
+        var settled = 0
         repeat {
-            if trust.exists {
-                trust.tap()
-            } else if replace.exists {
-                verified.tap()
-                replace.tap()
+            if acceptHostKeyIfAsked() {
+                settled = 0
             } else if tab.exists && !connecting.exists {
-                return true
+                settled += 1
+                if settled >= 6 { return true }
+            } else {
+                settled = 0
             }
             Thread.sleep(forTimeInterval: 0.5)
         } while Date() < deadline
         return false
+    }
+
+    private func labeled(_ format: String, _ text: String) -> XCUIElement {
+        descendants(matching: .any).matching(NSPredicate(format: format, text)).firstMatch
     }
 }

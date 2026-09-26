@@ -11,6 +11,8 @@
 #   ./scripts/m6.sh macos <套件> [参数…]        macOS 的 profile 构建上跑（性能门槛在这里判）
 #   ./scripts/m6.sh report                      汇总 build/m6/reports/*.json → build/m6/summary.md
 #
+# M6_REPORT=<名字> 改报告与日志的名字（默认 <套件>-<设备>）：只补跑一部分时不覆盖整套的结果。
+#
 # 设备：iphone-17-pro-max、iphone-17、ipad-pro-13、ipad-pro-11（iOS 模拟器，没有就按机型新建）。
 # 模拟器跑在主机上，主机忙时帧率与计时都会失真（PLAN 陷阱 36）：构建之后、测试之前等 1 分钟
 # 负载降到 M6_LOAD_MAX（默认 CPU 核数 × 1.5）以下，最多等 M6_LOAD_WAIT 秒（默认 300）。
@@ -29,7 +31,7 @@ DEVICES=(iphone-17-pro-max iphone-17 ipad-pro-13 ipad-pro-11)
 SUITES=(protocol tui agents)
 
 usage() {
-  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -130,19 +132,19 @@ target_of() {
 run() {
   local suite="$1" device="$2"
   shift 2
-  local target udid
+  local target udid report="${M6_REPORT:-${suite}-${device}}"
   target="$(target_of "${suite}")"
   udid="$(udid_of "${device}")"
   boot "${udid}"
   mkdir -p build/m6/logs
-  local log="build/m6/logs/${suite}-${device}.log"
+  local log="build/m6/logs/${report}.log"
   echo "== ${suite} @ ${device}（${udid}）→ ${log}"
   # 先构建一次（构建会把负载拉满），负载降下来再 drive（它只剩增量构建与安装）。
   flutter build ios --simulator --debug -t "${target}" \
     --dart-define=M6_DEVICE="${device}" "$@" >"${log}" 2>&1
   wait_for_load 2>&1 | tee -a "${log}"
   local status=0
-  M6_REPORT="${suite}-${device}" flutter drive \
+  M6_REPORT="${report}" flutter drive \
     --driver=test_driver/integration_test.dart --target="${target}" -d "${udid}" \
     --dart-define=M6_DEVICE="${device}" "$@" >>"${log}" 2>&1 || status=$?
   grep -E 'All tests passed|Some tests failed|Failure in method' "${log}" | sed 's/^/   /' || true
@@ -198,12 +200,13 @@ case "${1:-}" in
     suite="$2"
     shift 2
     target="$(target_of "${suite}")"
+    report="${M6_REPORT:-${suite}-macos}"
     mkdir -p build/m6/logs
-    log="build/m6/logs/${suite}-macos.log"
+    log="build/m6/logs/${report}.log"
     echo "== ${suite} @ macOS（profile）→ ${log}"
     flutter build macos --profile -t "${target}" --dart-define=M6_DEVICE=macos "$@" >"${log}" 2>&1
     wait_for_load 2>&1 | tee -a "${log}"
-    M6_REPORT="${suite}-macos" flutter drive --profile -d macos \
+    M6_REPORT="${report}" flutter drive --profile -d macos \
       --driver=test_driver/integration_test.dart --target="${target}" \
       --dart-define=M6_DEVICE=macos "$@" >>"${log}" 2>&1 || status=$?
     grep -E 'All tests passed|Some tests failed|Failure in method' "${log}" | sed 's/^/   /' || true

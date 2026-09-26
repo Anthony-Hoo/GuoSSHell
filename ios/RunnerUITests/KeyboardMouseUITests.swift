@@ -1,9 +1,10 @@
 // M6 D 类：iPad 上系统合成的硬件键盘与指针事件（XCUITest 走 UIKit → Flutter 引擎的真实路径），
 // 远端 m6-keyecho 记下收到的每一段字节，经验收服务器的 /m6/input 核对
-// （docs/acceptance-m6-2026-09-26.md §3 D）。
+// （docs/acceptance-m6-2026-09-26.md §3 D）。XCUITest 在 iPad 模拟器上合成不出来的部分不在这里，
+// 由集成测试从 Flutter 的事件注入（m6_protocol_test.dart）：回车、退格、Esc、Home / End、翻页、
+// 向前删除到不了 App，F1–F12 到达时错一位（F2 成了 F1），悬停不产生任何指针事件。
 //
-// 前提：./scripts/sshd-test.sh up；同一台模拟器上先跑过 M6 的集成测试（已信任服务器的主机密钥）。
-// 运行：./scripts/m6.sh ui <设备>
+// 前提：./scripts/sshd-test.sh up。运行：./scripts/m6.sh ui <设备>
 import XCTest
 
 final class KeyboardMouseUITests: XCTestCase {
@@ -26,46 +27,40 @@ final class KeyboardMouseUITests: XCTestCase {
         try launch(modes: "")
 
         // D1 可打印字符（含 Shift 大小写）与空格。
-        try expectBytes("aZ09-=[];',./ ".utf8.map { $0 }) {
-            app.typeText("aZ09-=[];',./ ")
-        }
+        try expectBytes("aZ09-=[];',./ ".utf8.map { $0 }) { typeKeys("aZ09-=[];',./ ") }
         try expectBytes([0x41]) { app.typeKey("a", modifierFlags: .shift) }
 
-        // D2 回车、退格、Tab、Shift+Tab、Esc。
-        try expectBytes([0x0d]) { app.typeKey(.`return`, modifierFlags: []) }
-        try expectBytes([0x7f]) { app.typeKey(.delete, modifierFlags: []) }
+        // D2 Tab、Shift+Tab。
         try expectBytes([0x09]) { app.typeKey(.tab, modifierFlags: []) }
         try expectBytes(esc("[Z")) { app.typeKey(.tab, modifierFlags: .shift) }
-        try expectBytes([0x1b]) { app.typeKey(.escape, modifierFlags: []) }
 
-        // D3 方向键与编辑键、F1–F12（远端没开应用光标键：CSI 形式）。
-        let navigation: [(XCUIKeyboardKey, String)] = [
-            (.upArrow, "[A"), (.downArrow, "[B"), (.rightArrow, "[C"), (.leftArrow, "[D"),
-            (.home, "[H"), (.end, "[F"), (.pageUp, "[5~"), (.pageDown, "[6~"), (.forwardDelete, "[3~"),
-            (.F1, "OP"), (.F2, "OQ"), (.F3, "OR"), (.F4, "OS"), (.F5, "[15~"), (.F6, "[17~"),
-            (.F7, "[18~"), (.F8, "[19~"), (.F9, "[20~"), (.F10, "[21~"), (.F11, "[23~"), (.F12, "[24~"),
-        ]
-        for (key, sequence) in navigation {
+        // D3 方向键（远端没开应用光标键：CSI 形式）。
+        let arrows: [(XCUIKeyboardKey, String)] = [(.upArrow, "[A"), (.downArrow, "[B"), (.rightArrow, "[C"), (.leftArrow, "[D")]
+        for (key, sequence) in arrows {
             try expectBytes(esc(sequence), "\(key.rawValue)") { app.typeKey(key, modifierFlags: []) }
         }
 
-        // D4 Ctrl 组合：C0 控制字符。
-        let control: [(String, UInt8)] = [("a", 0x01), ("c", 0x03), ("d", 0x04), ("z", 0x1a), ("[", 0x1b), ("\\", 0x1c)]
+        // D4 Ctrl 组合：C0 控制字符（Ctrl+[ 即 Esc，妙控键盘没有实体 Esc 键时靠它）。
+        let control: [(String, UInt8)] = [("a", 0x01), ("c", 0x03), ("d", 0x04), ("z", 0x1a), ("m", 0x0d), ("[", 0x1b), ("\\", 0x1c)]
         for (key, byte) in control {
             try expectBytes([byte], "ctrl+\(key)") { app.typeKey(key, modifierFlags: .control) }
         }
 
         // D5 Option：ESC 前缀；Option+方向键带修饰参数。
         try expectBytes(esc("b"), "option+b") { app.typeKey("b", modifierFlags: .option) }
+        try expectBytes(esc("."), "option+.") { app.typeKey(".", modifierFlags: .option) }
         try expectBytes(esc("[1;3D"), "option+left") { app.typeKey(.leftArrow, modifierFlags: .option) }
 
         // D6 ⌘ 组合由 App 处理，不发到远端。
         try expectBytes([], "cmd+a") { app.typeKey("a", modifierFlags: .command) }
         try expectBytes([], "cmd+c") { app.typeKey("c", modifierFlags: .command) }
 
-        // D7 一次连续输入 50 个键再回车：顺序不乱、不丢不重。
+        // D7 连续输入 50 个键再以 Ctrl+M（CR）结尾：直接处理的键不越过前面的文本，不丢不重。
         let burst = "the quick brown fox jumps over the lazy dog 012345"
-        try expectBytes(Array(burst.utf8) + [0x0d], "burst") { app.typeText(burst + "\n") }
+        try expectBytes(Array(burst.utf8) + [0x0d], "burst") {
+            typeKeys(burst)
+            app.typeKey("m", modifierFlags: .control)
+        }
     }
 
     // MARK: - D8–D12 鼠标 / 触控板
@@ -106,20 +101,6 @@ final class KeyboardMouseUITests: XCTestCase {
         XCTAssertTrue(events.isEmpty, "Shift+点击是本地选区，不发到远端：\(events)")
     }
 
-    func testPointerHover() throws {
-        // D10 悬停移动：1003 下上报移动（按钮 3 + 32 = 35），同一格不重复。
-        try launch(modes: "motion")
-        let events = try mouseEvents {
-            for step in 0..<6 {
-                app.coordinate(withNormalizedOffset: CGVector(dx: 0.3 + Double(step) * 0.05, dy: 0.5)).hover()
-            }
-        }
-        XCTAssertFalse(events.isEmpty, "悬停要上报")
-        XCTAssertTrue(events.allSatisfy { $0.kind == "35M" }, "悬停：\(events)")
-        let cells = events.map { "\($0.col),\($0.row)" }
-        XCTAssertEqual(cells.count, Set(cells).count, "同一格不重复上报：\(cells)")
-    }
-
     // MARK: - 辅助
 
     /// 启动 App，自动连上验收服务器并以 exec 模式运行 m6-keyecho；点一下终端拿到焦点，
@@ -134,7 +115,12 @@ final class KeyboardMouseUITests: XCTestCase {
             "GUOSH_CMD": "m6-keyecho \(modes) --seconds 900",
         ]
         app.launch()
-        let deadline = Date().addingTimeInterval(60)
+        guard app.waitConnected() else {
+            XCTFail("App 没连上验收服务器")
+            throw XCTSkip("未连接")
+        }
+        // XCUITest 每个动作前等 App 空闲，最多 60 秒；给就绪留出几轮的余量。
+        let deadline = Date().addingTimeInterval(180)
         repeat {
             try resetLog()
             app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
@@ -145,8 +131,20 @@ final class KeyboardMouseUITests: XCTestCase {
                 return
             }
         } while Date() < deadline
-        XCTFail("m6-keyecho 没有就绪（App 没连上验收服务器？先跑一遍 M6 集成测试信任主机密钥）")
+        XCTFail("m6-keyecho 没有就绪")
         throw XCTSkip("回显程序未就绪")
+    }
+
+    /// 逐键敲出 [text]（大写字母带 Shift）。终端的文本输入不在无障碍树里，XCUITest 的 typeText
+    /// 找不到键盘焦点，只能逐键合成硬件按键。
+    private func typeKeys(_ text: String) {
+        for character in text {
+            if character.isUppercase {
+                app.typeKey(character.lowercased(), modifierFlags: .shift)
+            } else {
+                app.typeKey(String(character), modifierFlags: [])
+            }
+        }
     }
 
     /// 做 [action]，核对远端收到的字节正好是 [expected]。
@@ -245,7 +243,8 @@ final class RotationUITests: XCTestCase {
         ]
         XCUIDevice.shared.orientation = .portrait
         app.launch()
-        Thread.sleep(forTimeInterval: 10)
+        XCTAssertTrue(app.waitConnected(), "App 没连上验收服务器")
+        Thread.sleep(forTimeInterval: 6)
         attach("竖屏")
         for orientation in [UIDeviceOrientation.landscapeLeft, .portrait, .landscapeRight, .portrait] {
             XCUIDevice.shared.orientation = orientation
@@ -261,5 +260,33 @@ final class RotationUITests: XCTestCase {
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+}
+
+extension XCUIApplication {
+    /// 等 App 连上验收服务器（终端标签在、「正在连接」的提示已消失）。首次连接或服务器换了主机
+    /// 密钥时 App 请用户确认——验收服务器是自己起的，照单信任。
+    func waitConnected(timeout: TimeInterval = 60) -> Bool {
+        func labeled(_ format: String, _ text: String) -> XCUIElement {
+            descendants(matching: .any).matching(NSPredicate(format: format, text)).firstMatch
+        }
+        let trust = buttons["信任并连接"]
+        let replace = buttons["替换旧密钥并连接"]
+        let verified = labeled("label CONTAINS %@", "核对新指纹")
+        let connecting = labeled("label BEGINSWITH %@", "正在连接")
+        let tab = labeled("label CONTAINS %@", "probe@")
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if trust.exists {
+                trust.tap()
+            } else if replace.exists {
+                verified.tap()
+                replace.tap()
+            } else if tab.exists && !connecting.exists {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        } while Date() < deadline
+        return false
     }
 }

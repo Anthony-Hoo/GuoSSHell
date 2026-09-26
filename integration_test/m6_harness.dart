@@ -294,6 +294,43 @@ class M6App {
   }
 }
 
+/// 清空 m6-keyecho 的输入记录（验收服务器的 /m6/input）。
+Future<void> resetInput() async {
+  final client = HttpClient();
+  try {
+    final request = await client.postUrl(Uri.parse('http://127.0.0.1:$m6LlmPort/m6/input/reset'));
+    await (await request.close()).drain<void>();
+  } finally {
+    client.close(force: true);
+  }
+}
+
+/// m6-keyecho 记下的输入：每行一条 `{"t": 毫秒, "hex": "..."}`，按顺序拼成字节。
+Future<List<int>> inputBytes() async {
+  final client = HttpClient();
+  try {
+    final request = await client.getUrl(Uri.parse('http://127.0.0.1:$m6LlmPort/m6/input'));
+    final body = await (await request.close()).transform(utf8.decoder).join();
+    final bytes = <int>[];
+    for (final line in const LineSplitter().convert(body)) {
+      if (line.trim().isEmpty) continue;
+      final hex = (jsonDecode(line) as Map<String, dynamic>)['hex'] as String;
+      for (var i = 0; i + 1 < hex.length; i += 2) {
+        bytes.add(int.parse(hex.substring(i, i + 2), radix: 16));
+      }
+    }
+    return bytes;
+  } finally {
+    client.close(force: true);
+  }
+}
+
+/// 字节里的 SGR 鼠标事件，每个写成「按钮码 + M/m @ 列,行」，如 `35M@12,5`。
+List<String> sgrMouseEvents(List<int> bytes) => [
+      for (final m in RegExp(r'\x1b\[<(\d+);(\d+);(\d+)([Mm])').allMatches(String.fromCharCodes(bytes)))
+        '${m.group(1)}${m.group(4)}@${m.group(2)},${m.group(3)}',
+    ];
+
 /// 把几窗性能数据汇总成一条（写进报告）。
 Map<String, Object> summarizePerf(List<PerfRecord> records) {
   if (records.isEmpty) return {'windows': 0};

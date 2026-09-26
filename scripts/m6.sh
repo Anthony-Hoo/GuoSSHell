@@ -6,8 +6,8 @@
 #   ./scripts/m6.sh run <套件> <设备> [flutter drive 参数…]
 #                                               在一台模拟器上跑一套（protocol / tui / agents）
 #   ./scripts/m6.sh matrix [套件…]              四台模拟器依次跑（默认三套全跑）
-#   ./scripts/m6.sh ui <设备>                   iPad 上的 XCUITest：系统合成的硬件键盘与指针事件（D 类；
-#                                               先在同一台模拟器上跑过一套集成测试，已信任主机密钥）
+#   ./scripts/m6.sh ui <设备>                   XCUITest：iPad 上系统合成的硬件键盘与指针事件（D 类），
+#                                               各设备上真实旋转下的全屏 TUI
 #   ./scripts/m6.sh macos <套件> [参数…]        macOS 的 profile 构建上跑（性能门槛在这里判）
 #   ./scripts/m6.sh report                      汇总 build/m6/reports/*.json → build/m6/summary.md
 #
@@ -72,8 +72,30 @@ for devices in json.load(sys.stdin)["devices"].values():
   fi
 }
 
+# D 类核对的是原始按键字节：验收模拟器只留英文（美国）键盘。新建的模拟器跟主机的语言，中文时默认是
+# 拼音，字母会被组成汉字。改设备自己的偏好文件（要在关机时改；不能用主机的 defaults，它会把
+# .GlobalPreferences 当成主机的全局域）。
+english_keyboard() {
+  local udid="$1"
+  local prefs="${HOME}/Library/Developer/CoreSimulator/Devices/${udid}/data/Library/Preferences/.GlobalPreferences.plist"
+  local keyboard="en_US@sw=QWERTY;hw=Automatic"
+  if [ -f "${prefs}" ] && [ "$(plutil -extract AppleKeyboards json -o - "${prefs}" 2>/dev/null)" = "[\"${keyboard}\"]" ]; then
+    return
+  fi
+  xcrun simctl shutdown "${udid}" 2>/dev/null || true
+  if [ ! -f "${prefs}" ]; then
+    # 从没启动过：先启动一次让系统建好偏好文件。
+    xcrun simctl boot "${udid}" 2>/dev/null || true
+    xcrun simctl bootstatus "${udid}" -b >/dev/null
+    xcrun simctl shutdown "${udid}"
+  fi
+  plutil -replace AppleKeyboards -json "[\"${keyboard}\"]" "${prefs}"
+  plutil -replace AppleKeyboardsExpanded -integer 1 "${prefs}"
+}
+
 boot() {
   local udid="$1"
+  english_keyboard "${udid}"
   xcrun simctl boot "${udid}" 2>/dev/null || true
   xcrun simctl bootstatus "${udid}" -b >/dev/null
 }

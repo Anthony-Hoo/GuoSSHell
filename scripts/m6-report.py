@@ -59,6 +59,9 @@ def main() -> int:
                 f"- 宽字符画面一致性：{'通过' if not p.get('cjk_mismatches') else '不一致 ' + str(len(p['cjk_mismatches'])) + ' 处'}",
                 f"- 同步输出无结束序列时显示用时：{p.get('sync_stall_visible_ms', '-')} ms",
                 f"- 终端查询：{modes_ok(p.get('probe_modes'))}",
+                f"- 按键编码：{len(p.get('keys') or {})} 个键，不一致 {len(p.get('keys_wrong') or [])} 个"
+                + "".join(f"\n  - {w}" for w in p.get("keys_wrong") or []),
+                f"- 鼠标悬停：1003 下上报 {len(p.get('hover_motion') or [])} 次，1002 下上报 {len(p.get('hover_drag') or [])} 次",
                 "",
             ]
         if "tui" in data:

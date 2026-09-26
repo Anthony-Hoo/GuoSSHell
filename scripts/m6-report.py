@@ -47,6 +47,8 @@ def main() -> int:
     out = ["# M6 集成测试汇总", ""]
     for path in sorted(reports.glob("*.json")):
         data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            continue
         name = path.stem
         out += [f"## {name}", ""]
         failed = failures(logs, name)
@@ -82,7 +84,7 @@ def main() -> int:
                 "|---|---|---|---|---|---|---|---|---|---|---|---|",
             ]
             for case, r in data["agents"].items():
-                if not isinstance(r, dict):
+                if not isinstance(r, dict) or case == "panes":
                     continue
                 out.append(
                     "| "
@@ -94,6 +96,15 @@ def main() -> int:
                     + " |"
                 )
             out.append("")
+            panes = data["agents"].get("panes")
+            if isinstance(panes, dict) and panes.get("echo_ms"):
+                busy = panes.get("busy_perf", {})
+                out += [
+                    f"- 多窗格：另一窗格 2000 行/秒输出时，本窗格回显 p95 {panes.get('echo_ms_p95')} ms"
+                    f"（样本 {panes.get('echo_ms')}）；输出窗格 fps {busy.get('fps', '-')}，"
+                    f"延迟 p95 {ms(busy.get('latency_us_p95_max'))} ms，ACK 超时 {busy.get('ack_timeouts', '-')}",
+                    "",
+                ]
         shots = [s.get("screenshotName") for s in data.get("screenshots", []) if isinstance(s, dict)]
         if shots:
             out += [f"截图（build/m6/screenshots/）：{len(shots)} 张", ""]

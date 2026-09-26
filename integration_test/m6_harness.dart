@@ -5,6 +5,8 @@
 //   M6_HOST / M6_PORT   验收服务器（默认 127.0.0.1:2223）
 //   M6_DEVICE           设备名，截图与报告按它分目录
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -22,6 +24,9 @@ import 'package:terminal_view/terminal_view.dart' show BufferLine, TerminalKey;
 const m6Host = String.fromEnvironment('M6_HOST', defaultValue: '127.0.0.1');
 const m6Port = int.fromEnvironment('M6_PORT', defaultValue: 2223);
 const m6Device = String.fromEnvironment('M6_DEVICE', defaultValue: 'device');
+
+/// 验收服务器上假 AI 上游的端口（映射到本机回环，见 scripts/sshd-test.sh）。
+const m6LlmPort = int.fromEnvironment('M6_LLM_PORT', defaultValue: 2224);
 
 bool _rustStarted = false;
 
@@ -159,6 +164,7 @@ class M6App {
     final deadline = start.add(timeout);
     while (!screenText(pane: pane).contains(text)) {
       if (DateTime.now().isAfter(deadline)) {
+        await screenshot('timeout-${DateTime.now().millisecondsSinceEpoch}');
         throw TestFailure('等「$text」超时。${describe(pane: pane)}\n当前屏幕：\n${screenText(pane: pane)}');
       }
       await tester.pump(const Duration(milliseconds: 50));
@@ -170,8 +176,41 @@ class M6App {
   Future<void> waitFor(bool Function() done, String what, {Duration timeout = const Duration(seconds: 30)}) async {
     final deadline = DateTime.now().add(timeout);
     while (!done()) {
-      if (DateTime.now().isAfter(deadline)) throw TestFailure('等「$what」超时。${describe()}\n当前屏幕：\n${screenText()}');
+      if (DateTime.now().isAfter(deadline)) {
+        await screenshot('timeout-${DateTime.now().millisecondsSinceEpoch}');
+        throw TestFailure('等「$what」超时。${describe()}\n当前屏幕：\n${screenText()}');
+      }
       await tester.pump(const Duration(milliseconds: 50));
+    }
+  }
+
+  /// 等假上游做出某个剧本决定（/m6/plans）：[since] 之后出现满足 [test] 的一条。
+  /// 用它判断「agent 开始流式」「subagent 已派出」，不依赖各 agent 界面上的写法。
+  Future<void> waitForPlan(bool Function(Map<String, dynamic> plan) test, String what,
+      {required DateTime since, Duration timeout = const Duration(seconds: 90)}) async {
+    final deadline = DateTime.now().add(timeout);
+    final client = HttpClient();
+    try {
+      while (true) {
+        try {
+          final request = await client.getUrl(Uri.parse('http://127.0.0.1:$m6LlmPort/m6/plans?limit=200'));
+          final response = await request.close();
+          final plans = jsonDecode(await response.transform(utf8.decoder).join()) as List<dynamic>;
+          final hit = plans.cast<Map<String, dynamic>>().any(
+                (plan) => (plan['t'] as int) >= since.millisecondsSinceEpoch && test(plan),
+              );
+          if (hit) return;
+        } on Object {
+          // 服务器暂时连不上：下一轮再问。
+        }
+        if (DateTime.now().isAfter(deadline)) {
+          await screenshot('timeout-${DateTime.now().millisecondsSinceEpoch}');
+          throw TestFailure('等「$what」超时（假上游没有对应的剧本决定）。当前屏幕：\n${screenText()}');
+        }
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+    } finally {
+      client.close(force: true);
     }
   }
 
@@ -187,35 +226,41 @@ class M6App {
     }
   }
 
-  /// 画面一致性：引擎按列给出的当前屏幕与 Dart 行池逐列比对，返回不一致之处（空 = 一致）。
-  /// 屏幕还在刷新时（TUI 定时重画）两边可能正好差一帧：比对几次，只报告每次都在的差异。
-  Future<List<String>> screenMismatches({TerminalPaneController? pane, int attempts = 4}) async {
-    List<String> problems = const [];
+  /// 画面一致性：Rust 最近发出的一帧（逐列）与 Dart 画完同一序号的帧后的行池逐列比对，
+  /// 返回不一致之处（空 = 一致）。按帧序号对齐，所以画面还在刷新（TUI 定时重画）也能比。
+  Future<List<String>> screenMismatches({TerminalPaneController? pane, int attempts = 5}) async {
+    final controller = pane ?? this.pane;
+    List<String>? problems;
     for (var attempt = 0; attempt < attempts; attempt++) {
-      problems = await _compareOnce(pane ?? this.pane);
-      if (problems.isEmpty) return problems;
-      await tester.pump(const Duration(milliseconds: 300));
+      problems = await _compareOnce(controller);
+      if (problems != null) return problems;
     }
-    return problems;
+    throw TestFailure('画面一致性：$attempts 次都没能与 Rust 发出的帧对齐（${describe(pane: controller)}）');
   }
 
-  Future<List<String>> _compareOnce(TerminalPaneController controller) async {
+  /// 对齐不上（Dart 已经画了更新的帧）返回 null，由调用方重试。
+  Future<List<String>?> _compareOnce(TerminalPaneController controller) async {
     final reply = ScreenCheck.rustSignalStream.firstWhere((p) => p.message.sessionId == controller.sessionId);
     ScreenCheckRequest(sessionId: controller.sessionId).sendSignalToRust();
     final check = (await reply.timeout(const Duration(seconds: 10))).message;
-    // 在途的帧先画上（引擎回报之前发出的帧，Dart 可能还没处理）。
-    await tester.pump(const Duration(milliseconds: 100));
+    final deadline = DateTime.now().add(const Duration(seconds: 2));
+    while (controller.lastFrameSeq != check.seq) {
+      if (controller.lastFrameSeq > check.seq || DateTime.now().isAfter(deadline)) return null;
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    // 同一轮事件里比对：此刻行池正是这一帧。
     final terminal = controller.terminal;
-    final top = terminal.screenTopIndex;
     final problems = <String>[];
     for (var row = 0; row < check.rows.length; row++) {
+      final index = terminal.indexOfStable(check.stableRows[row]);
+      if (index == null) continue;
       final engine = check.rows[row];
-      final line = terminal.lineAt(top + row);
+      final line = terminal.lineAt(index);
       for (var col = 0; col < check.cols; col++) {
         final expected = _blank(col < engine.length ? engine[col] : '');
         final actual = _blank(_cellText(line, col));
         if (expected != actual) {
-          problems.add('第 $row 行第 $col 列：引擎「$expected」App「$actual」');
+          problems.add('第 $row 行第 $col 列：Rust「$expected」App「$actual」');
           if (problems.length > 20) return problems;
         }
       }
@@ -223,10 +268,15 @@ class M6App {
     return problems;
   }
 
-  /// 截图（flutter drive 的驱动端落盘到 build/m6/screenshots/<设备>/）。
+  /// 截图（flutter drive 的驱动端落盘到 build/m6/screenshots/<设备>/）。平台不支持截图时
+  /// （macOS 的 integration_test）跳过，不影响断言。
   Future<void> screenshot(String name) async {
     await tester.pump();
-    await binding.takeScreenshot('$m6Device/$name');
+    try {
+      await binding.takeScreenshot('$m6Device/$name');
+    } on Object catch (error) {
+      debugPrint('[m6] 截图跳过（$name）：$error');
+    }
   }
 
   /// 从 [since] 起收集到的性能窗口（PerfMonitor）。

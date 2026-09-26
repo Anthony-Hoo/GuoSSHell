@@ -80,6 +80,10 @@ class TerminalPaneController extends ChangeNotifier {
 
   /// 当前会话编号（信号按它分流；重连换新编号）。窗格还没布局时为 0。
   int get sessionId => _pane?._sessionId ?? 0;
+
+  /// 最近画上的一帧的序号（画面一致性自检按它与 Rust 发出的帧对齐）。
+  int get lastFrameSeq => _lastFrameSeq;
+  int _lastFrameSeq = 0;
   bool get canCopy => selection.selection != null;
 
   /// 复制选区（取文在引擎里）。
@@ -297,6 +301,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         ..mouseReporting = msg.mouseReporting
         ..alternateScreen = msg.alternateScreen;
       _terminal.applyFrame(frame);
+      _controller._lastFrameSeq = msg.seq;
       _controller._report(title: _terminal.title);
       _keepScrollPosition();
       // 最早一行变了（滚回裁掉旧行、清空、重排）行号就整体平移；重新投影选区，

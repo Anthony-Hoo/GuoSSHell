@@ -264,6 +264,8 @@ struct Screen {
     /// 选区权威在引擎（M2a 方案 A）：一直持有当前选区，每次 render 都带上它——内容重排、
     /// 滚动时高亮跟着引擎走，不是 Dart 侧自己维护一套坐标。
     selection: Option<SelectionRange>,
+    /// 最近发出的一帧与它的序号（画面一致性自检回报的就是它）。
+    last_sent: Option<(u32, Arc<RenderFrame>)>,
 }
 
 impl Screen {
@@ -276,19 +278,21 @@ impl Screen {
             pacer: FramePacer::new(),
             mouse_motion: MouseMotion::default(),
             selection: None,
+            last_sent: None,
         }
     }
 
     /// 立即出帧。
     fn present(&mut self, session_id: u32) -> Result<(), String> {
-        present(
+        self.last_sent = Some(present(
             session_id,
             &mut self.engine,
             self.window.viewport(self.rows),
             self.selection,
             &mut self.stats,
             &mut self.pacer,
-        )
+        )?);
+        Ok(())
     }
 
     /// 内容或窗口变了：节拍允许就出帧，否则记为待发。
@@ -376,11 +380,9 @@ impl Screen {
                 self.flush(session_id)?;
             }
             SessionCommand::ScreenCheck => {
-                let frame = self
-                    .engine
-                    .render(Window::Bottom.viewport(self.rows), None)
-                    .map_err(|error| format!("render: {error:?}"))?;
-                screen_check(session_id, &frame).send_signal_to_dart();
+                if let Some((seq, frame)) = &self.last_sent {
+                    screen_check(session_id, *seq, frame).send_signal_to_dart();
+                }
             }
             other => return Ok(Some(other)),
         }
@@ -879,7 +881,7 @@ fn present<E: TerminalEngine>(
     selection: Option<SelectionRange>,
     stats: &mut PerfWindow,
     pacer: &mut FramePacer,
-) -> Result<(), String> {
+) -> Result<(u32, Arc<RenderFrame>), String> {
     if pacer.awaiting_ack() {
         // 上一帧 Dart 还没确认就照发了（节拍器等 ACK 超时才会走到这里）。
         stats.ack_timeouts += 1;
@@ -901,7 +903,7 @@ fn present<E: TerminalEngine>(
     if let Some(perf) = stats.maybe_report(session_id) {
         perf.send_signal_to_dart();
     }
-    Ok(())
+    Ok((seq, frame))
 }
 
 /// 帧节拍与流控：
@@ -1253,8 +1255,8 @@ fn micros_since(start: std::time::Instant) -> u32 {
     u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX)
 }
 
-/// 引擎眼中的屏幕，按列展开：宽字符的第二列为空串（画面一致性自检）。
-fn screen_check(session_id: u32, frame: &RenderFrame) -> ScreenCheck {
+/// 发出的一帧按列展开：宽字符的第二列为空串（画面一致性自检）。
+fn screen_check(session_id: u32, seq: u32, frame: &RenderFrame) -> ScreenCheck {
     let rows = frame
         .rows
         .iter()
@@ -1271,7 +1273,9 @@ fn screen_check(session_id: u32, frame: &RenderFrame) -> ScreenCheck {
         .collect();
     ScreenCheck {
         session_id,
+        seq,
         cols: frame.size.cols,
+        stable_rows: frame.rows.iter().map(|row| row.stable_row).collect(),
         rows,
     }
 }

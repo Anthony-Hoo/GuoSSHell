@@ -58,7 +58,7 @@ void main() {
       await app.waitFor(() => app.pane.terminal.viewWidth != colsBefore, '$name 收到新尺寸', timeout: const Duration(seconds: 10));
       await tester.pump(const Duration(seconds: 2));
       result['resized_to'] = '${app.pane.terminal.viewWidth}x${app.pane.terminal.viewHeight}';
-      await app.screenshot('tui-$name-resized');
+      // 这里改的是视图的物理尺寸（框架层的替身），系统截图不反映它；真实旋转的截图在 XCUITest 里。
       final resized = await app.screenMismatches();
       result['resized_mismatches'] = resized.length;
       await restoreView(tester);

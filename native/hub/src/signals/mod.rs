@@ -326,17 +326,20 @@ pub struct PerfStats {
     pub sync_timeouts: u32,
 }
 
-/// 画面一致性自检（M6，测试用）：请求引擎按列给出当前屏幕。
+/// 画面一致性自检（M6，测试用）：请求最近发出的那一帧的逐列内容。
 #[derive(Deserialize, DartSignal)]
 pub struct ScreenCheckRequest {
     pub session_id: u32,
 }
 
-/// 引擎眼中的当前屏幕：每行每列一格，宽字符的第二列为空串。与 Dart 行池逐列比对，
-/// 字符丢失、错位、最后一帧没画上都会显出来。
+/// 最近发出的一帧（序号 `seq`），每行每列一格、宽字符的第二列为空串，`stable_rows` 是各行的
+/// 绝对行号。Dart 画完同一序号的帧后逐列比对：帧编码或行池出错（丢字、错位）都会显出来，
+/// 与画面还在不在刷新无关。
 #[derive(Serialize, RustSignal)]
 pub struct ScreenCheck {
     pub session_id: u32,
+    pub seq: u32,
     pub cols: u16,
+    pub stable_rows: Vec<i64>,
     pub rows: Vec<Vec<String>>,
 }

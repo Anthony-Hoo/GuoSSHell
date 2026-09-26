@@ -44,8 +44,13 @@ void main() {
         await app.type('m6-agent $agent $scenario${inline ? ' --inline' : ''}\r');
 
         if (scenario == 'stream' || scenario == 'burst') {
-          // 流式中在 agent 的输入框里打字：从敲下最后一个字符到它出现在屏幕上。
-          await tester.pump(const Duration(seconds: 2));
+          // 流式开始后在 agent 的输入框里打字：从敲下最后一个字符到它出现在屏幕上。
+          await app.waitForPlan(
+            (p) => p['kind'] == 'main' && p['dialect'] == agent && p['scenario'] == scenario,
+            '$agent 开始流式输出',
+            since: started,
+          );
+          await tester.pump(const Duration(milliseconds: 400));
           const typed = 'zq6typ';
           final echo = Stopwatch()..start();
           await app.type(typed);
@@ -53,7 +58,12 @@ void main() {
           result['typing_echo_ms'] = echo.elapsedMilliseconds;
         }
         if (scenario == 'subagents') {
-          await tester.pump(const Duration(seconds: 3));
+          await app.waitForPlan(
+            (p) => p['kind'] == 'sub' && p['dialect'] == agent && p['scenario'] == 'subagents',
+            '$agent 派出 subagent',
+            since: started,
+          );
+          await tester.pump(const Duration(seconds: 1));
           await _switchViews(app, agent);
         }
 
@@ -178,17 +188,16 @@ Future<void> _switchViews(M6App app, String agent) async {
         await tester.pump(const Duration(milliseconds: 800));
       }
     case 'opencode':
-      // Ctrl+X ↓ 进第一个子会话，← / → 在子会话之间切换，↑ 回父会话。
+      // Ctrl+X ↓ 进第一个子会话；子会话里 ← / → 在子会话之间切换，↑ 回父会话（不带引导键）。
       await app.key(TerminalKey.keyX, ctrl: true);
       await app.key(TerminalKey.arrowDown);
       await tester.pump(const Duration(seconds: 1));
       await shot('child');
       for (final key in [TerminalKey.arrowRight, TerminalKey.arrowRight, TerminalKey.arrowLeft]) {
-        await app.key(TerminalKey.keyX, ctrl: true);
         await app.key(key);
         await tester.pump(const Duration(milliseconds: 800));
       }
-      await app.key(TerminalKey.keyX, ctrl: true);
+      await shot('child-cycled');
       await app.key(TerminalKey.arrowUp);
       await tester.pump(const Duration(seconds: 1));
   }

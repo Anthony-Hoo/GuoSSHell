@@ -16,6 +16,14 @@ Future<void> main() async {
       return true;
     },
     responseDataCallback: (data) async {
+      // 截图已经经 onScreenshot 落盘，报告里只留名字（字节以 JSON 数组存，动辄上百 MB）。
+      final screenshots = data?['screenshots'];
+      if (screenshots is List) {
+        data!['screenshots'] = [
+          for (final shot in screenshots)
+            if (shot is Map) {'screenshotName': shot['screenshotName']},
+        ];
+      }
       final file = File('build/m6/reports/$report.json');
       await file.parent.create(recursive: true);
       await file.writeAsString(const JsonEncoder.withIndent('  ').convert(data));

@@ -230,3 +230,36 @@ private struct MouseEvent: CustomStringConvertible {
 
     var description: String { "\(kind)@\(col),\(row)" }
 }
+
+/// M6 B3 / C：真实旋转（系统转动设备）下的全屏 TUI。画面内容由截图复核（附在测试结果里），
+/// 断言只管 App 活着、没有弹出异常界面。iPhone 与 iPad 都跑。
+final class RotationUITests: XCTestCase {
+    func testFullScreenTUIAcrossRotations() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment = [
+            "GUOSH_HOST": "127.0.0.1",
+            "GUOSH_PORT": "2223",
+            "GUOSH_USER": "probe",
+            "GUOSH_PASS": "probe",
+            "GUOSH_CMD": "m6-tui btop",
+        ]
+        XCUIDevice.shared.orientation = .portrait
+        app.launch()
+        Thread.sleep(forTimeInterval: 10)
+        attach("竖屏")
+        for orientation in [UIDeviceOrientation.landscapeLeft, .portrait, .landscapeRight, .portrait] {
+            XCUIDevice.shared.orientation = orientation
+            Thread.sleep(forTimeInterval: 4)
+            attach(orientation.isLandscape ? "横屏" : "竖屏")
+            XCTAssertEqual(app.state, .runningForeground)
+        }
+        app.terminate()
+    }
+
+    private func attach(_ name: String) {
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+}

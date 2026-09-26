@@ -26,8 +26,10 @@ RUN apt-get update \
       nodejs npm \
  && rm -rf /var/lib/apt/lists/*
 
+# 系统默认 locale（SSH 会话经 PAM 读 /etc/default/locale；Docker 的 ENV 进不了 SSH 会话）。
 RUN sed -i 's/^# *\(en_US.UTF-8\)/\1/; s/^# *\(zh_CN.UTF-8\)/\1/' /etc/locale.gen \
- && locale-gen
+ && locale-gen \
+ && echo 'LANG=en_US.UTF-8' > /etc/default/locale
 ENV LANG=en_US.UTF-8
 
 # 登录 probe / probe（与 demo_server 一致）。

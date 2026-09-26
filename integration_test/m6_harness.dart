@@ -188,12 +188,23 @@ class M6App {
   }
 
   /// 画面一致性：引擎按列给出的当前屏幕与 Dart 行池逐列比对，返回不一致之处（空 = 一致）。
-  Future<List<String>> screenMismatches({TerminalPaneController? pane}) async {
-    final controller = pane ?? this.pane;
+  /// 屏幕还在刷新时（TUI 定时重画）两边可能正好差一帧：比对几次，只报告每次都在的差异。
+  Future<List<String>> screenMismatches({TerminalPaneController? pane, int attempts = 4}) async {
+    List<String> problems = const [];
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      problems = await _compareOnce(pane ?? this.pane);
+      if (problems.isEmpty) return problems;
+      await tester.pump(const Duration(milliseconds: 300));
+    }
+    return problems;
+  }
+
+  Future<List<String>> _compareOnce(TerminalPaneController controller) async {
     final reply = ScreenCheck.rustSignalStream.firstWhere((p) => p.message.sessionId == controller.sessionId);
     ScreenCheckRequest(sessionId: controller.sessionId).sendSignalToRust();
     final check = (await reply.timeout(const Duration(seconds: 10))).message;
-    await tester.pump();
+    // 在途的帧先画上（引擎回报之前发出的帧，Dart 可能还没处理）。
+    await tester.pump(const Duration(milliseconds: 100));
     final terminal = controller.terminal;
     final top = terminal.screenTopIndex;
     final problems = <String>[];

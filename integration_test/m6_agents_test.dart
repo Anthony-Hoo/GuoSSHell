@@ -4,6 +4,7 @@
 // --dart-define=M6_SCENARIOS=stream,burst,…       跑哪些场景（默认全部；inline- 前缀 = 行内模式）
 import 'dart:convert';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:terminal_view/terminal_view.dart' show TerminalKey;
@@ -85,6 +86,52 @@ void main() {
       });
     }
   }
+
+  testWidgets('多窗格：一个窗格高速输出，另一个窗格打字的回显延迟', (tester) async {
+    final app = M6App(tester, binding);
+    final result = <String, Object>{};
+    report['panes'] = result;
+    await app.open();
+    await app.waitScreen('probe@');
+    // ⌘D 左右分屏，从选择器里再开一个同样的连接。
+    app.pane.focusNode.requestFocus();
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyD);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+    await app.waitFor(() => find.textContaining('再开一个').evaluate().isNotEmpty, '连接选择器');
+    await tester.tap(find.textContaining('再开一个'));
+    await app.waitFor(() => app.panes.length == 2 && app.panes.every((p) => p.connected), '第二个窗格连上');
+    final busy = app.panes[0];
+    final quiet = app.panes[1];
+    await app.waitScreen('probe@', pane: quiet);
+
+    // 左边：2000 行 / 秒的彩色输出，持续 20 秒。
+    final mark = app.perfMark;
+    await app.type('m6-flood 2000 20\r', pane: busy);
+    await tester.pump(const Duration(seconds: 2));
+
+    // 右边：逐个字符敲，量从敲下到它出现在屏幕上。
+    final samples = <int>[];
+    var typed = '';
+    for (var i = 0; i < 12; i++) {
+      final ch = String.fromCharCode(0x61 + i);
+      typed += ch;
+      final watch = Stopwatch()..start();
+      await app.type(ch, pane: quiet);
+      await app.waitScreen('probe@', pane: quiet);
+      await app.waitFor(() => app.screenText(pane: quiet).contains(typed), '右窗格回显「$typed」', timeout: const Duration(seconds: 10));
+      samples.add(watch.elapsedMilliseconds);
+      await tester.pump(const Duration(milliseconds: 300));
+    }
+    samples.sort();
+    result['echo_ms'] = samples;
+    result['echo_ms_p95'] = samples[(samples.length * 95 ~/ 100).clamp(0, samples.length - 1)];
+    await app.waitScreen('M6-FLOOD-DONE', pane: busy, timeout: const Duration(seconds: 60));
+    result['busy_perf'] = summarizePerf(app.perfSince(mark, pane: busy));
+    await app.screenshot('panes-flood');
+    await app.dispose();
+  });
 
   testWidgets('S5：流式中直接杀掉 agent，回到 shell 后画面不卡住、reset 能恢复', (tester) async {
     final app = M6App(tester, binding);

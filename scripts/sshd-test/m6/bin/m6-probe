@@ -2,7 +2,7 @@
 """M6：查询终端当前的模式与光标（TUI 退出后查残留）。
 
 依次发 DECRQM（CSI ? Pm $ p）、CPR（CSI 6n），最后发 DA1（CSI c）作为结束标记：
-终端按顺序作答，收到 DA1 的应答就说明前面的都答完了（没答的即不支持）。
+终端按顺序作答，收到 DA1 的应答就说明前面的都答完了（没答的即不支持）；最多等 3 秒。
 输出一行：M6-MODES {"1049": 2, "25": 1, ..., "cpr": [行, 列]}
 DECRPM 的值：1 置位、2 复位、3 永久置位、4 永久复位、0 不认识。
 """
@@ -30,7 +30,7 @@ def main() -> int:
         tty.setraw(fd)
         query = "".join(f"\x1b[?{mode}$p" for mode in MODES) + "\x1b[6n\x1b[c"
         os.write(sys.stdout.fileno(), query.encode())
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline and not re.search(rb"\x1b\[\?[\d;]*c", answer):
             ready, _, _ = select.select([fd], [], [], 0.05)
             if ready:

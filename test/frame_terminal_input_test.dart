@@ -30,6 +30,14 @@ void main() {
       expect(FrameTerminal.keyName(TerminalKey.f12), 'f12');
       expect(FrameTerminal.keyName(TerminalKey.escape), 'escape');
     });
+
+    test('标点键用 US 布局的基准字符', () {
+      expect(FrameTerminal.keyName(TerminalKey.bracketLeft), 'character:[');
+      expect(FrameTerminal.keyName(TerminalKey.backslash), r'character:\');
+      expect(FrameTerminal.keyName(TerminalKey.bracketRight), 'character:]');
+      expect(FrameTerminal.keyName(TerminalKey.period), 'character:.');
+      expect(FrameTerminal.keyName(TerminalKey.slash), 'character:/');
+    });
   });
 
   group('输入路由', () {
@@ -63,6 +71,28 @@ void main() {
         isA<KeyInputEvent>()
             .having((e) => e.key, 'key', 'character:c')
             .having((e) => e.control, 'control', isTrue),
+      );
+    });
+
+    test('Ctrl / Alt + 标点以键的形式发出：Ctrl+[ 即 Esc、Alt+. 即 ESC .', () {
+      expect(terminal.keyInput(TerminalKey.bracketLeft), isFalse, reason: '不带修饰键走文本通道');
+      expect(terminal.keyInput(TerminalKey.bracketLeft, ctrl: true), isTrue);
+      expect(terminal.keyInput(TerminalKey.backslash, ctrl: true), isTrue);
+      expect(terminal.keyInput(TerminalKey.period, alt: true), isTrue);
+      expect(
+        events.map((e) => ((e as KeyInputEvent).key, e.control, e.alt)),
+        [('character:[', true, false), (r'character:\', true, false), ('character:.', false, true)],
+      );
+    });
+
+    test('带 Ctrl / Alt 的 Shift+数字 / 标点换成 US 布局的上档字符', () {
+      terminal.keyInput(TerminalKey.minus, ctrl: true, shift: true);
+      terminal.keyInput(TerminalKey.digit6, ctrl: true, shift: true);
+      terminal.keyInput(TerminalKey.period, alt: true, shift: true);
+      terminal.keyInput(TerminalKey.keyB, alt: true, shift: true);
+      expect(
+        events.map((e) => (e as KeyInputEvent).key),
+        ['character:_', 'character:^', 'character:>', 'character:b'],
       );
     });
 

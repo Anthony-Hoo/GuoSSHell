@@ -553,13 +553,19 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
     bool alt = false,
     bool ctrl = false,
   }) {
-    final name = keyName(key);
+    var name = keyName(key);
     if (name == null) return false;
-    // 可打印字符（字母/数字/空格）不带硬件 Ctrl/Alt 时交回文本通道：
+    // 可打印字符（字母/数字/标点/空格）不带硬件 Ctrl/Alt 时交回文本通道：
     // fork 的软键盘路径先把单字符映射成键再试 keyInput，而 'A' 与 'a'
     // 映射到同一个 keyA——这里拿不到大小写。返回 false 后 fork 改走
     // textInput(原字符)，大小写原样保留，挂住的 Ctrl/Alt 也在那里消费。
     if (name.startsWith(_characterPrefix) && !ctrl && !alt) return false;
+    // 带 Ctrl/Alt 的 Shift+数字 / 标点：键只给出基准字符，按 US 布局换成上档字符
+    // （Ctrl+_ = 0x1f、Ctrl+^ = 0x1e、Alt+> = ESC >）。
+    if (shift && name.startsWith(_characterPrefix)) {
+      final shifted = _usShifted[name.substring(_characterPrefix.length)];
+      if (shifted != null) name = '$_characterPrefix$shifted';
+    }
     return _emit(
       KeyInputEvent(
         name,
@@ -667,8 +673,32 @@ class FrameTerminal with ChangeNotifier implements TerminalSurface, TerminalBuff
       return '$_characterPrefix${String.fromCharCode(0x31 + key.index - TerminalKey.digit1.index)}';
     }
     if (key == TerminalKey.digit0) return '${_characterPrefix}0';
+    final punctuation = _punctuation[key];
+    if (punctuation != null) return '$_characterPrefix$punctuation';
     return null;
   }
+
+  /// 标点键：US 布局的基准字符（与数字、字母一样只在带 Ctrl/Alt 时以键的形式发出）。
+  static const Map<TerminalKey, String> _punctuation = {
+    TerminalKey.minus: '-',
+    TerminalKey.equal: '=',
+    TerminalKey.bracketLeft: '[',
+    TerminalKey.bracketRight: ']',
+    TerminalKey.backslash: r'\',
+    TerminalKey.semicolon: ';',
+    TerminalKey.quote: "'",
+    TerminalKey.backquote: '`',
+    TerminalKey.comma: ',',
+    TerminalKey.period: '.',
+    TerminalKey.slash: '/',
+  };
+
+  /// US 布局下数字与标点的上档字符。
+  static const Map<String, String> _usShifted = {
+    '1': '!', '2': '@', '3': '#', '4': r'$', '5': '%', '6': '^', '7': '&', '8': '*', '9': '(', '0': ')',
+    '-': '_', '=': '+', '[': '{', ']': '}', r'\': '|', ';': ':', "'": '"', '`': '~', ',': '<', '.': '>',
+    '/': '?',
+  };
 
 
   static const Map<TerminalKey, String> _namedKeyNames = {

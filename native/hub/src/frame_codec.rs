@@ -39,7 +39,11 @@ pub fn pack_runs(frame: &RenderFrame) -> Vec<u8> {
         let mut runs: Vec<Run<'_>> = Vec::new();
         let mut column: u16 = 0;
         for cell in row.cells.iter() {
-            let text = if cell.text.is_empty() { " " } else { cell.text.as_str() };
+            let text = if cell.text.is_empty() {
+                " "
+            } else {
+                cell.text.as_str()
+            };
             let width = cell.width.clamp(1, 2);
             let code_points = text.chars().count().clamp(1, 15) as u8;
             let layout = (code_points << 4) | width;
@@ -58,7 +62,12 @@ pub fn pack_runs(frame: &RenderFrame) -> Vec<u8> {
             write_color(run.head.foreground, &mut out);
             write_color(run.head.background, &mut out);
             let layout = run.layout.as_deref();
-            write_attrs(run.head.attributes, run.head.selected, layout.is_some(), &mut out);
+            write_attrs(
+                run.head.attributes,
+                run.head.selected,
+                layout.is_some(),
+                &mut out,
+            );
             out.extend_from_slice(&(run.text.len() as u32).to_le_bytes());
             out.extend_from_slice(run.text.as_bytes());
             if let Some(layout) = layout {
@@ -209,11 +218,21 @@ mod tests {
                     let cells = u16_of(&take_vec(2));
                     take_vec(usize::from(cells))
                 });
-                runs.push(DecodedRun { start, len, fg, text, layout });
+                runs.push(DecodedRun {
+                    start,
+                    len,
+                    fg,
+                    text,
+                    layout,
+                });
             }
             rows.push(runs);
         }
-        assert_eq!(cursor, packed.len(), "decoder must consume exactly all bytes");
+        assert_eq!(
+            cursor,
+            packed.len(),
+            "decoder must consume exactly all bytes"
+        );
         rows
     }
 
@@ -252,9 +271,19 @@ mod tests {
              e\u{301}\x1b[31m!\x1b[0m\r\n",
         );
         let row = &rows[0];
-        assert_eq!((row[0].start, row[0].len, row[0].text.as_str()), (0, 4, "\u{4e2d}\u{6587}"));
-        assert_eq!(row[0].layout.as_deref(), Some(&[0x12, 0x12][..]), "two wide cells");
-        assert_eq!((row[1].start, row[1].len, row[1].text.as_str()), (4, 1, "X"));
+        assert_eq!(
+            (row[0].start, row[0].len, row[0].text.as_str()),
+            (0, 4, "\u{4e2d}\u{6587}")
+        );
+        assert_eq!(
+            row[0].layout.as_deref(),
+            Some(&[0x12, 0x12][..]),
+            "two wide cells"
+        );
+        assert_eq!(
+            (row[1].start, row[1].len, row[1].text.as_str()),
+            (4, 1, "X")
+        );
         assert_eq!((row[2].start, row[2].text.as_str()), (5, " tail \u{1f680}"));
         assert_eq!(row[2].len, 8, "six narrow cells and one wide emoji");
         let layout = row[2].layout.as_deref().expect("layout for the emoji");
@@ -262,7 +291,11 @@ mod tests {
         assert_eq!(layout[6], 0x12);
         assert_eq!((row[3].start, row[3].text.as_str()), (13, "Y"));
         let combined = &rows[1];
-        assert_eq!(combined[0].layout.as_deref(), Some(&[0x21][..]), "e + combining acute");
+        assert_eq!(
+            combined[0].layout.as_deref(),
+            Some(&[0x21][..]),
+            "e + combining acute"
+        );
         assert_eq!((combined[1].start, combined[1].text.as_str()), (1, "!"));
     }
 

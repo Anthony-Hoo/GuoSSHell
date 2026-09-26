@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -9,13 +10,16 @@ import 'catalog/connection_list_page.dart';
 import 'terminal/session_target.dart';
 import 'workspace/workspace_page.dart';
 
-/// 调试用的自动连接（debug 构建 + --dart-define 注入，见 README）：
-/// 启动后直接以快速连接打开终端。
-const _autoHost = String.fromEnvironment('GUOSH_HOST');
-const _autoPort = int.fromEnvironment('GUOSH_PORT', defaultValue: 22);
-const _autoUser = String.fromEnvironment('GUOSH_USER');
-const _autoPass = String.fromEnvironment('GUOSH_PASS');
-const _autoCmd = String.fromEnvironment('GUOSH_CMD');
+/// 调试用的自动连接（debug 构建）：启动后直接以快速连接打开终端。取值先看 --dart-define
+/// （见 README），没有就看进程环境变量（XCUITest 经 launchEnvironment 传入，M6）。
+String _autoValue(String name, String defined) =>
+    defined.isNotEmpty ? defined : (Platform.environment[name] ?? '');
+
+final _autoHost = _autoValue('GUOSH_HOST', const String.fromEnvironment('GUOSH_HOST'));
+final _autoPort = int.tryParse(_autoValue('GUOSH_PORT', const String.fromEnvironment('GUOSH_PORT'))) ?? 22;
+final _autoUser = _autoValue('GUOSH_USER', const String.fromEnvironment('GUOSH_USER'));
+final _autoPass = _autoValue('GUOSH_PASS', const String.fromEnvironment('GUOSH_PASS'));
+final _autoCmd = _autoValue('GUOSH_CMD', const String.fromEnvironment('GUOSH_CMD'));
 
 class GuoSSHellApp extends StatelessWidget {
   const GuoSSHellApp({super.key});

@@ -20,8 +20,8 @@ use rshell_m0::rshell_core::{
     SessionFailure, TerminalInput, TerminalMouseEvent, TerminalSize, Viewport,
 };
 use rshell_m0::rshell_session::{
-    DefaultTerminalEngine, NativeSshTransport, SessionTransport, TerminalEngine, TransportEvent,
-    ViewportBounds,
+    DefaultTerminalEngine, EngineDelta, EngineError, NativeSshTransport, SessionTransport,
+    TerminalEngine, TransportEvent, ViewportBounds,
 };
 
 use crate::app::AppContext;
@@ -33,7 +33,8 @@ use crate::signals::interaction::InteractionReply;
 use crate::signals::{
     ClipboardText, ConnectHint, ConnectRequest, CopyRequest, DisconnectRequest, FailureKind,
     FrameAck, FrameUpdate, InputRequest, MouseRequest, PasteRequest, PerfStats, ReconnectRequest,
-    ResizeRequest, SelectionRequest, SelectionState, SessionState, SessionStatus, ViewportRequest,
+    ResizeRequest, ScreenCheck, ScreenCheckRequest, SelectionRequest, SelectionState, SessionState,
+    SessionStatus, ViewportRequest,
 };
 
 const NO_CURSOR: i32 = -1;
@@ -53,6 +54,8 @@ pub enum SessionCommand {
     Copy,
     Paste(String),
     FrameAck(u32),
+    /// 画面一致性自检（M6，测试用）：按列回报引擎眼中的当前屏幕。
+    ScreenCheck,
 }
 
 /// 显示的窗口：跟着屏幕（随输出滚动），或停在滚回里的某一段。
@@ -127,6 +130,7 @@ pub async fn supervisor(context: Arc<AppContext>) {
     let selection_rx = SelectionRequest::get_dart_signal_receiver();
     let copy_rx = CopyRequest::get_dart_signal_receiver();
     let ack_rx = FrameAck::get_dart_signal_receiver();
+    let screen_check_rx = ScreenCheckRequest::get_dart_signal_receiver();
     let paste_rx = PasteRequest::get_dart_signal_receiver();
     let reply_rx = InteractionReply::get_dart_signal_receiver();
     let (finished_tx, mut finished_rx) = unbounded_channel::<(u32, u64)>();
@@ -233,6 +237,10 @@ pub async fn supervisor(context: Arc<AppContext>) {
                 let Some(pack) = pack else { break };
                 send(&sessions, pack.message.session_id, SessionCommand::FrameAck(pack.message.seq));
             }
+            pack = screen_check_rx.recv() => {
+                let Some(pack) = pack else { break };
+                send(&sessions, pack.message.session_id, SessionCommand::ScreenCheck);
+            }
             pack = reply_rx.recv() => {
                 let Some(pack) = pack else { break };
                 if let Some(handle) = sessions.get(&pack.message.session_id) {
@@ -301,6 +309,12 @@ impl Screen {
         }
     }
 
+    /// 远端输出进引擎（顺便记进吞吐统计）。
+    fn advance(&mut self, bytes: &[u8]) -> Result<EngineDelta, EngineError> {
+        self.stats.record_input(bytes.len());
+        self.engine.advance(bytes)
+    }
+
     /// 同步输出（DEC 2026）进行中时它的截止时刻：到点还没收到结束序列就由 [`Self::end_sync`] 结束。
     fn sync_deadline(&self) -> Option<Instant> {
         self.engine.sync_deadline().map(Instant::from_std)
@@ -314,6 +328,7 @@ impl Screen {
             .end_sync()
             .map_err(|error| format!("end sync: {error:?}"))?;
         if delta.dirty {
+            self.stats.sync_timeouts += 1;
             self.changed(session_id)?;
         }
         Ok(delta.outbound)
@@ -355,8 +370,17 @@ impl Screen {
             }
             SessionCommand::FrameAck(seq) => {
                 // 上一帧 Dart 已处理完：攒着的变化现在可以画了（节拍允许的话）。
-                self.pacer.acked(seq);
+                if let Some(latency) = self.pacer.acked(seq, Instant::now()) {
+                    self.stats.record_latency(latency);
+                }
                 self.flush(session_id)?;
+            }
+            SessionCommand::ScreenCheck => {
+                let frame = self
+                    .engine
+                    .render(Window::Bottom.viewport(self.rows), None)
+                    .map_err(|error| format!("render: {error:?}"))?;
+                screen_check(session_id, &frame).send_signal_to_dart();
             }
             other => return Ok(Some(other)),
         }
@@ -533,7 +557,7 @@ async fn run_connected(
         let sync_deadline = screen.sync_deadline();
         tokio::select! {
             event = transport.next_event() => match event {
-                Ok(TransportEvent::Output(bytes)) => match screen.engine.advance(&bytes) {
+                Ok(TransportEvent::Output(bytes)) => match screen.advance(&bytes) {
                     Ok(delta) => {
                         // 引擎对远端查询的应答（DA / 光标位置报告…）必须回写，
                         // 否则对端会一直等。
@@ -643,7 +667,8 @@ async fn run_connected(
                     SessionCommand::Viewport(_)
                     | SessionCommand::Selection(_)
                     | SessionCommand::Copy
-                    | SessionCommand::FrameAck(_) => {}
+                    | SessionCommand::FrameAck(_)
+                    | SessionCommand::ScreenCheck => {}
                 }
             }
         }
@@ -855,6 +880,10 @@ fn present<E: TerminalEngine>(
     stats: &mut PerfWindow,
     pacer: &mut FramePacer,
 ) -> Result<(), String> {
+    if pacer.awaiting_ack() {
+        // 上一帧 Dart 还没确认就照发了（节拍器等 ACK 超时才会走到这里）。
+        stats.ack_timeouts += 1;
+    }
     pacer.started(Instant::now());
     let render_start = std::time::Instant::now();
     let frame = engine
@@ -884,8 +913,18 @@ fn present<E: TerminalEngine>(
 ///   [`Self::ACK_TIMEOUT`] 后照发，防止卡死。
 struct FramePacer {
     last_start: Option<Instant>,
-    in_flight: Option<(u32, Instant)>,
+    in_flight: Option<InFlight>,
     pending: bool,
+    /// 还没画出去的变化最早是什么时候来的（显示延迟的起点）。
+    dirty_since: Option<Instant>,
+}
+
+/// 在途的一帧：帧序号、发出时刻、它所含内容最早的到达时刻。
+#[derive(Clone, Copy)]
+struct InFlight {
+    seq: u32,
+    sent: Instant,
+    since: Option<Instant>,
 }
 
 impl FramePacer {
@@ -897,11 +936,13 @@ impl FramePacer {
             last_start: None,
             in_flight: None,
             pending: false,
+            dirty_since: None,
         }
     }
 
     /// 内容变了。返回 true = 现在就出帧；false = 已记为待发。
     fn mark_dirty(&mut self, now: Instant) -> bool {
+        self.dirty_since.get_or_insert(now);
         if self.may_send(now) {
             return true;
         }
@@ -925,7 +966,7 @@ impl FramePacer {
             return None;
         }
         let beat = self.last_start.map(|start| start + Self::INTERVAL);
-        let ack = self.in_flight.map(|(_, sent)| sent + Self::ACK_TIMEOUT);
+        let ack = self.in_flight.map(|frame| frame.sent + Self::ACK_TIMEOUT);
         match (beat, ack) {
             (Some(beat), Some(ack)) => Some(beat.max(ack)),
             (beat, ack) => beat.or(ack),
@@ -938,7 +979,7 @@ impl FramePacer {
             .is_none_or(|start| now >= start + Self::INTERVAL);
         let ack_ok = self
             .in_flight
-            .is_none_or(|(_, sent)| now >= sent + Self::ACK_TIMEOUT);
+            .is_none_or(|frame| now >= frame.sent + Self::ACK_TIMEOUT);
         beat_ok && ack_ok
     }
 
@@ -949,17 +990,30 @@ impl FramePacer {
 
     /// 帧 `seq` 已发出；它包含此前所有变化。
     fn sent(&mut self, seq: u32, now: Instant) {
-        self.in_flight = Some((seq, now));
+        self.in_flight = Some(InFlight {
+            seq,
+            sent: now,
+            since: self.dirty_since.take(),
+        });
         self.pending = false;
     }
 
-    /// Dart 处理完了帧 `seq`（以及它之前的帧）。
-    fn acked(&mut self, seq: u32) {
-        if let Some((in_flight, _)) = self.in_flight
-            && seq.wrapping_sub(in_flight) < u32::MAX / 2
-        {
-            self.in_flight = None;
+    /// 上一帧发出后还没等到确认。
+    fn awaiting_ack(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// Dart 处理完了帧 `seq`（以及它之前的帧）。返回这一帧所含内容的显示延迟：从最早的
+    /// 那次变化到现在。
+    fn acked(&mut self, seq: u32, now: Instant) -> Option<Duration> {
+        let frame = self.in_flight?;
+        if seq.wrapping_sub(frame.seq) >= u32::MAX / 2 {
+            return None;
         }
+        self.in_flight = None;
+        frame
+            .since
+            .map(|since| now.saturating_duration_since(since))
     }
 }
 
@@ -1111,6 +1165,11 @@ struct PerfWindow {
     pack_us_total: u64,
     pack_us_max: u32,
     bytes_total: u64,
+    /// 每帧的显示延迟（微秒），出报告时取分位数。
+    latencies_us: Vec<u32>,
+    ack_timeouts: u32,
+    input_bytes: u64,
+    sync_timeouts: u32,
 }
 
 impl PerfWindow {
@@ -1124,7 +1183,20 @@ impl PerfWindow {
             pack_us_total: 0,
             pack_us_max: 0,
             bytes_total: 0,
+            latencies_us: Vec::new(),
+            ack_timeouts: 0,
+            input_bytes: 0,
+            sync_timeouts: 0,
         }
+    }
+
+    fn record_latency(&mut self, latency: Duration) {
+        self.latencies_us
+            .push(u32::try_from(latency.as_micros()).unwrap_or(u32::MAX));
+    }
+
+    fn record_input(&mut self, bytes: usize) {
+        self.input_bytes += bytes as u64;
     }
 
     fn record(&mut self, render_us: u32, pack_us: u32, bytes: usize) -> u32 {
@@ -1145,6 +1217,14 @@ impl PerfWindow {
             return None;
         }
         let frames = self.frames;
+        self.latencies_us.sort_unstable();
+        let percentile = |p: usize| -> u32 {
+            if self.latencies_us.is_empty() {
+                return 0;
+            }
+            let index = (self.latencies_us.len() - 1) * p / 100;
+            self.latencies_us[index]
+        };
         let stats = PerfStats {
             session_id,
             frames,
@@ -1154,6 +1234,12 @@ impl PerfWindow {
             pack_us_avg: (self.pack_us_total / u64::from(frames)) as u32,
             pack_us_max: self.pack_us_max,
             bytes_avg: (self.bytes_total / u64::from(frames)) as u32,
+            latency_us_p50: percentile(50),
+            latency_us_p95: percentile(95),
+            latency_us_max: percentile(100),
+            ack_timeouts: self.ack_timeouts,
+            input_bytes: self.input_bytes,
+            sync_timeouts: self.sync_timeouts,
         };
         *self = Self {
             seq: self.seq,
@@ -1165,6 +1251,29 @@ impl PerfWindow {
 
 fn micros_since(start: std::time::Instant) -> u32 {
     u32::try_from(start.elapsed().as_micros()).unwrap_or(u32::MAX)
+}
+
+/// 引擎眼中的屏幕，按列展开：宽字符的第二列为空串（画面一致性自检）。
+fn screen_check(session_id: u32, frame: &RenderFrame) -> ScreenCheck {
+    let rows = frame
+        .rows
+        .iter()
+        .map(|row| {
+            let mut columns = Vec::with_capacity(usize::from(frame.size.cols));
+            for cell in row.cells.iter() {
+                columns.push(cell.text.clone());
+                if cell.width == 2 {
+                    columns.push(String::new());
+                }
+            }
+            columns
+        })
+        .collect();
+    ScreenCheck {
+        session_id,
+        cols: frame.size.cols,
+        rows,
+    }
 }
 
 /// 发出一帧，返回它的帧序号。
@@ -1294,7 +1403,7 @@ mod tests {
         assert!(!pacer.mark_dirty(later));
         assert!(!pacer.ready_for_pending(later));
         // ACK 到了：待发帧可以发。
-        pacer.acked(1);
+        pacer.acked(1, later);
         assert!(pacer.ready_for_pending(later));
     }
 
@@ -1304,11 +1413,35 @@ mod tests {
         let mut pacer = FramePacer::new();
         pacer.started(start);
         pacer.sent(1, start);
-        pacer.acked(1);
+        pacer.acked(1, start);
         assert!(!pacer.mark_dirty(start + Duration::from_millis(3)));
         assert_eq!(pacer.deadline(), Some(start + FramePacer::INTERVAL));
         // 60 Hz 的源（16.7 ms 一次）不会被合并。
         assert!(pacer.ready_for_pending(start + Duration::from_micros(16_700)));
+    }
+
+    /// 显示延迟从「还没画出去的最早一次变化」算起，到含它的那一帧被确认为止。
+    #[test]
+    fn pacer_measures_display_latency_from_the_first_pending_change() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new();
+        pacer.started(start);
+        pacer.sent(1, start);
+        assert_eq!(
+            pacer.acked(1, start),
+            None,
+            "a frame without pending changes has no latency"
+        );
+        let first = start + Duration::from_millis(2);
+        assert!(!pacer.mark_dirty(first), "within the beat: kept pending");
+        assert!(!pacer.mark_dirty(first + Duration::from_millis(1)));
+        let beat = start + FramePacer::INTERVAL;
+        pacer.started(beat);
+        pacer.sent(2, beat);
+        assert!(pacer.awaiting_ack());
+        let acked = beat + Duration::from_millis(5);
+        assert_eq!(pacer.acked(2, acked), Some(acked - first));
+        assert!(!pacer.awaiting_ack());
     }
 
     #[test]
@@ -1328,9 +1461,9 @@ mod tests {
         let mut pacer = FramePacer::new();
         pacer.started(start);
         pacer.sent(5, start);
-        pacer.acked(4);
+        pacer.acked(4, start);
         assert!(!pacer.mark_dirty(start + FramePacer::INTERVAL));
-        pacer.acked(5);
+        pacer.acked(5, start);
         assert!(pacer.ready_for_pending(start + FramePacer::INTERVAL));
     }
 

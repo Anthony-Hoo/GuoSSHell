@@ -28,6 +28,7 @@ import 'package:guosh_shell/src/bindings/bindings.dart';
 import '../settings/terminal_font.dart';
 import 'frame.dart';
 import 'frame_terminal.dart';
+import 'perf_monitor.dart';
 import 'prompt_dialogs.dart';
 import 'session_target.dart';
 
@@ -75,6 +76,9 @@ class TerminalPaneController extends ChangeNotifier {
 
   SessionState? get state => _state;
   bool get connected => _state == SessionState.connected;
+
+  /// 当前会话编号（信号按它分流；重连换新编号）。窗格还没布局时为 0。
+  int get sessionId => _pane?._sessionId ?? 0;
   bool get canCopy => selection.selection != null;
 
   /// 复制选区（取文在引擎里）。
@@ -188,7 +192,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _selectionSub = SelectionState.rustSignalStream.listen(_onSelectionState);
     _clipboardSub = ClipboardText.rustSignalStream.listen(_onClipboardText);
     _promptSub = InteractionPrompt.rustSignalStream.listen(_onPrompt);
-    if (kDebugMode) {
+    if (!kReleaseMode) {
       _perfSub = PerfStats.rustSignalStream.listen(_onPerfStats);
     }
     _terminal
@@ -274,6 +278,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onFrame(RustSignalPack<FrameUpdate> pack) {
     final msg = pack.message;
     if (!mounted || msg.sessionId != _sessionId) return;
+    final watch = Stopwatch()..start();
     try {
       final frame = decodeFrame(
         pack.binary,
@@ -308,17 +313,15 @@ class _TerminalPaneState extends State<TerminalPane> {
     } finally {
       // 流控：Rust 等到这一帧的 ACK 才发下一帧（解码失败也要回，免得它空等）。
       FrameAck(sessionId: msg.sessionId, seq: msg.seq).sendSignalToRust();
+      if (!kReleaseMode) PerfMonitor.instance.recordApply(msg.sessionId, watch.elapsedMicroseconds);
     }
   }
 
-  /// debug 构建的帧率自检（只打日志、不画浮层）：Rust 每 5 秒汇总一次
-  /// 出帧数与渲染/打包耗时。
+  /// 性能汇总（debug 与 profile 构建，只打日志、不画浮层）：Rust 每 5 秒一条，
+  /// PerfMonitor 补上 Dart 与 Flutter 这边的数据。
   void _onPerfStats(RustSignalPack<PerfStats> pack) {
-    final p = pack.message;
-    if (p.sessionId != _sessionId) return;
-    final fps = p.windowMs == 0 ? 0 : p.frames * 1000 / p.windowMs;
-    debugPrint('[perf] ${fps.toStringAsFixed(1)} fps · render avg ${p.renderUsAvg}µs '
-        'max ${p.renderUsMax}µs · pack avg ${p.packUsAvg}µs · ${p.bytesAvg} B/frame');
+    if (pack.message.sessionId != _sessionId) return;
+    PerfMonitor.instance.report(pack.message);
   }
 
   /// 引擎回显选区 → 记住（绝对行坐标）→ 投影到当前视口。

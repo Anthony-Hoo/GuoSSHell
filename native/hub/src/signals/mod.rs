@@ -299,7 +299,7 @@ pub struct ClipboardText {
     pub text: String,
 }
 
-/// 每 5 秒一条的性能汇总（M1 帧率验收的数字来源）。
+/// 每 5 秒一条的性能汇总（M1 帧率与 M6 性能验收的数字来源）。
 /// 单帧预算 16.67 ms（PLAN §4）：render_us + pack_us 的 max 是 Rust 侧的真实开销。
 #[derive(Serialize, RustSignal)]
 pub struct PerfStats {
@@ -313,4 +313,30 @@ pub struct PerfStats {
     pub pack_us_max: u32,
     /// 每帧压缩字节数的平均值（典型 5.8–7.2 KB，TUI 满屏最坏 61 KB）。
     pub bytes_avg: u32,
+    /// 显示延迟：远端输出进了引擎、到含它的那一帧被 Dart 确认（画完）为止，微秒。
+    /// Dart 跟不上时帧流控让它变大，而不是积压。
+    pub latency_us_p50: u32,
+    pub latency_us_p95: u32,
+    pub latency_us_max: u32,
+    /// 因 Dart 250 ms 内没确认上一帧而照发的帧数（Dart 卡住的迹象）。
+    pub ack_timeouts: u32,
+    /// 收到的远端输出字节数。
+    pub input_bytes: u64,
+    /// 到截止时刻才结束的同步输出（DEC 2026）次数（程序在一帧中途停下）。
+    pub sync_timeouts: u32,
+}
+
+/// 画面一致性自检（M6，测试用）：请求引擎按列给出当前屏幕。
+#[derive(Deserialize, DartSignal)]
+pub struct ScreenCheckRequest {
+    pub session_id: u32,
+}
+
+/// 引擎眼中的当前屏幕：每行每列一格，宽字符的第二列为空串。与 Dart 行池逐列比对，
+/// 字符丢失、错位、最后一帧没画上都会显出来。
+#[derive(Serialize, RustSignal)]
+pub struct ScreenCheck {
+    pub session_id: u32,
+    pub cols: u16,
+    pub rows: Vec<Vec<String>>,
 }

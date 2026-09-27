@@ -22,6 +22,10 @@ GuoSSHell/
 │       ├── settings/    设置与开源许可页
 │       ├── terminal/    帧解码与帧驱动的终端适配器、窗格、键位条、交互对话框
 │       └── workspace/   标签与分屏
+├── .github/             检查、单测、多架构构建与 tag 发版工作流
+├── android/             Android 宿主与 Keystore 初始化
+├── linux/               Linux GTK 宿主
+├── windows/             Windows 宿主
 ├── native/hub/          rinf 的 Rust 侧：信号层、会话、连接与认证、钥匙串、卡、安全密钥
 │   └── src/             lib.rs · signals/ · session.rs · connect.rs · keys.rs · card/ · security_key/ …
 ├── rust/                rshell-m0：上游内核的 pin 点（再导出 rshell-core/session）+ M0 探针与示例
@@ -37,6 +41,7 @@ GuoSSHell/
 ├── assets/              内置字体、Rust 依赖许可清单（许可页用）
 ├── about.toml / .hbs    cargo-about 配置与输出模板（scripts/licenses.sh）
 └── scripts/
+    ├── ci/              版本校验、构建打包、签名文件管理与 Release 门禁
     ├── setup.sh         幂等环境准备
     ├── sshd-test.sh     本地验收 SSH 服务器（Docker：vim / htop / 主机密钥变更 / 私钥与安全密钥授权）
     ├── sshd-test/m6/    M6 验收服务器的内容：假 AI 上游（aimock + 剧本）、m6-* 辅助程序、agent 配置

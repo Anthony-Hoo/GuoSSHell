@@ -46,6 +46,8 @@ DerivedData/
 /android/key.properties
 *.jks
 *.keystore
+*.p12
+/.local-signing/
 
 # CI 打包结果
 /dist/

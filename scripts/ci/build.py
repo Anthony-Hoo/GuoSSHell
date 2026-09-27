@@ -151,7 +151,11 @@ def main():
         if not sdkmanager.is_file():
             raise RuntimeError("ANDROID_HOME 下缺少 Android command-line tools")
         run(sdkmanager, f"ndk;{ndk}", "platforms;android-36", "build-tools;36.0.0", input="y\n" * 30, text=True)
-        run("flutter", "build", "apk", "--release", "--split-per-abi", "--target-platform=android-arm,android-arm64,android-x64", *options)
+        # 发布模式需要 Flutter 重新生成排除开发插件的 Android 注册表。
+        # --no-pub 的上游限制：flutter/flutter#169336。
+        android_options = [option for option in options if option != "--no-pub"]
+        run("flutter", "build", "apk", "--release", "--split-per-abi", "--target-platform=android-arm,android-arm64,android-x64", *android_options)
+        run("git", "diff", "--exit-code", "--", "Cargo.lock", "pubspec.lock")
         signing = "release" if os.environ.get("ANDROID_KEYSTORE_PATH") else "development"
         for abi in ["armeabi-v7a", "arm64-v8a", "x86_64"]:
             apk = ROOT / f"build/app/outputs/flutter-apk/app-{abi}-release.apk"

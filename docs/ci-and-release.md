@@ -87,7 +87,8 @@ tag 的版本覆盖 Flutter 的 build-name；预发布标识保留在发布名�
   备份关闭，避免将无法跨设备解密的凭证文件恢复到其他设备。
 - Windows：长私钥和口令使用当前用户的 DPAPI 加密文件，SSH 登录密码仍使用 Windows
   凭证管理器。密文绑定条目种类与 ID，不能直接交换或复制给其他用户使用。
-- Linux：需要图形桌面、D-Bus 会话和可用的 Secret Service（如 GNOME Keyring）。deb 会声明
+- Linux：以 Ubuntu 24.04 为构建基线，需要相应运行库、图形桌面、D-Bus 会话和可用的
+  Secret Service（如 GNOME Keyring）。deb 会声明
   这些依赖；压缩包用户需要自行提供运行环境。没有安全存储时不回退到明文。
 - iCloud 同步只在支持的 Apple 构建中可用。其他平台的 OpenPGP 卡和 FIDO2 系统接入仍见
   `docs/followups/20260927_新增平台的硬件认证与真机验收.md`。

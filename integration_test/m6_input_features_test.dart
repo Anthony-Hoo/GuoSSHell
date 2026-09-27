@@ -1,5 +1,6 @@
 // 缩放与键位条配置在真机上的集成回归；按键与手势在 Flutter 层注入。
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart' show ValueKey;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:guosh_shell/src/bindings/bindings.dart';
 import 'package:guosh_shell/src/terminal/key_bar_layout.dart';
@@ -18,6 +19,7 @@ void main() {
     final app = M6App(tester, binding);
     final original = SettingsState.latestRustSignal!.message.keyBarRows;
     try {
+      await saveKeyBarLayout(defaultKeyBarRows);
       await app.open(command: 'm6-keyecho --seconds 180');
       await app.waitScreen('M6-KEYECHO-READY');
       final pane = app.pane;
@@ -80,14 +82,36 @@ void main() {
 
       await tester.tap(find.byTooltip('编辑功能按钮'));
       await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('删除按钮').first);
+      await app.screenshot('keybar-visual-editor');
+      final drag = await tester.startGesture(
+        tester.getCenter(find.byKey(const ValueKey('preview-0-0'))),
+      );
+      await drag.moveBy(const Offset(0, 12));
+      await tester.pump();
+      await drag.moveTo(
+        tester.getCenter(find.byKey(const ValueKey('preview-1-8'))),
+      );
+      await tester.pump();
+      await drag.up();
+      await tester.pumpAndSettle();
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('preview-1-8')),
+          matching: find.text('Esc'),
+        ),
+        findsOneWidget,
+      );
+      await app.screenshot('keybar-visual-editor-dragged');
+      await tester.pump();
+      await tester.tap(find.text('删除所选按钮'));
       await tester.pump();
       await tester.tap(find.text('保存'));
       await tester.pumpAndSettle();
       final rows = tester
           .widget<TerminalKeyBar>(find.byType(TerminalKeyBar))
           .rows;
-      expect(rows.first, original.first.skip(1).toList());
+      expect(rows.first, defaultKeyBarRows.first.skip(1).toList());
+      expect(rows.last, defaultKeyBarRows.last);
       expect(pane.sessionId, session);
       final query = SettingsState.rustSignalStream.first;
       SettingsQuery().sendSignalToRust();
@@ -103,6 +127,7 @@ void main() {
           'keyboard_zoom': true,
           'pinch_zoom': true,
           'key_bar_persistence': true,
+          'key_bar_visual_drag': true,
           'session_preserved': pane.sessionId == session,
         },
       };

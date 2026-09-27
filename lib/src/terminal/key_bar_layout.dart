@@ -19,9 +19,24 @@ class KeyBarButton {
     this.text,
     this.ctrl = false,
   });
+
+  String get compactLabel => switch (id) {
+    'enter' => '↵',
+    'home' => '行首',
+    'end' => '行尾',
+    'pageUp' => '上页',
+    'pageDown' => '下页',
+    'ctrlC' => '^C',
+    'ctrlD' => '^D',
+    'ctrlZ' => '^Z',
+    'ctrlL' => '^L',
+    'zoomReset' => '重置',
+    _ => label,
+  };
 }
 
 const keyBarButtons = [
+  KeyBarButton('spacer', '空位'),
   KeyBarButton('escape', 'Esc', key: TerminalKey.escape),
   KeyBarButton('tab', 'Tab', key: TerminalKey.tab),
   KeyBarButton('up', '↑', key: TerminalKey.arrowUp),
@@ -68,19 +83,8 @@ const keyBarButtons = [
 ];
 
 const defaultKeyBarRows = [
-  [
-    'escape',
-    'tab',
-    'up',
-    'down',
-    'left',
-    'right',
-    'ctrl',
-    'alt',
-    'keyboard',
-    'backspace',
-  ],
-  ['disconnect', 'copy', 'paste', 'pipe', 'slash', 'minus', 'tilde', 'period'],
+  ['escape', 'slash', 'minus', 'home', 'up', 'end', 'keyboard', 'backspace'],
+  ['tab', 'ctrl', 'alt', 'left', 'down', 'right', 'copy', 'paste'],
 ];
 
 KeyBarButton? keyBarButton(String id) {

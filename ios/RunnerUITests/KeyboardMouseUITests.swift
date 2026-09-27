@@ -164,7 +164,7 @@ final class KeyboardMouseUITests: XCTestCase {
         let edit = app.buttons["编辑功能按钮"]
         XCTAssertTrue(edit.waitForExistence(timeout: 10))
         edit.tap()
-        XCTAssertTrue(app.buttons["添加按钮"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["添加按钮"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.buttons["恢复默认"].exists)
         let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         screenshot.name = "功能按钮编辑器"

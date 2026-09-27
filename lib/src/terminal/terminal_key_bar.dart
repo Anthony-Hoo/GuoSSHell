@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'frame_terminal.dart';
 import 'key_bar_layout.dart';
+import 'key_bar_visuals.dart';
 
 /// 可编辑的双排键位条。
 ///
@@ -109,148 +110,66 @@ class _TerminalKeyBarState extends State<TerminalKeyBar> {
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Container(
-      color: scheme.surface.withValues(alpha: 0.6),
-      child: SafeArea(
-        top: false,
-        child: ListenableBuilder(
-          listenable: Listenable.merge([widget.terminal, widget.extraListen]),
-          builder: (context, _) => Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    for (final row in widget.rows)
-                      if (row.isNotEmpty)
-                        _buildRow([
-                          for (final id in row)
-                            if (keyBarButton(id) case final button?)
-                              _buttonCap(context, scheme, button),
-                        ]),
-                  ],
-                ),
-              ),
-              IconButton(
-                tooltip: '编辑功能按钮',
-                onPressed: () {
-                  _repeatTimer?.cancel();
-                  _repeatTimer = null;
-                  _pressedId = null;
-                  _repeatingId = null;
-                  widget.terminal.clearModifiers();
-                  widget.onEdit();
-                },
-                icon: const Icon(Icons.tune, size: 20),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
+  void _edit() {
+    _repeatTimer?.cancel();
+    _repeatTimer = null;
+    _pressedId = null;
+    _repeatingId = null;
+    widget.terminal.clearModifiers();
+    widget.onEdit();
   }
 
-  TextStyle _capStyle(
-    ColorScheme scheme, {
-    String? fontFamily,
-    double fontSize = 12,
-  }) => TextStyle(
-    fontSize: fontSize,
-    fontFamily: fontFamily,
-    color: scheme.onSurface,
+  @override
+  Widget build(BuildContext context) => ColoredBox(
+    color: Theme.of(context).colorScheme.surface,
+    child: SafeArea(
+      top: false,
+      child: ListenableBuilder(
+        listenable: Listenable.merge([widget.terminal, widget.extraListen]),
+        builder: (context, _) => Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: KeyBarGrid(
+                rows: [
+                  for (var row = 0; row < widget.rows.length; row++)
+                    [
+                      for (var col = 0; col < widget.rows[row].length; col++)
+                        if (keyBarButton(widget.rows[row][col])
+                            case final button?)
+                          _buttonCap(button, '$row:$col'),
+                    ],
+                ],
+              ),
+            ),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _edit,
+              child: const KeyBarKeyFace(label: '编辑功能按钮', icon: Icons.tune),
+            ),
+          ],
+        ),
+      ),
+    ),
   );
 
-  /// Wrap 而不是 Row+Spacer：窄屏（iPhone 13 mini 级别）自动换行，
-  /// 不会溢出；也不用把 Spacer 塞进 Padding（ParentData 会炸）。
-  Widget _buildRow(List<Widget> children) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-      child: Wrap(spacing: 4, runSpacing: 2, children: children),
-    );
-  }
-
-  /// 通用按键帽：短按抬起发一次；长按触发后自动重复。
-  /// 固定宽度 + alignment 居中——不能用「minWidth + alignment」的组合，
-  /// 带 alignment 的 Container 在有界约束下会撑满可用宽度（iPad 上一个
-  /// 键帽占一整行就是这么来的）。
-  Widget _cap(
-    BuildContext context,
-    ColorScheme scheme,
-    String id,
-    double width,
-    void Function() send,
-    Widget child,
-  ) {
-    final lit = _isLit(id);
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: (_) => _down(id),
-      onTapUp: (_) => _up(id, send),
-      onTapCancel: () => _endRepeat(id),
-      onLongPressStart: (_) => _longPress(id, send),
-      onLongPressEnd: (_) => _endRepeat(id),
-      onLongPressCancel: () => _endRepeat(id),
-      child: Container(
-        width: width,
-        height: 34,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          border: Border.all(color: scheme.outline),
-          borderRadius: BorderRadius.circular(17),
-          color: lit ? scheme.primaryContainer : null,
+  Widget _buttonCap(KeyBarButton button, String position) {
+    if (button.id == 'spacer') {
+      return const SizedBox(width: keyBarCellWidth, height: keyBarCellHeight);
+    }
+    final modifier = button.id == 'ctrl' || button.id == 'alt';
+    if (modifier) {
+      return GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => widget.terminal.tapModifier(button.id),
+        onLongPressStart: (_) => widget.terminal.lockModifier(button.id),
+        child: KeyBarKeyFace(
+          label: button.label,
+          displayLabel: button.compactLabel,
+          active: widget.terminal.isModifierLatched(button.id),
+          locked: widget.terminal.isModifierLocked(button.id),
         ),
-        child: child,
-      ),
-    );
-  }
-
-  /// 动作键帽（复制/粘贴）：单发、无自动重复；action 为 null 时置灰。
-  Widget _actionCap(
-    BuildContext context,
-    ColorScheme scheme,
-    String label,
-    VoidCallback? action,
-  ) {
-    final enabled = action != null;
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: enabled ? action : null,
-      child: Container(
-        width: 48,
-        height: 34,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          border: Border.all(
-            color: enabled
-                ? scheme.outline
-                : scheme.outline.withValues(alpha: 0.4),
-          ),
-          borderRadius: BorderRadius.circular(17),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            fontSize: 12,
-            color: enabled
-                ? scheme.onSurface
-                : scheme.onSurface.withValues(alpha: 0.4),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buttonCap(
-    BuildContext context,
-    ColorScheme scheme,
-    KeyBarButton button,
-  ) {
-    if (button.id == 'ctrl' || button.id == 'alt') {
-      return _modifierCap(context, scheme, button.id, button.label);
+      );
     }
     final action = switch (button.id) {
       'keyboard' => widget.onToggleKeyboard,
@@ -263,66 +182,37 @@ class _TerminalKeyBarState extends State<TerminalKeyBar> {
       _ => null,
     };
     if (button.key == null && button.text == null) {
-      return _actionCap(context, scheme, button.label, action);
-    }
-    return Tooltip(
-      message: button.label,
-      child: _cap(
-        context,
-        scheme,
-        button.id,
-        button.label.length > 4 ? 76 : 48,
-        () {
-          if (button.key case final key?) {
-            widget.terminal.keyInput(key, ctrl: button.ctrl);
-          } else {
-            widget.terminal.textInput(button.text!);
-          }
-        },
-        Text(
-          button.label,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: _capStyle(scheme),
+      return GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: action,
+        child: KeyBarKeyFace(
+          label: button.label,
+          displayLabel: button.compactLabel,
+          enabled: action != null,
         ),
-      ),
-    );
-  }
+      );
+    }
+    void send() {
+      if (button.key case final key?) {
+        widget.terminal.keyInput(key, ctrl: button.ctrl);
+      } else {
+        widget.terminal.textInput(button.text!);
+      }
+    }
 
-  /// 修饰键帽：点按循环（挂住 → 锁定 → 解除），长按直接锁定。
-  /// 修饰键不参与自动重复。
-  Widget _modifierCap(
-    BuildContext context,
-    ColorScheme scheme,
-    String modifier,
-    String label,
-  ) {
-    final locked = widget.terminal.isModifierLocked(modifier);
-    final latched = widget.terminal.isModifierLatched(modifier);
+    // 位置标识区分同名按钮，按住一个时不会点亮其他副本。
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: () => widget.terminal.tapModifier(modifier),
-      onLongPressStart: (_) => widget.terminal.lockModifier(modifier),
-      child: Container(
-        width: 56,
-        height: 34,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          border: Border.all(color: scheme.outline),
-          borderRadius: BorderRadius.circular(17),
-          color: locked
-              ? scheme.primary
-              : latched
-              ? scheme.primaryContainer
-              : null,
-        ),
-        child: Text(
-          locked ? '$label 🔒' : label,
-          style: TextStyle(
-            fontSize: 12,
-            color: locked ? scheme.onPrimary : scheme.onSurface,
-          ),
-        ),
+      onTapDown: (_) => _down(position),
+      onTapUp: (_) => _up(position, send),
+      onTapCancel: () => _endRepeat(position),
+      onLongPressStart: (_) => _longPress(position, send),
+      onLongPressEnd: (_) => _endRepeat(position),
+      onLongPressCancel: () => _endRepeat(position),
+      child: KeyBarKeyFace(
+        label: button.label,
+        displayLabel: button.compactLabel,
+        active: _isLit(position),
       ),
     );
   }

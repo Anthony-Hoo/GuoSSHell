@@ -122,6 +122,7 @@ pub async fn run(context: Arc<AppContext>) {
                 let saved = validate_key_bar_rows(&pack.message.rows).and_then(|()| {
                     context.preferences.update(|preferences| {
                         preferences.key_bar_rows = Some(pack.message.rows);
+                        preferences.key_bar_layout_version = 1;
                     })
                 });
                 KeyBarLayoutResult {
@@ -180,12 +181,10 @@ async fn publish(context: &Arc<AppContext>) {
         max_font_size: f64::from(MAX_FONT_SIZE),
         scrollback_lines: u32::try_from(settings.scrollback_lines).unwrap_or(u32::MAX),
         max_scrollback_lines: u32::try_from(scrollback_cap()).unwrap_or(u32::MAX),
-        key_bar_rows: context
-            .preferences
-            .get()
-            .key_bar_rows
-            .filter(|rows| validate_key_bar_rows(rows).is_ok())
-            .unwrap_or_else(default_key_bar_rows),
+        key_bar_rows: {
+            let preferences = context.preferences.get();
+            effective_key_bar_rows(preferences.key_bar_rows, preferences.key_bar_layout_version)
+        },
         show_key_bar: context
             .preferences
             .get()
@@ -197,6 +196,7 @@ async fn publish(context: &Arc<AppContext>) {
 
 /// 稳定标识与 Flutter 的按钮目录对应；自定义文本不包含控制字符。
 const KEY_BAR_BUTTONS: &[&str] = &[
+    "spacer",
     "escape",
     "tab",
     "up",
@@ -246,6 +246,31 @@ pub fn default_key_bar_rows() -> Vec<Vec<String>> {
     [
         vec![
             "escape",
+            "slash",
+            "minus",
+            "home",
+            "up",
+            "end",
+            "keyboard",
+            "backspace",
+        ],
+        vec![
+            "tab", "ctrl", "alt", "left", "down", "right", "copy", "paste",
+        ],
+    ]
+    .into_iter()
+    .map(|row| row.into_iter().map(str::to_owned).collect())
+    .collect()
+}
+
+/// 仅升级旧版本的原始默认排布；自定义排布以及新保存的配置保持原样。
+fn effective_key_bar_rows(rows: Option<Vec<Vec<String>>>, version: u8) -> Vec<Vec<String>> {
+    let Some(rows) = rows.filter(|rows| validate_key_bar_rows(rows).is_ok()) else {
+        return default_key_bar_rows();
+    };
+    const LEGACY: [&[&str]; 2] = [
+        &[
+            "escape",
             "tab",
             "up",
             "down",
@@ -256,7 +281,7 @@ pub fn default_key_bar_rows() -> Vec<Vec<String>> {
             "keyboard",
             "backspace",
         ],
-        vec![
+        &[
             "disconnect",
             "copy",
             "paste",
@@ -266,10 +291,17 @@ pub fn default_key_bar_rows() -> Vec<Vec<String>> {
             "tilde",
             "period",
         ],
-    ]
-    .into_iter()
-    .map(|row| row.into_iter().map(str::to_owned).collect())
-    .collect()
+    ];
+    if version == 0
+        && rows
+            .iter()
+            .zip(LEGACY)
+            .all(|(row, expected)| row.iter().map(String::as_str).eq(expected.iter().copied()))
+    {
+        default_key_bar_rows()
+    } else {
+        rows
+    }
 }
 
 fn validate_key_bar_rows(rows: &[Vec<String>]) -> Result<(), String> {
@@ -318,6 +350,50 @@ mod tests {
         assert_eq!(loaded.show_key_bar, Some(true));
         assert_eq!(loaded.key_bar_rows, Some(rows));
         std::fs::remove_dir_all(directory).expect("清理");
+    }
+
+    #[test]
+    fn key_bar_default_upgrade_preserves_custom_and_newly_saved_layouts() {
+        let old = vec![
+            vec![
+                "escape",
+                "tab",
+                "up",
+                "down",
+                "left",
+                "right",
+                "ctrl",
+                "alt",
+                "keyboard",
+                "backspace",
+            ],
+            vec![
+                "disconnect",
+                "copy",
+                "paste",
+                "pipe",
+                "slash",
+                "minus",
+                "tilde",
+                "period",
+            ],
+        ]
+        .into_iter()
+        .map(|row| row.into_iter().map(str::to_owned).collect())
+        .collect::<Vec<Vec<String>>>();
+        assert_eq!(
+            super::effective_key_bar_rows(Some(old.clone()), 0),
+            super::default_key_bar_rows()
+        );
+        assert_eq!(super::effective_key_bar_rows(Some(old.clone()), 1), old);
+        let custom = vec![vec!["f1".to_owned()], vec![]];
+        assert_eq!(
+            super::effective_key_bar_rows(Some(custom.clone()), 0),
+            custom
+        );
+        let default = super::default_key_bar_rows();
+        let up = default[0].iter().position(|id| id == "up").expect("上");
+        assert_eq!(&default[1][up - 1..=up + 1], &["left", "down", "right"]);
     }
 
     #[test]

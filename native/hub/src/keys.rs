@@ -229,6 +229,9 @@ pub struct Preferences {
     /// 未配置时使用默认排布；空排与未配置有不同含义。
     #[serde(default)]
     pub key_bar_rows: Option<Vec<Vec<String>>>,
+    /// 标记默认排布的版本；保存过的新配置不再按旧默认值迁移。
+    #[serde(default)]
+    pub key_bar_layout_version: u8,
 }
 
 pub struct PreferenceFile {

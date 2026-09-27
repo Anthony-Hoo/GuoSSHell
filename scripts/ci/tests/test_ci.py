@@ -6,10 +6,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from metadata import CONFIG, metadata
-from release import validate
+from release import validate, verify_tag
 
 SHA = "a" * 40
 NOW = 1_790_510_400
@@ -80,6 +81,12 @@ class ReleaseGate(unittest.TestCase):
         path.write_text(json.dumps(data))
         with self.assertRaises(ValueError):
             validate(self.directory, "2.3.4", SHA)
+
+    def test_remote_tag_must_still_reference_the_built_commit(self):
+        with patch("release.subprocess.check_output", return_value=SHA + "\n"):
+            verify_tag("owner/repository", "v2.3.4", SHA)
+        with patch("release.subprocess.check_output", return_value="b" * 40), self.assertRaises(RuntimeError):
+            verify_tag("owner/repository", "v2.3.4", SHA)
 
 
 if __name__ == "__main__":

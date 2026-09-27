@@ -52,6 +52,14 @@ def gh(*args, **kwargs):
     return subprocess.run(["gh", *args], check=True, **kwargs)
 
 
+def verify_tag(repository, tag, commit):
+    actual = subprocess.check_output(
+        ["gh", "api", f"repos/{repository}/commits/{tag}", "--jq", ".sha"], text=True
+    ).strip()
+    if actual != commit:
+        raise RuntimeError("远端 tag 已移动，拒绝发布与标签不一致的构建")
+
+
 def main():
     directory = Path(sys.argv[1]).resolve()
     version = os.environ["GUOSH_CI_VERSION"]
@@ -60,6 +68,7 @@ def main():
     tag = f"v{version}"
     if os.environ.get("GITHUB_REF") != f"refs/tags/{tag}":
         raise RuntimeError("仅允许当前版本 tag 发布")
+    verify_tag(repository, tag, commit)
     files = validate(directory, version, commit)
     checksums = directory / "SHA256SUMS.txt"
     checksums.write_text("".join(f"{digest}  {name}\n" for name, digest in sorted(files.items())))
@@ -86,6 +95,7 @@ def main():
     assets = [str(path) for path in sorted(directory.iterdir())]
     gh("release", "upload", tag, *assets, "--repo", repository, "--clobber")
     prerelease = os.environ.get("GUOSH_CI_PRERELEASE") == "true"
+    verify_tag(repository, tag, commit)
     gh("release", "edit", tag, "--repo", repository, "--draft=false",
        f"--prerelease={str(prerelease).lower()}", "--notes-file", str(notes))
 

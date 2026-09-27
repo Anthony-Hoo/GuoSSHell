@@ -95,7 +95,11 @@ def main():
     if platform in ["ios", "ios-simulator", "macos"]:
         config = ROOT / "build/ci/unsigned.xcconfig"
         config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text("CODE_SIGNING_ALLOWED = NO\nCODE_SIGNING_REQUIRED = NO\nDEVELOPMENT_TEAM =\n")
+        architectures = "arm64 x86_64" if arch == "universal" else ("x86_64" if arch == "x64" else arch)
+        config.write_text(
+            "CODE_SIGNING_ALLOWED = NO\nCODE_SIGNING_REQUIRED = NO\nDEVELOPMENT_TEAM =\n"
+            f"ARCHS = {architectures}\nONLY_ACTIVE_ARCH = NO\n"
+        )
         os.environ["XCODE_XCCONFIG_FILE"] = str(config)
     if platform == "macos":
         run("flutter", "build", "macos", "--release", *options)

@@ -81,6 +81,7 @@ jobs:
           path: coverage/lcov.info
           if-no-files-found: ignore
           retention-days: 14
+          overwrite: true
 
   build:
     name: 构建 / ${{ matrix.id }}
@@ -133,6 +134,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+          overwrite: true
       - name: 删除临时签名文件
         if: always() && matrix.platform == 'android'
         run: python scripts/ci/android_signing.py clean

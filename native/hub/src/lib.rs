@@ -28,12 +28,7 @@ mod security_key;
 mod session;
 mod settings;
 mod signals;
-#[cfg(any(
-    test,
-    target_os = "android",
-    target_os = "linux",
-    target_os = "windows"
-))]
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
 mod system_keys;
 #[cfg(target_os = "windows")]
 mod windows_keys;

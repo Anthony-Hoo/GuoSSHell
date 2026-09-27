@@ -21,12 +21,23 @@ runs:
         sudo apt-get update
         sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libssl-dev libsecret-1-dev xvfb dbus-x11 gnome-keyring
     - name: 配置 Flutter
+      if: runner.arch != 'ARM64' || runner.os == 'macOS'
       uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
       with:
         flutter-version: ${{ steps.versions.outputs.flutter }}
         channel: stable
         architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
         cache: true
+    - name: 缓存原生 ARM64 Flutter SDK
+      if: runner.arch == 'ARM64' && runner.os != 'macOS'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/flutter-native
+        key: flutter-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.versions.outputs.flutter_revision }}
+    - name: 从固定源码准备 ARM64 工具链
+      if: runner.arch == 'ARM64' && runner.os != 'macOS'
+      shell: bash
+      run: python scripts/ci/flutter_native.py
     - name: 配置 Rust
       uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       with:

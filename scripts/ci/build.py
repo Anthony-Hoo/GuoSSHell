@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import struct
 import sys
@@ -98,8 +99,13 @@ def main():
         os.environ["XCODE_XCCONFIG_FILE"] = str(config)
     if platform == "macos":
         run("flutter", "build", "macos", "--release", *options)
-        app = ROOT / "build/macos/Build/Products/Release/guosh_shell.app"
-        check_binary(app / "Contents/MacOS/guosh_shell", platform, arch)
+        applications = list((ROOT / "build/macos/Build/Products/Release").glob("*.app"))
+        if len(applications) != 1:
+            raise RuntimeError("macOS 构建目录必须包含唯一的应用 bundle")
+        app = applications[0]
+        with open(app / "Contents/Info.plist", "rb") as info:
+            executable = plistlib.load(info)["CFBundleExecutable"]
+        check_binary(app / "Contents/MacOS" / executable, platform, arch)
         run("codesign", "--force", "--deep", "--sign", "-", "--entitlements", "macos/Runner/Release.entitlements", app)
         run("codesign", "--verify", "--deep", "--strict", app)
         archive_zip(app, dist / f"{prefix}-adhoc.zip")
@@ -136,7 +142,11 @@ def main():
         if os.environ.get("GUOSH_CI_RELEASE") == "true" and not os.environ.get("ANDROID_KEYSTORE_PATH"):
             raise RuntimeError("版本发版不能使用 Android 调试签名")
         ndk = CONFIG["android_ndk"]
-        run("sdkmanager", f"ndk;{ndk}", "platforms;android-36", "build-tools;36.0.0")
+        sdk_root = Path(os.environ["ANDROID_HOME"])
+        sdkmanager = sdk_root / "cmdline-tools/latest/bin/sdkmanager"
+        if not sdkmanager.is_file():
+            raise RuntimeError("ANDROID_HOME 下缺少 Android command-line tools")
+        run(sdkmanager, f"ndk;{ndk}", "platforms;android-36", "build-tools;36.0.0", input="y\n" * 30, text=True)
         run("flutter", "build", "apk", "--release", "--split-per-abi", "--target-platform=android-arm,android-arm64,android-x64", *options)
         signing = "release" if os.environ.get("ANDROID_KEYSTORE_PATH") else "development"
         for abi in ["armeabi-v7a", "arm64-v8a", "x86_64"]:
@@ -144,7 +154,7 @@ def main():
             with zipfile.ZipFile(apk) as archive:
                 if f"lib/{abi}/libhub.so" not in archive.namelist():
                     raise RuntimeError(f"APK 缺少 Rust 库：{abi}")
-            signer = Path(os.environ["ANDROID_HOME"]) / "build-tools/36.0.0/apksigner"
+            signer = sdk_root / "build-tools/36.0.0/apksigner"
             run(signer, "verify", "--verbose", apk)
             shutil.copyfile(apk, dist / f"GuoSSHell-{version}-android-{abi}-{signing}.apk")
     else:

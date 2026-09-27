@@ -10,7 +10,6 @@ use crate::keys::{Item, KeyStore, StoreError};
 
 pub struct SystemKeyStore {
     store: Arc<CredentialStore>,
-    windows_backend: bool,
 }
 
 impl SystemKeyStore {
@@ -21,22 +20,14 @@ impl SystemKeyStore {
             .map_err(|error| error.to_string())?;
         let store =
             keyring_core::get_default_store().ok_or_else(|| "系统凭证存储不可用".to_owned())?;
-        Ok(Self {
-            store,
-            windows_backend: cfg!(target_os = "windows"),
-        })
+        Ok(Self { store })
     }
 
     fn entry(&self, item: Item, id: &str, synchronized: bool) -> Result<Entry, StoreError> {
         if synchronized {
             return Err(StoreError("此平台不支持 iCloud 同步".to_owned()));
         }
-        let modifiers = self
-            .windows_backend
-            .then(|| HashMap::from([("persistence", "Local")]));
-        self.store
-            .build(item.service(), id, modifiers.as_ref())
-            .map_err(failure)
+        self.store.build(item.service(), id, None).map_err(failure)
     }
 }
 
@@ -81,13 +72,7 @@ impl KeyStore for SystemKeyStore {
         if synchronized {
             return Err(StoreError("此平台不支持 iCloud 同步".to_owned()));
         }
-        // Windows 按 target 的正则查找，其余后端按 service 查找。
-        let pattern = format!("\\.{}$", item.service().replace('.', "\\."));
-        let spec = if self.windows_backend {
-            HashMap::from([("pattern", pattern.as_str())])
-        } else {
-            HashMap::from([("service", item.service())])
-        };
+        let spec = HashMap::from([("service", item.service())]);
         let entries = self.store.search(&spec).map_err(failure)?;
         Ok(entries
             .iter()
@@ -112,7 +97,6 @@ mod tests {
     fn system_store_preserves_binary_keys_and_separates_passphrases() {
         let store = SystemKeyStore {
             store: keyring_core::sample::Store::new().expect("内存系统存储"),
-            windows_backend: false,
         };
         let bytes = [0, 255, 1, 2];
         store

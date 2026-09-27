@@ -55,6 +55,7 @@ pub enum SkFailure {
     /// 这台设备（或这个构建）用不了安全密钥。
     Unavailable,
     /// 用户取消了系统的安全密钥界面。
+    #[cfg_attr(not(any(target_os = "ios", target_os = "macos")), allow(dead_code))]
     Cancelled,
     /// 安全密钥给的数据不对（或不是 OpenSSH 能验证的格式）。
     Invalid(String),

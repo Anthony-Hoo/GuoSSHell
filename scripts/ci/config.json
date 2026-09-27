@@ -67,5 +67,6 @@
       "arch": "arm,arm64,x64",
       "rust_targets": "armv7-linux-androideabi,aarch64-linux-android,x86_64-linux-android"
     }
-  ]
+  ],
+  "flutter_revision": "6a19cca56475dbfba1478ee68d7bd0c2ef891da1"
 }

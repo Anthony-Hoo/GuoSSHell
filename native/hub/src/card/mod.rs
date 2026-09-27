@@ -226,8 +226,43 @@ impl CardContext {
         Ok(info)
     }
 
-    /// 验证 PIN 后让卡签名，返回 SSH 签名 blob。`nfc` 时先弹 NFC 界面等卡靠近（整个过程
-    /// 一次靠近完成）。`before_sign` 在送签名命令前调用（提示用户按卡上的按键）。
+    /// 缓存 PIN 的取用、验证与失效都在卡锁内完成，排队者不能复用已失败的缓存。
+    /// 没有显式输入或有效缓存时返回 `None`，让调用者在锁外询问用户。
+    #[allow(clippy::too_many_arguments)]
+    fn sign_with_pin(
+        &self,
+        ident: &str,
+        expected: &PublicKey,
+        provided: Option<(SecretString, bool)>,
+        data: &[u8],
+        hash: Option<HashAlg>,
+        nfc: bool,
+        before_sign: &dyn Fn(bool),
+    ) -> Result<Option<Vec<u8>>, CardFailure> {
+        let _busy = lock(&self.busy);
+        let (pin, remember) = match provided {
+            Some(provided) => provided,
+            None => match self.remembered_pin(ident) {
+                Some(pin) => (pin, false),
+                None => return Ok(None),
+            },
+        };
+        let remembered = remember.then(|| pin.clone());
+        let result = self.sign_locked(ident, expected, pin, data, hash, nfc, before_sign);
+        match &result {
+            Ok(_) => {
+                if let Some(pin) = remembered {
+                    self.remember_pin(ident, pin);
+                }
+            }
+            Err(CardFailure::PinWrong { .. } | CardFailure::PinBlocked) => self.forget_pin(ident),
+            Err(_) => {}
+        }
+        result.map(Some)
+    }
+
+    /// 测试直接提供 PIN，仍经过生产代码的卡锁与缓存失效路径。
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn sign(
         &self,
@@ -239,7 +274,30 @@ impl CardContext {
         nfc: bool,
         before_sign: &dyn Fn(bool),
     ) -> Result<Vec<u8>, CardFailure> {
-        let _busy = lock(&self.busy);
+        self.sign_with_pin(
+            ident,
+            expected,
+            Some((pin, false)),
+            data,
+            hash,
+            nfc,
+            before_sign,
+        )?
+        .ok_or(CardFailure::Cancelled)
+    }
+
+    /// 持有卡锁时验证 PIN 并签名；NFC 会话覆盖整个卡操作。
+    #[allow(clippy::too_many_arguments)]
+    fn sign_locked(
+        &self,
+        ident: &str,
+        expected: &PublicKey,
+        pin: SecretString,
+        data: &[u8],
+        hash: Option<HashAlg>,
+        nfc: bool,
+        before_sign: &dyn Fn(bool),
+    ) -> Result<Vec<u8>, CardFailure> {
         let _nfc = if nfc {
             Some(self.reader.begin_nfc("将 OpenPGP 卡靠近设备以完成登录")?)
         } else {

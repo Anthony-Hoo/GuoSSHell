@@ -41,7 +41,7 @@ class FrameRun {
   final int start, len, attrs;
   final TermColor fg, bg;
   final String text;
-  final Uint8List? layout;
+  final List<int>? layout;
   const FrameRun({
     required this.start,
     required this.len,
@@ -77,10 +77,13 @@ class FrameRow {
 /// （跟着屏幕时就是屏幕），不一定从 [firstStableRow] 开始。
 class TerminalFrame {
   final int cols, rows;
+
   /// 光标在屏幕上的列与行；`-1` = 隐藏。
   final int cursorCol, cursorRow;
+
   /// 滚回范围：最早一行与屏幕首行的绝对行号。
   final int firstStableRow, screenTopStableRow;
+
   /// 远端设置的窗口标题（OSC 0 / 2）。
   final String title;
   final List<FrameRow> lines;
@@ -100,7 +103,8 @@ class TerminalFrame {
 /// wire 格式（全部小端）：
 /// row_count:u16 → 每行 { run_count:u16 · stable_row:i64 · wrapped:u8 →
 ///   每个 run { start:u16 · len:u16 · fg · bg · attrs:u8 · text_len:u32 · text ·
-///     [attrs 带 Attr.layout 时] cell_count:u16 · layout:[u8] } }
+///     [attrs 带 Attr.layout 时] cell_count:u16 · 每格 { descriptor:u8 · [扩展时] code_points:u32 } } }
+/// descriptor 高半字节非 0 时为码点数；为 0 时读取后续 u32，完整展开为 `码点数 << 4 | 宽度`。
 /// fg/bg：0=Default；1+u8=Ansi；2+r,g,b=Rgb。start / len 以列计。
 TerminalFrame decodeFrame(
   Uint8List binary, {
@@ -178,14 +182,23 @@ TerminalFrame decodeFrame(
       final attrs = u8();
       final textLen = u32();
       need(textLen);
-      final text = utf8.decode(binary.sublist(o, o + textLen), allowMalformed: true);
+      final text = utf8.decode(
+        binary.sublist(o, o + textLen),
+        allowMalformed: true,
+      );
       o += textLen;
-      Uint8List? layout;
+      List<int>? layout;
       if (attrs & Attr.layout != 0) {
         final cells = u16();
-        need(cells);
-        layout = binary.sublist(o, o + cells);
-        o += cells;
+        layout = List<int>.generate(cells, (_) {
+          final descriptor = u8();
+          final width = descriptor & 0x0f;
+          final count = descriptor >> 4 == 0 ? u32() : descriptor >> 4;
+          if (count == 0 || count > text.length || (width != 1 && width != 2)) {
+            throw FormatException('invalid cell layout at byte $o');
+          }
+          return (count << 4) | width;
+        }, growable: false);
       }
       runs.add(
         FrameRun(
@@ -199,9 +212,7 @@ TerminalFrame decodeFrame(
         ),
       );
     }
-    lines.add(
-      FrameRow(stableRow: stableRow, wrapped: wrapped, runs: runs),
-    );
+    lines.add(FrameRow(stableRow: stableRow, wrapped: wrapped, runs: runs));
   }
   if (o != binary.length) {
     throw FormatException('trailing bytes: stream=$binary.length consumed=$o');

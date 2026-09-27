@@ -542,6 +542,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       case KeyInputEvent(:final key, :final shift, :final control, :final alt):
         InputRequest(
           sessionId: _sessionId,
+          paste: false,
           text: '',
           key: key,
           shift: shift,
@@ -551,6 +552,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       case TextInputEvent(:final text):
         InputRequest(
           sessionId: _sessionId,
+          paste: false,
           text: text,
           key: '',
           shift: false,
@@ -558,7 +560,15 @@ class _TerminalPaneState extends State<TerminalPane> {
           alt: false,
         ).sendSignalToRust();
       case PasteInputEvent(:final text):
-        PasteRequest(sessionId: _sessionId, text: text).sendSignalToRust();
+        InputRequest(
+          sessionId: _sessionId,
+          paste: true,
+          text: text,
+          key: '',
+          shift: false,
+          control: false,
+          alt: false,
+        ).sendSignalToRust();
       case MouseInputEvent(
         :final button,
         :final action,

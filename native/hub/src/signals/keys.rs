@@ -33,6 +33,12 @@ pub struct KeySummary {
 #[derive(Serialize, RustSignal)]
 pub struct KeyListState {
     pub keys: Vec<KeySummary>,
+    /// 列表读取失败时不把空列表当作没有私钥。
+    pub list_error: KeyError,
+    /// 迁移或来源清理尚未完成，此时两个存储可能都留有副本。
+    pub sync_pending: bool,
+    /// 未完成迁移的目标；重试时使用它。
+    pub sync_target_enabled: bool,
     /// 私钥经 iCloud 钥匙串同步（新导入的私钥也放进 iCloud 钥匙串）。
     pub sync_enabled: bool,
     /// 这个构建能用 iCloud 钥匙串（没有团队签名的 macOS 构建不能）。

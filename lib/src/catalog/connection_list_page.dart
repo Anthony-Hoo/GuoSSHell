@@ -13,7 +13,9 @@ enum _RowAction { edit, duplicate, delete }
 
 /// 首页：连接目录（搜索、增删改、点按连接）。
 class ConnectionListPage extends StatefulWidget {
-  const ConnectionListPage({super.key});
+  final ValueChanged<String>? queryCatalog;
+
+  const ConnectionListPage({super.key, this.queryCatalog});
 
   @override
   State<ConnectionListPage> createState() => _ConnectionListPageState();
@@ -25,6 +27,7 @@ class _ConnectionListPageState extends State<ConnectionListPage> {
 
   /// null = 还没收到目录。
   List<ConnectionSummary>? _connections;
+  bool _wasCurrent = true;
 
   @override
   void initState() {
@@ -38,7 +41,22 @@ class _ConnectionListPageState extends State<ConnectionListPage> {
     _query();
   }
 
-  void _query() => CatalogQuery(query: _search.text).sendSignalToRust();
+  void _query() {
+    if (widget.queryCatalog case final query?) {
+      query(_search.text);
+    } else {
+      CatalogQuery(query: _search.text).sendSignalToRust();
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 选择器可在其他路由查询整个目录；返回首页时重新订阅搜索框的查询。
+    final current = ModalRoute.isCurrentOf(context) ?? true;
+    if (current && !_wasCurrent) _query();
+    _wasCurrent = current;
+  }
 
   @override
   void dispose() {
@@ -48,35 +66,43 @@ class _ConnectionListPageState extends State<ConnectionListPage> {
   }
 
   void _open(ConnectionSummary connection) {
-    Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => WorkspacePage(
-        initial: SessionTarget.saved(
-          connectionId: connection.id,
-          title: connectionTitle(connection),
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => WorkspacePage(
+          initial: SessionTarget.saved(
+            connectionId: connection.id,
+            title: connectionTitle(connection),
+          ),
         ),
       ),
-    ));
+    );
   }
 
   void _edit(ConnectionSummary? connection) {
-    Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => ConnectionEditorPage(existing: connection),
-    ));
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ConnectionEditorPage(existing: connection),
+      ),
+    );
   }
 
   void _quickConnect() {
-    Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => const ConnectionEditorPage(quick: true),
-    ));
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => const ConnectionEditorPage(quick: true),
+      ),
+    );
   }
 
   void _settings() {
-    Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => const SettingsPage(),
-    ));
+    Navigator.of(context)
+        .push(MaterialPageRoute<void>(builder: (_) => const SettingsPage()));
   }
 
-  Future<void> _onAction(ConnectionSummary connection, _RowAction action) async {
+  Future<void> _onAction(
+    ConnectionSummary connection,
+    _RowAction action,
+  ) async {
     switch (action) {
       case _RowAction.edit:
         _edit(connection);
@@ -105,7 +131,9 @@ class _ConnectionListPageState extends State<ConnectionListPage> {
             ],
           ),
         );
-        if (confirmed == true) await _run(() => deleteConnection(connection.id));
+        if (confirmed == true) {
+          await _run(() => deleteConnection(connection.id));
+        }
     }
   }
 
@@ -113,12 +141,15 @@ class _ConnectionListPageState extends State<ConnectionListPage> {
     String? message;
     try {
       final result = await request();
-      if (result.error != CatalogError.none) message = catalogErrorText(result.error);
+      if (result.error != CatalogError.none) {
+        message = catalogErrorText(result.error);
+      }
     } on TimeoutException {
       message = '操作超时';
     }
     if (message != null && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
     }
   }
 
@@ -200,12 +231,15 @@ class _ConnectionListPageState extends State<ConnectionListPage> {
       itemCount: connections.length,
       itemBuilder: (context, index) {
         final connection = connections[index];
-        final target = '${connection.username}@${connection.host}:${connection.port}';
+        final target =
+            '${connection.username}@${connection.host}:${connection.port}';
         return ListTile(
           leading: const Icon(Icons.dns_outlined),
           title: Text(connectionTitle(connection)),
           subtitle: Text(
-            connection.command.isEmpty ? target : '$target · ${connection.command}',
+            connection.command.isEmpty
+                ? target
+                : '$target · ${connection.command}',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
           ),

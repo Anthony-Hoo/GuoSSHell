@@ -3,11 +3,11 @@
 > 把 rsHell 的 **Rust 业务内核**原样搬到一个 Flutter 前端的 iOS / iPadOS 应用上。
 > 这份文件是实现期的唯一参考。所有结论都标注了证据来源；标「实测」的都是本机跑出来的，可复现。
 
-- 上游基线：`hugefiver/rsHell` @ `b2ab8656079225dc2c920c24f5d9e0124f4f83e1`（2026-09-14，MIT），
-  经 fork（`Anthony-Hoo/rsHell` 的 `guosh` 分支：基线 + 小补丁）**作为 pin 住 rev 的 git 依赖**
-  （上游源码不进本仓库；补丁逐条记在 `rust/UPSTREAM.md`）。
-  **改上游的原则**：能不改就不改；设计上明显不合理、或挡住必要能力时就改，按 §9.2 第 3 条
-  的规则走（在 fork 的 `guosh` 分支加提交、换 `rev`、在 UPSTREAM.md 记录改了哪几行、为什么）。
+- 当前上游：官方 `hugefiver/rsHell` @ `718d9b62a8f062af8f5787b5fc27f6c5bbb4f268`
+  （2026-09-27，MIT），**作为固定提交的 git 依赖**。上游源码不进本仓库，
+  所需认证与终端接口均已合并到官方仓库；依赖边界见 `rust/UPSTREAM.md`。
+  **改上游的原则**：优先复用官方接口；必要的新增能力向上游提交。升级时同步更新 `rev`
+  与根锁文件，按 §9.2 第 3 条验证后再使用。
 - 应用名：**GuoSSHell**
 - 开发环境：macOS（Apple Silicon）· Xcode 16+ · Flutter 3.x
   （**本机的具体版本号、工具绝对路径、真机清单、签名配置等一律不入库**，见 §7）
@@ -16,6 +16,7 @@
   - `docs/mvp-plan-2026-09-14.html`（里程碑与 M0 交接单）
   - `docs/acceptance-m6-2026-09-26.md`（M6 验收计划：coding agent、全屏 TUI、设备矩阵）
   - `docs/acceptance-device-2026-09-27.md`（真机 E2E 结果、性能门槛与修饰键问题）
+  - `docs/acceptance-review-2026-09-27.md`（官方 rsHell 兼容性与 PR 审查修复回归）
   - `rust/`（可运行的 M0 代码 + `bench_frame` 性能基准 + `UPSTREAM.md`）
 
 ---
@@ -653,7 +654,8 @@ subagent 靠派发时写进 prompt 的标记识别），并发与重试都安全
 比对，持续刷新的程序也能比。度量随 `PerfStats` 5 秒一窗：显示延迟（远端字节进引擎 → 含它的帧被
 Dart 确认）、ACK 超时、远端输出字节、同步超时；Dart 汇总帧应用耗时、Flutter 帧耗时与卡顿、RSS，
 非 release 构建打 `[m6-perf]`。宽度只以引擎为准：帧里的 run 按列定位，含宽字符与组合字符的 run 带
-每格的码点数与宽度，Dart 不再自己算宽度。同步输出（DEC 2026）150 ms 没有结束就照常显示（rsHell 补丁
+每格的码点数与宽度，Dart 不再自己算宽度；超过 15 个码点时使用扩展计数，保留完整组合字符。
+同步输出（DEC 2026）150 ms 没有结束就照常显示（rsHell 补丁
 P8，与 alacritty 一致）。只有用户发起的滚动能让视图离开底部（iOS 回弹动画与内容增长叠加时不算）。
 debug 构建的自动连接除了 `--dart-define`，也认进程环境变量 `GUOSH_*`：由 Rust 读取、随 `AppReady`
 交给 Dart（iOS 上 Dart 读不到进程环境变量），XCUITest 与 `simctl launch` 都经它传入。自动化分三层：
@@ -756,7 +758,7 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
 字体：内置 MesloLGS NF（常规与粗体，斜体由引擎合成），可选系统 Menlo；缺字回退内置字体。
 
 **M2a 粘贴与鼠标决定（2026-09-25）：**
-粘贴走 `PasteRequest`，由 Rust 处理：换行统一成 CR，剔除 Tab 以外的控制字符（防
+粘贴与键入共用 `InputRequest`（粘贴标记 `paste = true`）以保留顺序，由 Rust 处理：换行统一成 CR，剔除 Tab 以外的控制字符（防
 `ESC[201~` 注入），远端开了 bracketed paste（DECSET 2004，模式由 rsHell fork 补丁 P1 暴露）
 时包 `ESC[200~ … ESC[201~`；软键盘 / 输入法一次插入多行文本也改走粘贴。
 鼠标：Dart 只转发，编码与模式判断全在 Rust（`encode_mouse`；远端没开对应的上报就丢弃，
@@ -810,16 +812,16 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
 | 边界类型**沿用** `rshell-core::protocol` | 上游已有完整可序列化协议，重建等于在 Dart 写业务模型（违反铁律 1） |
 | **不做本地 shell 面板** | iOS 不可能；Rust 侧零改动，Flutter 侧不暴露入口即可 |
 | 帧格式：**结构化帧 + run 压缩 + 脏行增量** | §4.3 实测 |
-| **帧流控：Dart 处理完回 `FrameAck`，同一时刻至多一帧在途** | rinf 的队列无界，逐块出帧会在高输出下积压；在途期间的变化只保留最新状态。两帧渲染起点至少相隔 8 ms（不合并 60 Hz 刷新），ACK 缺失 250 ms 后照发；会话结束前先画出待发帧 |
+| **帧流控：Dart 处理完回 `FrameAck`，同一时刻至多一帧在途** | rinf 的队列无界，逐块出帧会在高输出下积压；在途期间的变化只保留最新状态。两帧渲染起点至少相隔 8 ms（不合并 60 Hz 刷新），ACK 缺失 250 ms 后照发；选区、尺寸变化与断线后的末帧共用同一节拍，关闭窗格直接释放会话 |
 | 度量权威归 **Flutter** | 字体度量只有一个权威，就是实际画字的那一方。`TerminalSize{cols,rows,pixel_width,pixel_height,dpi}` 由 Flutter 测完回传 |
 | 状态权威归 **Rust** | alacritty 网格只在 Rust 侧 |
 | M0 宿主用 **Swift 而不是 Flutter** | 把「SSH 通不通」与「Flutter 构建集成」两个未知量分开；`.a` 在两种宿主下通用，M1 换宿主零返工 |
 | M0 主机密钥策略：**TOFU 自动接受并落盘** | M0 前提是「不接 UI」，走完整确认会自相矛盾。**明确的技术债，M3 还清** |
 | release profile **不要设 `panic = "abort"`** | 上游 actor 靠 `catch_unwind` 把 panic 转成 `SessionEvent::Crashed`（有 `actor_panic_gtk_survival_macos` 测试守着），abort 会毁掉这条韧性设计 |
 | iPad 优先，iPhone 作为子项 | iPad 有大屏 + 硬件键盘 + 指针支持，能把最难的 IME/软键盘问题推到 M1-b |
-| **仓库形态：独立仓库 + 上游经 fork 作 git 依赖** | 本仓库只装我们自己的代码。上游 pin 到 fork 上的具体 `rev`（基线 + 逐条记录的小补丁）；`Cargo.lock` 进版本控制保证复现。代价：首次构建要联网、升级上游要在 fork 里 rebase。见 `rust/UPSTREAM.md` |
+| **仓库形态：独立仓库 + 官方上游 git 依赖** | 本仓库只装应用自己的代码。上游固定到官方仓库的具体 `rev`，根 `Cargo.lock` 进版本控制保证复现；升级需通过内核与应用回归，见 `rust/UPSTREAM.md` |
 | **keyring 的 iOS feature 从我们这边打开** | 不用改上游 `Cargo.toml`——Cargo 的 feature 是按包统一的。见 §3.2 |
-| **不应用上游的 `portable-pty-psmux` patch** | 它的改动全在 `src/win/*`，我们的目标不编译这些文件；换 git 依赖后 dev-dep 的 feature 冲突也自动消失 |
+| **使用上游仓内的 `portable-pty-psmux`** | Cargo 从同一官方提交解析 path 依赖，无需本仓库另设 root patch；Windows 专用代码不参与 iOS / macOS 编译 |
 | **iOS 上不删上游的本地传输，靠 `-Wl,-dead_strip` 裁符号** | 保留了 M5 里 macOS/Android 白拿本地面板的可能；将来真要摘掉就得 fork 上游（见 §9.2） |
 | **链接可行性用命令行验，不用 Xcode** | `scripts/link-check.sh`：两个切片各链进一个 iOS 可执行文件 + 符号审计 |
 | **连接方式：手工填写，不做自动发现** | 范围收窄，M0-c 只做「手填内网地址能连 + 权限处理 + 清晰失败提示」。mDNS/Bonjour 插件候选留在 §6.1 备查，不作为本期依赖 |
@@ -844,9 +846,9 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
    但 120×40 只是基准值。真实 iPad 上的默认字号/行列数要等 M1 画出来才好定。
 2. **M3 的凭证 UI 形态**：已定——每次连接都读钥匙串，不在内存缓存（§6.1 M3 决定）。
    Face ID 保护（钥匙串条目的访问控制）留到需要时再加。
-3. **上游 fork 的边界。** 已经 fork（UPSTREAM.md 的 P1 bracketed paste、P2 密码可不存、
-   P3 主机密钥变更提示、P4 内存私钥认证、P5 外部签名认证、P6 连接单独限时、P7 keepalive、
-   P8 同步输出超时）。M6 验收记下的几项终端协议能力（XTVERSION、颜色查询、OSC 52、焦点上报、
+3. **上游接口与升级边界。** 官方已提供 bracketed paste、密码可不存、主机密钥变更提示、
+   内存私钥认证、外部签名认证、连接单独限时、keepalive 与同步输出超时接口。
+   M6 验收记下的几项终端协议能力（XTVERSION、颜色查询、OSC 52、焦点上报、
    emoji 计宽）也要改上游，见各自的 followup。还有两个已知的可能再改上游的需求，都不急：
    - **把 iOS 不可用的三个传输（`local` / `pty` / `system_ssh`）从编译图里摘掉**，
      而不是靠链接器裁符号。现在靠 `-Wl,-dead_strip` 能压到 0（§3.2），所以**不急**；
@@ -854,8 +856,8 @@ LoginGraceTime 把关，与 OpenSSH 客户端一致；交给传输层的连接�
    - **给 `rshell-platform` 加真正的 iOS 分支**（它现在只分 `windows`/`unix`）。
      §2 里列过它「需要 iOS 分支」，但那可能是「实现时才发现不需要」——
      等到 M0-c（内网权限）或 M3（keyring）真的碰到壁垒再决定。
-   **决策规则**：改上游就在 fork 的 `guosh` 分支加提交、换 `rev=`，
-   在 `rust/UPSTREAM.md` 的「fork 补丁」里记下改了哪几行、为什么。
+   **决策规则**：新增能力向官方上游提交；应用升级到精确 `rev` 时同步更新根锁文件和
+   `rust/UPSTREAM.md`，验证上游内核、应用认证与会话回归、Flutter 测试及 iOS 构建。
 4. **自动发现（mDNS）要不要做**：本期明确不做，但如果 M0-c 的手填体验在局域网里太差，
    可以把它拉回来做一个独立里程碑（编号往后排，不要把 §5 的 M5 占掉——M5 是平台宽度）。
    候选插件已在 §6.1。

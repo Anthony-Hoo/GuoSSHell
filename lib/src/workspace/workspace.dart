@@ -7,7 +7,8 @@ import '../terminal/terminal_pane.dart';
 /// 工作区里的一个窗格：一条会话。[key] 让窗格在分屏、关窗格引起的重新布局中保住
 /// 自己的状态（会话不断）。
 class WorkspacePane {
-  WorkspacePane(SessionTarget target) : controller = TerminalPaneController(target);
+  WorkspacePane(SessionTarget target)
+    : controller = TerminalPaneController(target);
 
   final TerminalPaneController controller;
   final GlobalKey key = GlobalKey();
@@ -38,16 +39,15 @@ final class PaneSplit extends PaneNode {
   void _syncAreas() {
     final previous = {for (final area in layout.areas) area.data: area.flex};
     layout.areas = [
-      for (final child in children) Area(flex: previous[child] ?? 1, data: child),
+      for (final child in children)
+        Area(flex: previous[child] ?? 1, data: child),
     ];
   }
 }
 
 /// 一个标签：一棵分屏树与其中的活动窗格。
 class WorkspaceTab {
-  WorkspaceTab(WorkspacePane pane)
-      : root = PaneLeaf(pane),
-        active = pane;
+  WorkspaceTab(WorkspacePane pane) : root = PaneLeaf(pane), active = pane;
 
   PaneNode root;
   WorkspacePane active;
@@ -129,6 +129,10 @@ class Workspace extends ChangeNotifier {
         _activeIndex = (_activeIndex - 1).clamp(0, tabs.length);
       }
     } else {
+      // 先在同级子树里选相邻窗格，不能把局部 index 当作整棵树的索引。
+      final nextActive = index > 0
+          ? _edgePane(parent.children[index - 1], last: true)
+          : _edgePane(parent.children[index + 1], last: false);
       parent.children.removeAt(index);
       if (parent.children.length == 1) {
         _replace(tab, parent, parent.children.single);
@@ -136,8 +140,7 @@ class Workspace extends ChangeNotifier {
         parent._syncAreas();
       }
       if (tab.active == pane) {
-        final remaining = tab.panes;
-        tab.active = remaining[(index - 1).clamp(0, remaining.length - 1)];
+        tab.active = nextActive;
       }
     }
     _release(pane);
@@ -194,11 +197,22 @@ class Workspace extends ChangeNotifier {
   void _release(WorkspacePane pane) {
     pane.controller.removeListener(notifyListeners);
     // 窗格的 widget 要等这一帧重建时才从界面上移除（届时断开会话），之后再释放控制器。
-    WidgetsBinding.instance.addPostFrameCallback((_) => pane.controller.dispose());
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => pane.controller.dispose(),
+    );
   }
 
   WorkspaceTab _tabOf(WorkspacePane pane) =>
       tabs.firstWhere((tab) => tab.panes.contains(pane));
+
+  WorkspacePane _edgePane(PaneNode node, {required bool last}) =>
+      switch (node) {
+        PaneLeaf(:final pane) => pane,
+        PaneSplit(:final children) => _edgePane(
+          last ? children.last : children.first,
+          last: last,
+        ),
+      };
 
   /// 窗格叶子的父分支与它在父分支里的位置；叶子就是根时父分支为 null。
   (PaneSplit?, int) _parentOf(PaneNode node, WorkspacePane pane) {

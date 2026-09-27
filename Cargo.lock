@@ -2037,8 +2037,7 @@ dependencies = [
 [[package]]
 name = "portable-pty-psmux"
 version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "793e46fb3212b514f6eb694e26a64aeaca64b47a2d66b810351b44628e307a0e"
+source = "git+https://github.com/hugefiver/rsHell?rev=718d9b62a8f062af8f5787b5fc27f6c5bbb4f268#718d9b62a8f062af8f5787b5fc27f6c5bbb4f268"
 dependencies = [
  "anyhow",
  "downcast-rs",
@@ -2254,7 +2253,7 @@ dependencies = [
 [[package]]
 name = "rshell-core"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=7a77b724156cd65fd2bdced9b72be0ad7d9b963d#7a77b724156cd65fd2bdced9b72be0ad7d9b963d"
+source = "git+https://github.com/hugefiver/rsHell?rev=718d9b62a8f062af8f5787b5fc27f6c5bbb4f268#718d9b62a8f062af8f5787b5fc27f6c5bbb4f268"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2286,7 +2285,7 @@ dependencies = [
 [[package]]
 name = "rshell-platform"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=7a77b724156cd65fd2bdced9b72be0ad7d9b963d#7a77b724156cd65fd2bdced9b72be0ad7d9b963d"
+source = "git+https://github.com/hugefiver/rsHell?rev=718d9b62a8f062af8f5787b5fc27f6c5bbb4f268#718d9b62a8f062af8f5787b5fc27f6c5bbb4f268"
 dependencies = [
  "directories",
  "thiserror 2.0.20",
@@ -2296,7 +2295,7 @@ dependencies = [
 [[package]]
 name = "rshell-session"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=7a77b724156cd65fd2bdced9b72be0ad7d9b963d#7a77b724156cd65fd2bdced9b72be0ad7d9b963d"
+source = "git+https://github.com/hugefiver/rsHell?rev=718d9b62a8f062af8f5787b5fc27f6c5bbb4f268#718d9b62a8f062af8f5787b5fc27f6c5bbb4f268"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
@@ -2317,7 +2316,7 @@ dependencies = [
 [[package]]
 name = "rshell-storage"
 version = "0.1.0"
-source = "git+https://github.com/Anthony-Hoo/rsHell?rev=7a77b724156cd65fd2bdced9b72be0ad7d9b963d#7a77b724156cd65fd2bdced9b72be0ad7d9b963d"
+source = "git+https://github.com/hugefiver/rsHell?rev=718d9b62a8f062af8f5787b5fc27f6c5bbb4f268#718d9b62a8f062af8f5787b5fc27f6c5bbb4f268"
 dependencies = [
  "async-trait",
  "keyring",

@@ -8,10 +8,10 @@ SessionTarget target(String name) =>
 
 /// 树的形状：叶子写连接名，分支写 `h[...]` / `v[...]`。
 String shape(PaneNode node) => switch (node) {
-      PaneLeaf(:final pane) => pane.controller.target.title,
-      PaneSplit(:final axis, :final children) =>
-        '${axis == Axis.horizontal ? 'h' : 'v'}[${children.map(shape).join(',')}]',
-    };
+  PaneLeaf(:final pane) => pane.controller.target.title,
+  PaneSplit(:final axis, :final children) =>
+    '${axis == Axis.horizontal ? 'h' : 'v'}[${children.map(shape).join(',')}]',
+};
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -69,6 +69,38 @@ void main() {
     workspace.close(a);
     expect(workspace.tabs, isEmpty);
     expect(workspace.activePane, isNull);
+  });
+
+  test('关闭嵌套分屏的末尾窗格，焦点留在同级前一个窗格', () {
+    final workspace = Workspace();
+    final a = workspace.openTab(target('a'));
+    final b = workspace.split(a, Axis.horizontal, target('b'));
+    final c = workspace.split(b, Axis.vertical, target('c'));
+    workspace.close(c);
+    expect(shape(workspace.activeTab!.root), 'h[a,b]');
+    expect(workspace.activePane, b);
+  });
+
+  test('关闭嵌套分屏的首个窗格，焦点留在同级后一个窗格', () {
+    final workspace = Workspace();
+    final a = workspace.openTab(target('a'));
+    final b = workspace.split(a, Axis.horizontal, target('b'));
+    final c = workspace.split(b, Axis.vertical, target('c'));
+    workspace.activate(b);
+    workspace.close(b);
+    expect(shape(workspace.activeTab!.root), 'h[a,c]');
+    expect(workspace.activePane, c);
+  });
+
+  test('相邻项是子树时，焦点落在最靠近关闭位置的叶子', () {
+    final workspace = Workspace();
+    final a = workspace.openTab(target('a'));
+    final b = workspace.split(a, Axis.horizontal, target('b'));
+    final d = workspace.split(b, Axis.horizontal, target('d'));
+    final c = workspace.split(b, Axis.vertical, target('c'));
+    workspace.activate(d);
+    workspace.close(d);
+    expect(workspace.activePane, c);
   });
 
   test('窗格按从左到右轮换', () {

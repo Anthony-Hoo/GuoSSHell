@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize, DartSignal)]
 pub struct SettingsQuery {}
 
-#[derive(Deserialize, DartSignal)]
+/// 只提交被修改的字段，避免尚未收到旧回包时覆盖其他设置。
+#[derive(Default, Deserialize, DartSignal)]
 pub struct SaveSettings {
-    pub font_family: String,
-    pub font_size: f64,
-    pub scrollback_lines: u32,
-    pub show_key_bar: bool,
+    pub font_family: Option<String>,
+    pub font_size: Option<f64>,
+    pub scrollback_lines: Option<u32>,
+    pub show_key_bar: Option<bool>,
 }
 
 /// 键位条排布独立保存，避免覆盖同时修改的字体和滚回设置。

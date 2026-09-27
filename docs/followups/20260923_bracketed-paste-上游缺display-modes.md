@@ -22,5 +22,5 @@ adapter 把 `TermMode::BRACKETED_PASTE` 映射成 `TerminalDisplayModes`
 ## 结论
 
 rsHell fork 补丁 P1 暴露了 `TerminalDisplayModes.bracketed_paste`（见 `rust/UPSTREAM.md`）。
-粘贴走 `PasteRequest` 由 Rust 处理：换行统一成 CR、剔除 Tab 以外的控制字符（防 `\e[201~`
+粘贴与键入共用 `InputRequest`（粘贴标记 `paste = true`）以保留顺序，由 Rust 处理：换行统一成 CR、剔除 Tab 以外的控制字符（防 `\e[201~`
 注入），远端开启 DECSET 2004 时包 `\e[200~ … \e[201~`，未开启直发。

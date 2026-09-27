@@ -13,7 +13,7 @@ use rshell_m0::rshell_core::{CellAttributes, Color, RenderCell, RenderFrame};
 const ATTR_LAYOUT: u8 = 1 << 6;
 
 /// 每格都是「一个码点、宽 1」时的布局字节（码点数 << 4 | 宽度）。
-const SIMPLE_CELL: u8 = (1 << 4) | 1;
+const SIMPLE_CELL: u64 = (1 << 4) | 1;
 
 /// wire 格式（全部**小端**）：
 ///
@@ -23,12 +23,13 @@ const SIMPLE_CELL: u8 = (1 << 4) | 1;
 ///   run_count: u16 · stable_row: i64 · wrapped: u8
 ///   每个 run:
 ///     start: u16 · len: u16 · fg · bg · attrs: u8 · text_len: u32 · text: utf8
-///     [attrs 第 6 位为 1 时] cell_count: u16 · layout: [u8; cell_count]
+///     [attrs 第 6 位为 1 时] cell_count: u16 · 每格 { descriptor: u8 · [扩展时] code_points: u32 }
 /// ```
 ///
 /// `start` / `len` 以**列**计。run 里每格都是「一个码点、宽 1」时不带布局，text 的每个码点
 /// 就是一格；否则 layout 逐格给出 `码点数 << 4 | 宽度`（宽度 1 或 2，宽字符的第二列不单独成格，
 /// 码点数含组合字符与零宽连接符），按它从 text 里切出每一格。
+/// 超过 15 个码点的格子把 descriptor 的高半字节置 0，再用后续 u32 给出完整码点数。
 /// `fg` / `bg`：`0` = Default；`1` + `u8` = Ansi(index)；`2` + r,g,b = Rgb。
 /// `attrs` 位：0 bold · 1 italic · 2 underline · 3 strike · 4 reverse · 5 selected · 6 布局。
 pub fn pack_runs(frame: &RenderFrame) -> Vec<u8> {
@@ -45,8 +46,8 @@ pub fn pack_runs(frame: &RenderFrame) -> Vec<u8> {
                 cell.text.as_str()
             };
             let width = cell.width.clamp(1, 2);
-            let code_points = text.chars().count().clamp(1, 15) as u8;
-            let layout = (code_points << 4) | width;
+            let code_points = text.chars().count() as u64;
+            let layout = (code_points << 4) | u64::from(width);
             match runs.last_mut() {
                 Some(run) if same_run(run.head, cell) => run.push(text, width, layout),
                 _ => runs.push(Run::new(column, cell, text, width, layout)),
@@ -72,7 +73,15 @@ pub fn pack_runs(frame: &RenderFrame) -> Vec<u8> {
             out.extend_from_slice(run.text.as_bytes());
             if let Some(layout) = layout {
                 out.extend_from_slice(&(layout.len() as u16).to_le_bytes());
-                out.extend_from_slice(layout);
+                for &cell in layout {
+                    let code_points = cell >> 4;
+                    if code_points <= 15 {
+                        out.push(cell as u8);
+                    } else {
+                        out.push((cell & 0x0f) as u8);
+                        out.extend_from_slice(&(code_points as u32).to_le_bytes());
+                    }
+                }
             }
         }
     }
@@ -86,11 +95,11 @@ struct Run<'a> {
     cells: u16,
     head: &'a RenderCell,
     text: String,
-    layout: Option<Vec<u8>>,
+    layout: Option<Vec<u64>>,
 }
 
 impl<'a> Run<'a> {
-    fn new(start: u16, head: &'a RenderCell, text: &str, width: u8, layout: u8) -> Self {
+    fn new(start: u16, head: &'a RenderCell, text: &str, width: u8, layout: u64) -> Self {
         let mut run = Self {
             start,
             columns: 0,
@@ -103,7 +112,7 @@ impl<'a> Run<'a> {
         run
     }
 
-    fn push(&mut self, text: &str, width: u8, layout: u8) {
+    fn push(&mut self, text: &str, width: u8, layout: u64) {
         if layout != SIMPLE_CELL && self.layout.is_none() {
             self.layout = Some(vec![SIMPLE_CELL; usize::from(self.cells)]);
         }
@@ -178,7 +187,7 @@ mod tests {
         len: u16,
         fg: Vec<u8>,
         text: String,
-        layout: Option<Vec<u8>>,
+        layout: Option<Vec<u64>>,
     }
 
     fn decode(packed: &[u8]) -> Vec<Vec<DecodedRun>> {
@@ -216,7 +225,18 @@ mod tests {
                 let text = String::from_utf8(take_vec(text_len)).expect("utf8");
                 let layout = (attrs & (1 << 6) != 0).then(|| {
                     let cells = u16_of(&take_vec(2));
-                    take_vec(usize::from(cells))
+                    (0..cells)
+                        .map(|_| {
+                            let descriptor = u64::from(take_vec(1)[0]);
+                            if descriptor >> 4 != 0 {
+                                descriptor
+                            } else {
+                                let count =
+                                    u32::from_le_bytes(take_vec(4).try_into().expect("u32"));
+                                (u64::from(count) << 4) | descriptor
+                            }
+                        })
+                        .collect()
                 });
                 runs.push(DecodedRun {
                     start,
@@ -305,5 +325,32 @@ mod tests {
         let run = &rows[0][0];
         assert_eq!((run.start, run.len), (0, 80));
         assert_eq!(run.text.chars().count(), 40);
+    }
+
+    #[test]
+    fn long_combining_clusters_keep_the_following_cells_aligned() {
+        for (base, width) in [("a", 1), ("中", 2)] {
+            for count in [15, 16, 32, 256] {
+                let cluster = format!("{base}{}", "\u{301}".repeat(count - 1));
+                let rows = screen(&format!("{cluster}B"));
+                let run = &rows[0][0];
+                let layout = run.layout.as_ref().expect("组合字符布局");
+                assert_eq!(layout[0], ((count as u64) << 4) | width);
+                assert_eq!(layout[1], 0x11);
+                let mut chars = run.text.chars();
+                assert_eq!(
+                    chars
+                        .by_ref()
+                        .take((layout[0] >> 4) as usize)
+                        .collect::<String>(),
+                    cluster
+                );
+                assert_eq!(chars.next(), Some('B'));
+                assert_eq!(
+                    layout.iter().map(|cell| cell >> 4).sum::<u64>(),
+                    run.text.chars().count() as u64
+                );
+            }
+        }
     }
 }

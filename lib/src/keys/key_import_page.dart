@@ -11,7 +11,9 @@ const _maxKeyFileBytes = 64 * 1024;
 
 /// 导入私钥：粘贴原文或从文件选择。成功后返回私钥 id。
 class KeyImportPage extends StatefulWidget {
-  const KeyImportPage({super.key});
+  final Future<XFile?> Function()? pickFile;
+
+  const KeyImportPage({super.key, this.pickFile});
 
   @override
   State<KeyImportPage> createState() => _KeyImportPageState();
@@ -35,19 +37,33 @@ class _KeyImportPageState extends State<KeyImportPage> {
   }
 
   Future<void> _pickFile() async {
-    final file = await openFile();
-    if (file == null) return;
-    if (await file.length() > _maxKeyFileBytes) {
-      setState(() => _error = '文件太大，不像是私钥');
-      return;
-    }
-    final text = await file.readAsString();
-    if (!mounted) return;
+    if (_busy) return;
     setState(() {
-      _key.text = text;
+      _busy = true;
       _error = null;
-      if (_name.text.isEmpty) _name.text = file.name;
     });
+    try {
+      final file = await (widget.pickFile ?? () => openFile())();
+      if (file == null) return;
+      if (await file.length() > _maxKeyFileBytes) {
+        if (mounted) setState(() => _error = '文件太大，不像是私钥');
+        return;
+      }
+      final text = await file.readAsString();
+      if (!mounted) return;
+      setState(() {
+        _key.text = text;
+        if (_name.text.isEmpty) _name.text = file.name;
+      });
+    } on FormatException {
+      if (mounted) {
+        setState(() => _error = '文件不是有效的 UTF-8 文本，请选择 PEM 或 OpenSSH 私钥文件');
+      }
+    } catch (_) {
+      if (mounted) setState(() => _error = '无法读取文件，请确认文件可用后重试');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _import() async {
@@ -89,7 +105,10 @@ class _KeyImportPageState extends State<KeyImportPage> {
       appBar: AppBar(
         title: const Text('导入私钥'),
         actions: [
-          TextButton(onPressed: _busy ? null : _import, child: const Text('导入')),
+          TextButton(
+            onPressed: _busy ? null : _import,
+            child: const Text('导入'),
+          ),
         ],
       ),
       body: SafeArea(

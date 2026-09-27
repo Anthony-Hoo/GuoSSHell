@@ -1,7 +1,7 @@
 # GuoSSHell
 
 一个 **纯 SSH 客户端**，iOS / iPadOS（iPad 优先）与 macOS 共用一套代码。业务与终端语义跑在 **Rust**
-（上游 [rsHell](https://github.com/hugefiver/rsHell) 的内核，经我们的 fork 作为 pin 住 rev 的 git 依赖），
+（上游 [rsHell](https://github.com/hugefiver/rsHell) 的内核，直接作为固定提交的 git 依赖），
 只有渲染与交互用 **Flutter** 重写。Dart 不写业务逻辑。
 
 > **实现期的唯一参考是 [`PLAN.md`](PLAN.md)。** 动代码之前先读它。
@@ -94,13 +94,14 @@ flutter run -d <模拟器id 或 macos> \
 ## 真机验收
 
 真机的覆盖、结果、限制与复测命令见 [真机 E2E 补充验收](docs/acceptance-device-2026-09-27.md)。
+官方 rsHell 兼容性与审查修复回归见 [PR 审查修复验收](docs/acceptance-review-2026-09-27.md)。
 签名覆盖、设备标识与测试地址只保存在本机；日志、截图和报告位于 `build/m6/`。
 
 ## 上游与许可
 
-上游 `hugefiver/rsHell` @ `b2ab8656079225dc2c920c24f5d9e0124f4f83e1`，MIT。
-经我们的 fork（`Anthony-Hoo/rsHell` 的 `guosh` 分支）作为 git 依赖引入：基线之上只叠了
-几个小补丁，逐条记在 [`rust/UPSTREAM.md`](rust/UPSTREAM.md)。
+直接依赖官方 `hugefiver/rsHell` @ `718d9b62a8f062af8f5787b5fc27f6c5bbb4f268`，MIT。
+该提交包含 GuoSSHell 所需的认证、连接与终端接口，以及顶部滚动区域的稳定行号修复。
+接口与平台依赖边界见 [`rust/UPSTREAM.md`](rust/UPSTREAM.md)。
 
 我们只依赖 4 个内核 crate（`rshell-core` / `rshell-session` / `rshell-platform` /
 `rshell-storage`），**不用** `rshell-ui`（22,812 行 GTK4/Relm4 界面层，正是要用 Flutter 替掉的那层）。

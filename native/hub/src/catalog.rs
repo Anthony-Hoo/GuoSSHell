@@ -167,6 +167,10 @@ fn apply(
 
 /// 新建或修改一条连接，返回它的 id。
 fn save(context: &AppContext, request: SaveConnection) -> Result<String, CatalogError> {
+    let _operations = context
+        .key_operations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let existing = if request.id.is_empty() {
         None
     } else {
@@ -292,6 +296,10 @@ fn delete(context: &AppContext, id: &str) -> Result<(), CatalogError> {
 /// 复制出的连接排在原连接所在分组的末尾；已存的密码与原连接共用
 /// （上游按引用计数删除）。返回新连接的 id。
 fn duplicate(context: &AppContext, id: &str) -> Result<String, CatalogError> {
+    let _operations = context
+        .key_operations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let source = parse_id(id)?;
     let before = load(context)?;
     let group = before
@@ -344,6 +352,7 @@ mod tests {
             repository,
             known_hosts: PathBuf::new(),
             keys: Arc::new(MemoryKeyStore::new(false)),
+            key_operations: std::sync::Mutex::new(()),
             cards: Arc::new(CardContext::new(Arc::new(NoCards))),
             security_keys: Arc::new(crate::security_key::Unavailable),
             preferences: PreferenceFile::open(
@@ -527,5 +536,163 @@ mod tests {
 
         profile.authentication = AuthenticationKind::KeyboardInteractive;
         assert!(!summary(&profile).expect("listed").password_saved);
+    }
+
+    /// 在存在性检查或删除真正落地前暂停，确定性构造保存与删除的交错。
+    struct PausedKeyStore {
+        inner: Arc<MemoryKeyStore>,
+        pause_delete: bool,
+        pause: std::sync::Mutex<
+            Option<(
+                std::sync::mpsc::SyncSender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+    }
+
+    impl PausedKeyStore {
+        fn pause_if_needed(&self, item: crate::keys::Item, deleting: bool) {
+            if item == crate::keys::Item::Key && deleting == self.pause_delete {
+                let pause = self.pause.lock().expect("暂停锁").take();
+                if let Some((entered, resume)) = pause {
+                    entered.send(()).expect("通知已进入关键区");
+                    resume.recv().expect("继续操作");
+                }
+            }
+        }
+    }
+
+    impl crate::keys::KeyStore for PausedKeyStore {
+        fn put(
+            &self,
+            item: crate::keys::Item,
+            id: &str,
+            secret: &[u8],
+            synchronized: bool,
+        ) -> Result<(), crate::keys::StoreError> {
+            self.inner.put(item, id, secret, synchronized)
+        }
+
+        fn get_in(
+            &self,
+            item: crate::keys::Item,
+            id: &str,
+            synchronized: bool,
+        ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, crate::keys::StoreError> {
+            self.pause_if_needed(item, false);
+            self.inner.get_in(item, id, synchronized)
+        }
+
+        fn delete(
+            &self,
+            item: crate::keys::Item,
+            id: &str,
+            synchronized: bool,
+        ) -> Result<(), crate::keys::StoreError> {
+            self.pause_if_needed(item, true);
+            self.inner.delete(item, id, synchronized)
+        }
+
+        fn list(
+            &self,
+            item: crate::keys::Item,
+            synchronized: bool,
+        ) -> Result<Vec<String>, crate::keys::StoreError> {
+            self.inner.list(item, synchronized)
+        }
+
+        fn sync_available(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn 目录保存与私钥删除共享关键区而不产生悬空引用() {
+        use crate::keys::{self, KeyStore as _};
+        use crate::signals::keys::KeyError;
+        use rshell_m0::russh::keys::ssh_key::LineEnding;
+        use rshell_m0::russh::keys::{Algorithm, PrivateKey, key::safe_rng};
+
+        for delete_first in [false, true] {
+            let (mut context, _) = context();
+            let store = Arc::new(MemoryKeyStore::new(false));
+            context.keys = store.clone();
+            let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).expect("测试私钥");
+            let private = key.to_openssh(LineEnding::LF).expect("测试私钥编码");
+            let id = keys::import(&context, "并发测试", &private, "").expect("导入私钥");
+            let (entered, wait_entered) = std::sync::mpsc::sync_channel(1);
+            let (resume, wait_resume) = std::sync::mpsc::sync_channel(1);
+            context.keys = Arc::new(PausedKeyStore {
+                inner: store.clone(),
+                pause_delete: delete_first,
+                pause: std::sync::Mutex::new(Some((entered, wait_resume))),
+            });
+            let context = Arc::new(context);
+            let mut form = request(AuthMethod::PublicKey, PasswordAction::Keep, "");
+            form.key_id = id.clone();
+            if delete_first {
+                let deleting = {
+                    let context = context.clone();
+                    let id = id.clone();
+                    std::thread::spawn(move || keys::delete(&context, &id))
+                };
+                wait_entered
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("删除暂停");
+                assert!(
+                    context.key_operations.try_lock().is_err(),
+                    "删除前的引用检查与实际删除必须持同一把锁"
+                );
+                let saving = {
+                    let context = context.clone();
+                    std::thread::spawn(move || save(&context, form))
+                };
+                resume.send(()).expect("完成删除");
+                assert_eq!(deleting.join().expect("删除线程"), Ok(()));
+                assert_eq!(
+                    saving.join().expect("保存线程"),
+                    Err(CatalogError::KeyRequired)
+                );
+                assert!(
+                    context
+                        .repository
+                        .load_catalog()
+                        .expect("目录")
+                        .connections
+                        .is_empty()
+                );
+                assert!(store.get(keys::Item::Key, &id).expect("密钥存储").is_none());
+            } else {
+                let saving = {
+                    let context = context.clone();
+                    std::thread::spawn(move || save(&context, form))
+                };
+                wait_entered
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("保存暂停");
+                assert!(
+                    context.key_operations.try_lock().is_err(),
+                    "密钥存在性检查与目录提交必须持同一把锁"
+                );
+                let deleting = {
+                    let context = context.clone();
+                    let id = id.clone();
+                    std::thread::spawn(move || keys::delete(&context, &id))
+                };
+                resume.send(()).expect("完成保存");
+                assert!(saving.join().expect("保存线程").is_ok());
+                assert_eq!(deleting.join().expect("删除线程"), Err(KeyError::InUse));
+                assert_eq!(
+                    context
+                        .repository
+                        .load_catalog()
+                        .expect("目录")
+                        .connections
+                        .len(),
+                    1
+                );
+                assert!(store.get(keys::Item::Key, &id).expect("密钥存储").is_some());
+            }
+        }
     }
 }

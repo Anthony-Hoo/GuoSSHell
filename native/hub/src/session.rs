@@ -25,16 +25,16 @@ use rshell_m0::rshell_session::{
 };
 
 use crate::app::AppContext;
-use crate::connect::{self, Abort, Channels, Connected};
+use crate::connect::{self, Abort, Channels, Connected, PromptIds};
 use crate::frame_codec::pack_runs;
 use crate::local_network;
 use crate::settings;
 use crate::signals::interaction::InteractionReply;
 use crate::signals::{
     ClipboardText, ConnectHint, ConnectRequest, CopyRequest, DisconnectRequest, FailureKind,
-    FrameAck, FrameUpdate, InputRequest, MouseRequest, PasteRequest, PerfStats, ReconnectRequest,
-    ResizeRequest, ScreenCheck, ScreenCheckRequest, SelectionRequest, SelectionState, SessionState,
-    SessionStatus, ViewportRequest,
+    FrameAck, FrameUpdate, InputRequest, MouseRequest, PerfStats, ReconnectRequest, ResizeRequest,
+    ScreenCheck, ScreenCheckRequest, SelectionRequest, SelectionState, SessionState, SessionStatus,
+    ViewportRequest,
 };
 
 const NO_CURSOR: i32 = -1;
@@ -131,7 +131,6 @@ pub async fn supervisor(context: Arc<AppContext>) {
     let copy_rx = CopyRequest::get_dart_signal_receiver();
     let ack_rx = FrameAck::get_dart_signal_receiver();
     let screen_check_rx = ScreenCheckRequest::get_dart_signal_receiver();
-    let paste_rx = PasteRequest::get_dart_signal_receiver();
     let reply_rx = InteractionReply::get_dart_signal_receiver();
     let (finished_tx, mut finished_rx) = unbounded_channel::<(u32, u64)>();
     let mut sessions: HashMap<u32, SessionHandle> = HashMap::new();
@@ -210,8 +209,8 @@ pub async fn supervisor(context: Arc<AppContext>) {
             pack = input_rx.recv() => {
                 let Some(pack) = pack else { break };
                 let session_id = pack.message.session_id;
-                if let Some(input) = terminal_input_from_request(pack.message) {
-                    send(&sessions, session_id, SessionCommand::Input(input));
+                if let Some(command) = input_command_from_request(pack.message) {
+                    send(&sessions, session_id, command);
                 }
             }
             pack = mouse_rx.recv() => {
@@ -228,10 +227,6 @@ pub async fn supervisor(context: Arc<AppContext>) {
             pack = copy_rx.recv() => {
                 let Some(pack) = pack else { break };
                 send(&sessions, pack.message.session_id, SessionCommand::Copy);
-            }
-            pack = paste_rx.recv() => {
-                let Some(pack) = pack else { break };
-                send(&sessions, pack.message.session_id, SessionCommand::Paste(pack.message.text));
             }
             pack = ack_rx.recv() => {
                 let Some(pack) = pack else { break };
@@ -282,7 +277,7 @@ impl Screen {
         }
     }
 
-    /// 立即出帧。
+    /// 节拍器已允许本次发送，实际渲染并记录在途帧。调用者必须先经 changed / flush。
     fn present(&mut self, session_id: u32) -> Result<(), String> {
         self.last_sent = Some(present(
             session_id,
@@ -343,7 +338,7 @@ impl Screen {
             .resize(size)
             .map_err(|error| format!("engine resize: {error:?}"))?;
         self.rows = size.rows;
-        self.present(session_id)
+        self.changed(session_id)
     }
 
     /// 与连接无关的命令（滚回、选区、复制、帧确认）：处理掉返回 `None`，其余原样交回。
@@ -361,7 +356,7 @@ impl Screen {
                 // 选区变化：更新引擎持有的选区 → 重渲染发帧（高亮跟着内容走）→ 把引擎的
                 // 选区原样回显（Dart 用它对耳朵/气泡定位）。
                 self.selection = selection_range_from_request(request);
-                self.present(session_id)?;
+                self.changed(session_id)?;
                 send_selection_state(session_id, self.selection);
             }
             SessionCommand::Copy => {
@@ -423,6 +418,8 @@ async fn run_session(
     let mut terminal: Option<Screen> = None;
     // 连接期间收到的输入 / 尺寸变化：连上后先按原顺序处理。
     let mut backlog = VecDeque::new();
+    // 回答通道跨重连复用，提示编号也必须跨重连唯一，旧回答不能命中新提示。
+    let mut prompts = PromptIds::default();
 
     loop {
         let first_attempt = quick_password.is_some();
@@ -441,10 +438,18 @@ async fn run_session(
                 replies: &mut replies,
                 backlog: &mut backlog,
             };
-            connect::establish(&context, session_id, target, password, size, channels)
-                .await
-                .map(|connected| (connected, described))
-                .map_err(|abort| (abort, host, port))
+            connect::establish(
+                &context,
+                session_id,
+                target,
+                password,
+                size,
+                channels,
+                &mut prompts,
+            )
+            .await
+            .map(|connected| (connected, described))
+            .map_err(|abort| (abort, host, port))
         };
         let (
             Connected {
@@ -454,6 +459,10 @@ async fn run_session(
             described,
         ) = match attempt.await {
             Ok(connected) => connected,
+            Err((Abort::Closed, _, _)) => {
+                report(session_id, SessionState::Closed, "disconnect".into());
+                return;
+            }
             Err((abort, host, port)) => {
                 // 第一次连接就被取消（关了密码框等）：会话就此结束（Dart 关掉窗格）。
                 // 其余情况留在断开状态，等用户重试或关掉窗格。
@@ -518,10 +527,7 @@ async fn run_session(
             &mut backlog,
         )
         .await;
-        // 会话结束：先把合帧里攒着的变化画出来（最后一屏输出不能丢），再报状态。
-        if screen.pacer.has_pending() {
-            let _ = screen.present(session_id);
-        }
+        // 最后一屏的待发变化仍由离线循环按 ACK / 节拍发送；窗格关闭时直接释放。
         report_end(session_id, end);
         let _ = transport.shutdown().await;
         if quit {
@@ -552,8 +558,8 @@ async fn run_connected(
     commands: &mut UnboundedReceiver<SessionCommand>,
     backlog: &mut VecDeque<SessionCommand>,
 ) -> (SessionEnd, bool) {
-    // 连接建立即送第一帧（欢迎横幅可能已经进了引擎）。
-    if let Err(detail) = screen.present(session_id) {
+    // 第一次连接立即送首帧；重连时仍遵守已有画面的 ACK / 节拍。
+    if let Err(detail) = screen.changed(session_id) {
         return (SessionEnd::failed(FailureKind::Other, detail), false);
     }
     send_selection_state(session_id, screen.selection);
@@ -794,6 +800,7 @@ fn report_end(session_id: u32, end: SessionEnd) {
 /// 连接没建成：取消报 Closed；失败时顺带判断是否可能是本地网络权限。
 async fn report_abort(session_id: u32, abort: Abort, host: &str, port: u16) {
     match abort {
+        Abort::Closed => report(session_id, SessionState::Closed, "disconnect".into()),
         Abort::Cancelled => report(session_id, SessionState::Cancelled, String::new()),
         Abort::Failed { failure, detail } => SessionStatus {
             session_id,
@@ -956,10 +963,6 @@ impl FramePacer {
         false
     }
 
-    fn has_pending(&self) -> bool {
-        self.pending
-    }
-
     /// 有待发的帧，且此刻允许发。
     fn ready_for_pending(&self, now: Instant) -> bool {
         self.pending && self.may_send(now)
@@ -1106,6 +1109,14 @@ fn parse_key_code(key: &str) -> Option<KeyCode> {
             KeyCode::F(index)
         }
     })
+}
+
+/// 键、IME 文本与粘贴共用一个 rinf 通道，按接收顺序进入同一会话命令队列。
+fn input_command_from_request(request: InputRequest) -> Option<SessionCommand> {
+    if request.paste {
+        return Some(SessionCommand::Paste(request.text));
+    }
+    terminal_input_from_request(request).map(SessionCommand::Input)
 }
 
 fn terminal_input_from_request(request: InputRequest) -> Option<TerminalInput> {
@@ -1337,23 +1348,27 @@ fn send_frame(
 mod tests {
     #![allow(clippy::expect_used)]
     use super::{
-        FramePacer, MouseMotion, Window, lost, mouse_event_from_request, paste_bytes,
-        terminal_input_from_request,
+        FramePacer, MouseMotion, Next, Screen, SessionCommand, Window, input_command_from_request,
+        lost, mouse_event_from_request, next_command, paste_bytes, terminal_input_from_request,
+        wait_offline,
     };
     use crate::signals::FailureKind;
-    use crate::signals::{InputRequest, MouseRequest};
+    use crate::signals::{InputRequest, MouseRequest, SelectionRequest};
     use rshell_m0::rshell_core::SessionFailure;
     use rshell_m0::rshell_core::{
         KeyCode, MouseButton, MouseEventKind, TerminalInput, TerminalOverrides, TerminalSettingsV1,
         TerminalSize,
     };
     use rshell_m0::rshell_session::{DefaultTerminalEngine, TerminalEngine};
+    use std::collections::VecDeque;
     use std::time::Duration;
+    use tokio::sync::mpsc::unbounded_channel;
     use tokio::time::Instant;
 
     fn input(key: &str, control: bool) -> Option<TerminalInput> {
         terminal_input_from_request(InputRequest {
             session_id: 1,
+            paste: false,
             text: String::new(),
             key: key.to_owned(),
             shift: false,
@@ -1483,6 +1498,149 @@ mod tests {
         assert!(pacer.ready_for_pending(start + FramePacer::INTERVAL));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn selection_and_resize_share_the_pending_frame_until_ack() {
+        let profile = TerminalSettingsV1::default().resolve(&TerminalOverrides::default());
+        let mut size = TerminalSize {
+            cols: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let engine = DefaultTerminalEngine::new(&profile, size).expect("引擎");
+        let mut screen = Screen::new(engine, size);
+        screen.changed(1).expect("第一帧");
+        let first_seq = screen.last_sent.as_ref().expect("第一帧").0;
+        for focus in 1..=10 {
+            tokio::time::advance(FramePacer::INTERVAL).await;
+            screen
+                .handle_local(
+                    1,
+                    SessionCommand::Selection(SelectionRequest {
+                        session_id: 1,
+                        clear: false,
+                        anchor_row: 0,
+                        anchor_col: 0,
+                        focus_row: 0,
+                        focus_col: focus,
+                        rectangular: false,
+                    }),
+                )
+                .expect("拖动选区");
+            size.cols -= 1;
+            screen.resize(1, size).expect("连续缩放");
+            screen.flush(1).expect("检查待发帧");
+            assert_eq!(screen.last_sent.as_ref().expect("在途帧").0, first_seq);
+            assert_eq!(screen.pacer.in_flight.expect("在途序号").seq, first_seq);
+        }
+        assert!(screen.pacer.pending);
+        screen
+            .handle_local(1, SessionCommand::FrameAck(first_seq))
+            .expect("确认第一帧");
+        let (seq, frame) = screen.last_sent.as_ref().expect("合并后的帧");
+        assert_eq!(*seq, first_seq + 1);
+        assert_eq!(frame.size.cols, 70);
+        assert_eq!(screen.selection.expect("最终选区").end.column, 10);
+        assert!(!screen.pacer.pending);
+        assert_eq!(screen.stats.ack_timeouts, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_final_output_respects_the_original_ack() {
+        for current_ack in [false, true] {
+            let profile = TerminalSettingsV1::default().resolve(&TerminalOverrides::default());
+            let mut size = TerminalSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            };
+            let engine = DefaultTerminalEngine::new(&profile, size).expect("引擎");
+            let mut screen = Screen::new(engine, size);
+            screen.changed(1).expect("第一帧");
+            let first_seq = screen.last_sent.as_ref().expect("第一帧").0;
+            screen.advance(b"final output").expect("断线前最后一段输出");
+            screen.changed(1).expect("最后输出等待确认");
+            tokio::time::advance(FramePacer::INTERVAL).await;
+
+            let (sender, mut commands) = unbounded_channel();
+            let acknowledged = if current_ack {
+                first_seq
+            } else {
+                first_seq.wrapping_sub(1)
+            };
+            sender
+                .send(SessionCommand::FrameAck(acknowledged))
+                .expect("确认帧");
+            sender
+                .send(SessionCommand::Disconnect)
+                .expect("结束离线循环");
+            let mut terminal = Some(screen);
+            assert!(matches!(
+                wait_offline(
+                    1,
+                    &mut terminal,
+                    &mut size,
+                    &mut commands,
+                    &mut VecDeque::new()
+                )
+                .await,
+                Next::Quit
+            ));
+            let screen = terminal.expect("断线后仍保留画面");
+            let (seq, frame) = screen.last_sent.expect("最后发出的帧");
+            assert_eq!(seq, first_seq + u32::from(current_ack));
+            assert_eq!(screen.pacer.pending, !current_ack);
+            assert_eq!(screen.stats.ack_timeouts, 0);
+            let visible: String = frame.rows[0]
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect();
+            assert_eq!(visible.starts_with("final output"), current_ack);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordered_input_commands_keep_their_order_across_the_connect_backlog() {
+        let request = |text: &str, key: &str, paste| InputRequest {
+            session_id: 1,
+            paste,
+            text: text.to_owned(),
+            key: key.to_owned(),
+            shift: false,
+            control: false,
+            alt: false,
+        };
+        let mut backlog = VecDeque::new();
+        for value in [request("echo ", "", false), request("粘贴", "", true)] {
+            backlog.push_back(input_command_from_request(value).expect("连接中的输入"));
+        }
+        let (sender, mut commands) = unbounded_channel();
+        for value in [request("", "enter", false), request("下一段", "", true)] {
+            assert!(
+                sender
+                    .send(input_command_from_request(value).expect("已连接输入"))
+                    .is_ok()
+            );
+        }
+        assert!(matches!(next_command(&mut backlog, &mut commands).await,
+            Some(SessionCommand::Input(TerminalInput::CommittedText(text))) if text == "echo "));
+        assert!(matches!(next_command(&mut backlog, &mut commands).await,
+            Some(SessionCommand::Paste(text)) if text == "粘贴"));
+        assert!(matches!(
+            next_command(&mut backlog, &mut commands).await,
+            Some(SessionCommand::Input(TerminalInput::Key {
+                code: KeyCode::Enter,
+                ..
+            }))
+        ));
+        assert!(matches!(next_command(&mut backlog, &mut commands).await,
+            Some(SessionCommand::Paste(text)) if text == "下一段"));
+    }
+
     #[test]
     fn paste_normalizes_newlines_to_carriage_returns() {
         assert_eq!(paste_bytes("a\nb\r\nc\rd", false), b"a\rb\rc\rd");
@@ -1522,6 +1680,7 @@ mod tests {
     fn text_wins_and_carries_no_key() {
         let request = InputRequest {
             session_id: 1,
+            paste: false,
             text: "你好".to_owned(),
             key: String::new(),
             shift: false,
@@ -1708,3 +1867,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod lifecycle_tests;

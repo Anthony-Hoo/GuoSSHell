@@ -133,9 +133,10 @@ pub async fn run(context: Arc<AppContext>) {
             pack = save_rx.recv() => {
                 let Some(pack) = pack else { break };
                 let request = pack.message;
-                if let Err(error) = context.preferences.update(|preferences| {
-                    preferences.show_key_bar = Some(request.show_key_bar);
-                }) {
+                if let Some(show_key_bar) = request.show_key_bar
+                    && let Err(error) = context.preferences.update(|preferences| {
+                        preferences.show_key_bar = Some(show_key_bar);
+                    }) {
                     debug_print!("[settings] preferences: {error}");
                 }
                 let task_context = context.clone();
@@ -156,15 +157,19 @@ fn save(repository: &SqliteRepository, request: &SaveSettings) -> Result<(), Sto
     let mut profile = default_profile(repository)?;
     if let Some(family) = FONT_FAMILIES
         .iter()
-        .find(|family| **family == request.font_family)
+        .find(|family| Some(**family) == request.font_family.as_deref())
     {
         profile.settings.font_family = (*family).to_owned();
     }
-    if request.font_size.is_finite() {
-        profile.settings.font_size = (request.font_size as f32).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+    if let Some(size) = request.font_size
+        && size.is_finite()
+    {
+        profile.settings.font_size = (size as f32).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
     }
-    profile.settings.scrollback_lines =
-        effective_scrollback(usize::try_from(request.scrollback_lines).unwrap_or(usize::MAX));
+    if let Some(lines) = request.scrollback_lines {
+        profile.settings.scrollback_lines =
+            effective_scrollback(usize::try_from(lines).unwrap_or(usize::MAX));
+    }
     repository.save_terminal_profile(profile)
 }
 
@@ -429,10 +434,10 @@ mod tests {
         save(
             &repository,
             &SaveSettings {
-                font_family: "Menlo".to_owned(),
-                font_size: 17.0,
-                scrollback_lines: 3_000,
-                show_key_bar: true,
+                font_family: Some("Menlo".to_owned()),
+                font_size: Some(17.0),
+                scrollback_lines: Some(3_000),
+                show_key_bar: Some(true),
             },
         )
         .expect("save");
@@ -450,10 +455,10 @@ mod tests {
         save(
             &repository,
             &SaveSettings {
-                font_family: "Comic Sans".to_owned(),
-                font_size: 200.0,
-                scrollback_lines: 10,
-                show_key_bar: false,
+                font_family: Some("Comic Sans".to_owned()),
+                font_size: Some(200.0),
+                scrollback_lines: Some(10),
+                show_key_bar: Some(false),
             },
         )
         .expect("save");
@@ -461,6 +466,36 @@ mod tests {
         assert_eq!(profile.settings.font_family, FONT_FAMILIES[0]);
         assert_eq!(profile.settings.font_size, 32.0);
         assert_eq!(profile.settings.scrollback_lines, 1_000);
+    }
+
+    #[test]
+    fn consecutive_partial_settings_preserve_preceding_edits() {
+        let repository = repository();
+        adopt_app_defaults(&repository).expect("应用默认设置");
+        for request in [
+            SaveSettings {
+                font_family: Some("Menlo".to_owned()),
+                ..SaveSettings::default()
+            },
+            SaveSettings {
+                font_size: Some(22.0),
+                ..SaveSettings::default()
+            },
+            SaveSettings {
+                scrollback_lines: Some(2_000),
+                ..SaveSettings::default()
+            },
+            SaveSettings {
+                show_key_bar: Some(false),
+                ..SaveSettings::default()
+            },
+        ] {
+            save(&repository, &request).expect("按字段保存设置");
+        }
+        let settings = default_profile(&repository).expect("最终设置").settings;
+        assert_eq!(settings.font_family, "Menlo");
+        assert_eq!(settings.font_size, 22.0);
+        assert_eq!(settings.scrollback_lines, 2_000);
     }
 
     #[test]

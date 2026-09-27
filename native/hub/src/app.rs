@@ -2,7 +2,7 @@
 //! 启动目录、设置与会话三个处理任务。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rinf::{DartSignal, RustSignal, debug_print};
 use rshell_m0::rshell_storage::{CredentialCoordinator, SqliteRepository, SystemCredentialVault};
@@ -28,6 +28,8 @@ pub struct AppContext {
     pub known_hosts: PathBuf,
     /// 私钥与口令（钥匙串）。
     pub keys: Arc<dyn KeyStore>,
+    /// 串行化密钥写入、迁移、删除与连接目录的密钥引用提交。
+    pub key_operations: Mutex<()>,
     /// OpenPGP 卡（读卡器、记住的 PIN）。
     pub cards: Arc<CardContext>,
     /// 安全密钥（FIDO2）。
@@ -56,17 +58,22 @@ impl AppContext {
             debug_print!("[app] credential reconcile: {error:?}");
         }
         settings::adopt_app_defaults(&repository)?;
-        Ok(Self {
+        let context = Self {
             repository,
             credentials,
             known_hosts: support_dir.join(KNOWN_HOSTS_FILE),
             keys: platform_key_store()?,
+            key_operations: Mutex::new(()),
             cards: Arc::new(CardContext::new(card::platform_reader())),
             security_keys: security_key::platform_authenticator(),
             preferences: PreferenceFile::open(support_dir.join(PREFERENCES_FILE)),
             catalog_changed: Notify::new(),
             keys_changed: Notify::new(),
-        })
+        };
+        if let Err(error) = keys::reconcile_sync(&context) {
+            debug_print!("[app] 私钥同步迁移待完成：{error:?}");
+        }
+        Ok(context)
     }
 }
 

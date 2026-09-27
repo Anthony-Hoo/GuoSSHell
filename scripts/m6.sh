@@ -243,6 +243,11 @@ case "${1:-}" in
       --dart-define=M6_LLM_HOST="${M6_LLM_HOST:-${M6_HOST}}" \
       --dart-define=M6_LLM_PORT="${M6_LLM_PORT:-2224}" \
       "$@" >"${log}" 2>&1 || status=$?
+    # 构建失败时不能接受设备上旧 App 的通过结果。
+    if grep -qE '^Failed to build iOS app|^Could not build the precompiled application' "${log}"; then
+      echo "真机验收失败：当前测试 App 构建未通过" >&2
+      status=1
+    fi
     grep -E 'All tests passed|Some tests failed|Failure in method|Error|Exception' "${log}" | tail -30 || true
     exit "${status}"
     ;;

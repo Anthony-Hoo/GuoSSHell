@@ -50,6 +50,8 @@ const CONNECT_LIMIT: Duration = Duration::from_secs(30 * 60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEPALIVE_MAX: usize = 3;
 
+type PendingPins = HashMap<u32, oneshot::Sender<Option<(SecretString, bool)>>>;
+
 pub struct Connected {
     pub transport: NativeSshTransport,
     pub profile: ConnectionProfile,
@@ -80,7 +82,9 @@ impl Signer {
 
 /// 连接没有建成的原因。
 pub enum Abort {
-    /// 用户取消：关掉了页面，或取消了密码框。
+    /// 窗格关闭或会话通道已释放：首次连接与重连都结束会话。
+    Closed,
+    /// 用户取消本次交互；重连时保留断开画面，以便再次尝试。
     Cancelled,
     Failed {
         failure: FailureKind,
@@ -106,7 +110,7 @@ impl Channels<'_> {
     /// 连接期间收到命令：Disconnect（或会话被丢弃）即中止，其余留到连上以后。
     fn defer(&mut self, command: Option<SessionCommand>) -> Result<(), Abort> {
         match command {
-            Some(SessionCommand::Disconnect) | None => Err(Abort::Cancelled),
+            Some(SessionCommand::Disconnect) | None => Err(Abort::Closed),
             Some(command) => {
                 self.backlog.push_back(command);
                 Ok(())
@@ -180,8 +184,8 @@ pub async fn establish(
     quick_password: SecretString,
     size: TerminalSize,
     mut channels: Channels<'_>,
+    prompts: &mut PromptIds,
 ) -> Result<Connected, Abort> {
-    let mut prompts = PromptIds::default();
     let described = target.describe();
     let Target { profile, saved } = target;
     // 外部签名器（OpenPGP 卡或安全密钥）与它要会话代办的事（问 PIN、等用户）。
@@ -204,7 +208,7 @@ pub async fn establish(
                     };
                     let (password, keep) = ask_secret(
                         session_id,
-                        prompts.next(),
+                        prompts.next()?,
                         &profile,
                         question,
                         &mut channels,
@@ -230,7 +234,7 @@ pub async fn establish(
                     let key = unlock_key(
                         context,
                         session_id,
-                        &mut prompts,
+                        prompts,
                         &profile,
                         id,
                         stored,
@@ -266,8 +270,7 @@ pub async fn establish(
         let connect = transport.connect(&transport_request, broker.clone());
         tokio::pin!(connect);
         let mut pending = HashMap::new();
-        let mut pending_pins: HashMap<u32, oneshot::Sender<Option<(SecretString, bool)>>> =
-            HashMap::new();
+        let mut pending_pins = PendingPins::new();
         let mut budget = Budget::new(CONNECT_BUDGET);
         let mut signer_waiting = false;
         loop {
@@ -279,12 +282,12 @@ pub async fn establish(
                 }
                 request = requests.recv() => {
                     if let Some((id, request)) = request {
-                        forward_prompt(session_id, &profile, &broker, &mut prompts, &mut pending, id, request);
+                        forward_prompt(session_id, &profile, &broker, prompts, &mut pending, id, request)?;
                     }
                 }
                 request = next_signer_request(&mut signer_requests) => match request {
                     Some(SignerRequest::Pin { question, reply }) => {
-                        let prompt_id = prompts.next();
+                        let prompt_id = prompts.next()?;
                         card_pin_prompt(session_id, prompt_id, &profile, question)
                             .send_signal_to_dart();
                         pending_pins.insert(prompt_id, reply);
@@ -293,13 +296,8 @@ pub async fn establish(
                     None => signer_requests = None,
                 },
                 reply = channels.replies.recv() => {
-                    if let Some(reply) = reply {
-                        if let Some((id, kind)) = pending.remove(&reply.prompt_id) {
-                            let _ = broker.respond(id, broker_response(kind, reply));
-                        } else if let Some(answer) = pending_pins.remove(&reply.prompt_id) {
-                            let _ = answer.send(pin_answer(reply));
-                        }
-                    }
+                    let Some(reply) = reply else { return Err(Abort::Closed) };
+                    forward_reply(&broker, &mut pending, &mut pending_pins, reply);
                 }
                 command = channels.commands.recv() => channels.defer(command)?,
             }
@@ -357,14 +355,17 @@ impl Budget {
     }
 }
 
-/// 本会话内递增的问题编号。
+/// 整个会话内递增的问题编号，由会话持有，重连不会重新分配旧编号。
 #[derive(Default)]
-struct PromptIds(u32);
+pub struct PromptIds(u32);
 
 impl PromptIds {
-    fn next(&mut self) -> u32 {
-        self.0 = self.0.wrapping_add(1);
-        self.0
+    fn next(&mut self) -> Result<u32, Abort> {
+        self.0 = self
+            .0
+            .checked_add(1)
+            .ok_or_else(|| Abort::failed(FailureKind::Other, "会话交互编号已用尽".to_owned()))?;
+        Ok(self.0)
     }
 }
 
@@ -415,7 +416,7 @@ async fn ask_secret(
     loop {
         tokio::select! {
             reply = channels.replies.recv() => {
-                let Some(reply) = reply else { return Err(Abort::Cancelled) };
+                let Some(reply) = reply else { return Err(Abort::Closed) };
                 if reply.prompt_id != prompt_id {
                     continue;
                 }
@@ -523,7 +524,7 @@ async fn unlock_key(
             retry,
         };
         let (passphrase, keep) =
-            ask_secret(session_id, prompts.next(), profile, question, channels).await?;
+            ask_secret(session_id, prompts.next()?, profile, question, channels).await?;
         let Ok(key) = decode_key(&stored.private_key, Some(&passphrase)).await else {
             retry = true;
             continue;
@@ -638,32 +639,47 @@ fn forward_prompt(
     pending: &mut HashMap<u32, (InteractionId, PromptKind)>,
     id: InteractionId,
     request: InteractionRequest,
-) {
-    let prompt_id = prompts.next();
+) -> Result<(), Abort> {
+    let prompt_id = prompts.next()?;
     let prompt = match request {
         InteractionRequest::HostKey(host_key) => {
             host_key_prompt(session_id, prompt_id, profile, host_key)
         }
         InteractionRequest::KeyboardInteractive(questions) if is_empty_round(&questions) => {
             let _ = broker.respond(id, InteractionResponse::Answers(Vec::new()));
-            return;
+            return Ok(());
         }
         InteractionRequest::KeyboardInteractive(questions) => {
             keyboard_interactive_prompt(session_id, prompt_id, profile, questions)
         }
         InteractionRequest::Password(_) | InteractionRequest::PrivateKeyPassphrase(_) => {
             let _ = broker.respond(id, InteractionResponse::Cancel);
-            return;
+            return Ok(());
         }
     };
     pending.insert(prompt_id, (id, prompt.kind));
     prompt.send_signal_to_dart();
+    Ok(())
 }
 
 fn is_empty_round(questions: &KeyboardInteractivePrompt) -> bool {
     questions.prompts.is_empty()
         && questions.name.trim().is_empty()
         && questions.instruction.trim().is_empty()
+}
+
+/// 只把答案交给本轮仍在等待的提示；前一次连接遗留的答案直接丢弃。
+fn forward_reply(
+    broker: &InteractionBroker,
+    pending: &mut HashMap<u32, (InteractionId, PromptKind)>,
+    pending_pins: &mut PendingPins,
+    reply: InteractionReply,
+) {
+    if let Some((id, kind)) = pending.remove(&reply.prompt_id) {
+        let _ = broker.respond(id, broker_response(kind, reply));
+    } else if let Some(answer) = pending_pins.remove(&reply.prompt_id) {
+        let _ = answer.send(pin_answer(reply));
+    }
 }
 
 fn empty_prompt(
@@ -800,12 +816,19 @@ pub fn failure_kind(failure: SessionFailure) -> FailureKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{Budget, PromptKind, broker_response, is_empty_round};
+    #![allow(clippy::expect_used)]
+    use super::{
+        Abort, Budget, PendingPins, PromptIds, PromptKind, broker_response, forward_prompt,
+        forward_reply, is_empty_round,
+    };
     use crate::signals::interaction::InteractionReply;
     use rshell_m0::rshell_core::{
-        AuthPrompt, HostKeyDecision, InteractionId, InteractionResponse, KeyboardInteractivePrompt,
+        AuthPrompt, ConnectionProfile, HostKeyDecision, HostKeyPrompt, InteractionId,
+        InteractionRequest, InteractionResponse, KeyboardInteractivePrompt,
     };
+    use rshell_m0::rshell_session::interaction_channel;
     use secrecy::ExposeSecret;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     #[test]
@@ -847,6 +870,72 @@ mod tests {
             broker_response(PromptKind::HostKey, reply(false, &[])),
             InteractionResponse::HostKey(HostKeyDecision::Reject)
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_host_key_acceptance_and_rejection_do_not_answer_a_new_connection() {
+        for stale_accept in [true, false] {
+            let mut prompts = PromptIds::default();
+            let old_prompt = prompts.next().ok().expect("上一轮提示");
+            let profile = ConnectionProfile::new("主机密钥回归", "example.test");
+            let (broker, mut requests) = interaction_channel();
+            let request_broker = broker.clone();
+            let response = tokio::spawn(async move {
+                request_broker
+                    .request(InteractionRequest::HostKey(HostKeyPrompt {
+                        id: InteractionId::new(),
+                        host: "example.test".into(),
+                        port: 22,
+                        algorithm: "ssh-ed25519".into(),
+                        sha256: "SHA256:current".into(),
+                        changed: true,
+                    }))
+                    .await
+            });
+            let (id, request) = requests.recv().await.expect("上游主机密钥提示");
+            let mut pending = HashMap::new();
+            let mut pending_pins = PendingPins::new();
+            assert!(
+                forward_prompt(
+                    1,
+                    &profile,
+                    &broker,
+                    &mut prompts,
+                    &mut pending,
+                    id,
+                    request
+                )
+                .is_ok()
+            );
+            let current = *pending.keys().next().expect("本轮提示");
+            assert_ne!(current, old_prompt);
+            let mut stale = reply(stale_accept, &[]);
+            stale.prompt_id = old_prompt;
+            forward_reply(&broker, &mut pending, &mut pending_pins, stale);
+            assert!(pending.contains_key(&current));
+            assert!(
+                !response.is_finished(),
+                "旧答案不能让新主机密钥通过或被拒绝"
+            );
+            let mut fresh = reply(!stale_accept, &[]);
+            fresh.prompt_id = current;
+            forward_reply(&broker, &mut pending, &mut pending_pins, fresh);
+            let answer = response.await.expect("broker 任务").expect("本轮回答");
+            let expected = if stale_accept {
+                HostKeyDecision::Reject
+            } else {
+                HostKeyDecision::AcceptAndStore
+            };
+            assert!(
+                matches!(answer, InteractionResponse::HostKey(decision) if decision == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_prompt_ids_fail_instead_of_reusing_an_old_number() {
+        let mut prompts = PromptIds(u32::MAX);
+        assert!(matches!(prompts.next(), Err(Abort::Failed { .. })));
     }
 
     #[test]

@@ -105,6 +105,14 @@ void main() {
       'app:end': (const [], LogicalKeyboardKey.end, _esc('OF')),
       'app:shift+up': (const [shift], LogicalKeyboardKey.arrowUp, _esc('[1;2A')),
     };
+    // 先检查全部用例，避免连接后才因漏写键位映射中断字节断言。
+    for (final MapEntry(key: name, value: (modifiers, key, _))
+        in [...normal.entries, ...appCursor.entries]) {
+      for (final logical in [...modifiers, key]) {
+        expect(_usPhysicalKeys.containsKey(logical), isTrue,
+            reason: '$name 缺少 US 物理键映射：0x${logical.keyId.toRadixString(16)}');
+      }
+    }
 
     final received = <String, String>{};
     final wrong = <String>[];
@@ -117,11 +125,11 @@ void main() {
       for (final MapEntry(key: name, value: (modifiers, key, expected)) in cases.entries) {
         await resetInput();
         for (final modifier in modifiers) {
-          await tester.sendKeyDownEvent(modifier);
+          await tester.sendKeyDownEvent(modifier, physicalKey: _physicalKey(modifier));
         }
-        await tester.sendKeyEvent(key);
+        await tester.sendKeyEvent(key, physicalKey: _physicalKey(key));
         for (final modifier in modifiers.reversed) {
-          await tester.sendKeyUpEvent(modifier);
+          await tester.sendKeyUpEvent(modifier, physicalKey: _physicalKey(modifier));
         }
         // 等字节到齐：与期望一致，或 1.5 秒内不再变化。
         var bytes = <int>[];
@@ -215,6 +223,51 @@ const _fKeys = [
   LogicalKeyboardKey.f11,
   LogicalKeyboardKey.f12,
 ];
+
+// 按 US 键盘的实际键位注入，Shift 组合仍使用原键位（如减号、句号）。
+// Flutter 的自动映射依赖仅 debug 构建可用的 debugName，profile 测试必须显式给出物理键。
+final _usPhysicalKeys = <LogicalKeyboardKey, PhysicalKeyboardKey>{
+  LogicalKeyboardKey.controlLeft: PhysicalKeyboardKey.controlLeft,
+  LogicalKeyboardKey.altLeft: PhysicalKeyboardKey.altLeft,
+  LogicalKeyboardKey.shiftLeft: PhysicalKeyboardKey.shiftLeft,
+  LogicalKeyboardKey.enter: PhysicalKeyboardKey.enter,
+  LogicalKeyboardKey.backspace: PhysicalKeyboardKey.backspace,
+  LogicalKeyboardKey.escape: PhysicalKeyboardKey.escape,
+  LogicalKeyboardKey.tab: PhysicalKeyboardKey.tab,
+  LogicalKeyboardKey.arrowUp: PhysicalKeyboardKey.arrowUp,
+  LogicalKeyboardKey.arrowRight: PhysicalKeyboardKey.arrowRight,
+  LogicalKeyboardKey.arrowLeft: PhysicalKeyboardKey.arrowLeft,
+  LogicalKeyboardKey.home: PhysicalKeyboardKey.home,
+  LogicalKeyboardKey.end: PhysicalKeyboardKey.end,
+  LogicalKeyboardKey.pageUp: PhysicalKeyboardKey.pageUp,
+  LogicalKeyboardKey.pageDown: PhysicalKeyboardKey.pageDown,
+  LogicalKeyboardKey.delete: PhysicalKeyboardKey.delete,
+  LogicalKeyboardKey.insert: PhysicalKeyboardKey.insert,
+  LogicalKeyboardKey.f1: PhysicalKeyboardKey.f1,
+  LogicalKeyboardKey.f2: PhysicalKeyboardKey.f2,
+  LogicalKeyboardKey.f3: PhysicalKeyboardKey.f3,
+  LogicalKeyboardKey.f4: PhysicalKeyboardKey.f4,
+  LogicalKeyboardKey.f5: PhysicalKeyboardKey.f5,
+  LogicalKeyboardKey.f6: PhysicalKeyboardKey.f6,
+  LogicalKeyboardKey.f7: PhysicalKeyboardKey.f7,
+  LogicalKeyboardKey.f8: PhysicalKeyboardKey.f8,
+  LogicalKeyboardKey.f9: PhysicalKeyboardKey.f9,
+  LogicalKeyboardKey.f10: PhysicalKeyboardKey.f10,
+  LogicalKeyboardKey.f11: PhysicalKeyboardKey.f11,
+  LogicalKeyboardKey.f12: PhysicalKeyboardKey.f12,
+  LogicalKeyboardKey.keyC: PhysicalKeyboardKey.keyC,
+  LogicalKeyboardKey.bracketLeft: PhysicalKeyboardKey.bracketLeft,
+  LogicalKeyboardKey.backslash: PhysicalKeyboardKey.backslash,
+  LogicalKeyboardKey.bracketRight: PhysicalKeyboardKey.bracketRight,
+  LogicalKeyboardKey.minus: PhysicalKeyboardKey.minus,
+  LogicalKeyboardKey.space: PhysicalKeyboardKey.space,
+  LogicalKeyboardKey.keyB: PhysicalKeyboardKey.keyB,
+  LogicalKeyboardKey.period: PhysicalKeyboardKey.period,
+};
+
+PhysicalKeyboardKey _physicalKey(LogicalKeyboardKey key) =>
+    _usPhysicalKeys[key] ??
+    (throw StateError('缺少 US 物理键映射：0x${key.keyId.toRadixString(16)}'));
 
 List<int> _esc(String sequence) => [0x1b, ...sequence.codeUnits];
 

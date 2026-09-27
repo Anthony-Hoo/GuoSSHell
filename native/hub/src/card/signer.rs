@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use rinf::debug_print;
 use rshell_m0::rshell_session::{ExternalSigner, ExternalSignerError};
 use rshell_m0::russh::keys::{HashAlg, PublicKey};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
@@ -78,16 +78,8 @@ impl CardSigner {
         }
 
         let mut retry = false;
+        let mut provided = None;
         loop {
-            let remembered = if retry {
-                None
-            } else {
-                self.cards.remembered_pin(&self.ident)
-            };
-            let (pin, remember) = match remembered {
-                Some(pin) => (pin, false),
-                None => self.ask_pin(tries_left, retry).await?,
-            };
             if nfc {
                 send_hint(self.session_id, &self.target, ConnectHint::TapCard);
             }
@@ -96,12 +88,12 @@ impl CardSigner {
                 let cards = self.cards.clone();
                 let ident = self.ident.clone();
                 let key = self.public_key.clone();
-                let pin = SecretString::from(pin.expose_secret().to_owned());
+                let pin = provided.take();
                 let data = data.to_vec();
                 let session_id = self.session_id;
                 let target = self.target.clone();
                 spawn_blocking(move || {
-                    cards.sign(&ident, &key, pin, &data, hash, nfc, &|touch| {
+                    cards.sign_with_pin(&ident, &key, pin, &data, hash, nfc, &|touch| {
                         if touch {
                             send_hint(session_id, &target, ConnectHint::TouchCard);
                         }
@@ -113,23 +105,14 @@ impl CardSigner {
             let _ = self.requests.send(SignerRequest::Waiting(false));
             send_hint(self.session_id, &self.target, ConnectHint::None);
             match result {
-                Ok(blob) => {
-                    if remember {
-                        self.cards.remember_pin(&self.ident, pin);
-                    }
-                    return Ok(blob);
-                }
+                Ok(Some(blob)) => return Ok(blob),
+                Ok(None) => provided = Some(self.ask_pin(tries_left, retry).await?),
                 Err(CardFailure::PinWrong { tries_left: left }) => {
-                    self.cards.forget_pin(&self.ident);
                     tries_left = Some(left);
                     retry = true;
+                    provided = Some(self.ask_pin(tries_left, retry).await?);
                 }
-                Err(failure) => {
-                    if failure == CardFailure::PinBlocked {
-                        self.cards.forget_pin(&self.ident);
-                    }
-                    return Err(failure);
-                }
+                Err(failure) => return Err(failure),
             }
         }
     }

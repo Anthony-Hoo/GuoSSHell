@@ -277,3 +277,57 @@ fn ecdsa_halves_drop_padding_and_keep_positive() {
     assert!(super::ecdsa_signature(EcdsaCurve::NistP521, &padded).is_ok());
     assert!(super::ecdsa_signature(EcdsaCurve::NistP521, &[0x01; 3]).is_err());
 }
+
+#[test]
+fn 并发签名只尝试一次失效的缓存pin() {
+    let card = VirtualCard::new(CardKey::ed25519([7; 32]), false);
+    let cards = cards(&card);
+    cards.remember_pin(IDENT, pin("已失效的缓存"));
+    let barrier = Arc::new(std::sync::Barrier::new(9));
+    let busy = super::lock(&cards.busy);
+    let workers = (0..8)
+        .map(|_| {
+            let cards = cards.clone();
+            let key = card.public_key();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                cards.sign_with_pin(
+                    IDENT,
+                    &key,
+                    None,
+                    "并发签名".as_bytes(),
+                    None,
+                    false,
+                    &|_| {},
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    drop(busy);
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("签名线程结束"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(CardFailure::PinWrong { tries_left: 2 })))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Ok(None)))
+            .count(),
+        7
+    );
+    assert_eq!(
+        card.tries_left(),
+        2,
+        "等待卡锁的签名不能再次验证已失效的缓存 PIN"
+    );
+    assert!(cards.remembered_pin(IDENT).is_none());
+}

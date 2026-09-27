@@ -10,7 +10,10 @@ import '../terminal/key_bar_layout.dart';
 
 /// 设置：终端字体、字号、键位条与滚回行数（存在 Rust 侧，新会话生效）。
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key});
+  final ValueChanged<SaveSettings>? saveSettings;
+  final VoidCallback? querySettings;
+
+  const SettingsPage({super.key, this.saveSettings, this.querySettings});
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -29,7 +32,11 @@ class _SettingsPageState extends State<SettingsPage> {
     _settingsSub = SettingsState.rustSignalStream.listen((pack) {
       if (mounted) setState(() => _settings = pack.message);
     });
-    SettingsQuery().sendSignalToRust();
+    if (widget.querySettings case final query?) {
+      query();
+    } else {
+      SettingsQuery().sendSignalToRust();
+    }
   }
 
   @override
@@ -44,14 +51,19 @@ class _SettingsPageState extends State<SettingsPage> {
     int? scrollbackLines,
     bool? showKeyBar,
   }) {
-    final settings = _settings;
-    if (settings == null) return;
-    SaveSettings(
-      fontFamily: fontFamily ?? settings.fontFamily,
-      fontSize: fontSize ?? settings.fontSize,
-      scrollbackLines: scrollbackLines ?? settings.scrollbackLines,
-      showKeyBar: showKeyBar ?? settings.showKeyBar,
-    ).sendSignalToRust();
+    if (_settings == null) return;
+    // 回包只用于显示，不用旧快照补齐未修改字段。
+    final request = SaveSettings(
+      fontFamily: fontFamily,
+      fontSize: fontSize,
+      scrollbackLines: scrollbackLines,
+      showKeyBar: showKeyBar,
+    );
+    if (widget.saveSettings case final save?) {
+      save(request);
+    } else {
+      request.sendSignalToRust();
+    }
   }
 
   /// 滚回行数的可选档位，不超过本机上界（上界本身也是一档）。

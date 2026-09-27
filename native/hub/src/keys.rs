@@ -7,6 +7,7 @@
 //! 私钥在卡或安全密钥里。
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -34,7 +35,7 @@ use crate::signals::keys::{
 pub const KEY_REF_PREFIX: &str = "keychain:";
 
 /// 钥匙串里的两类条目（按 service 区分，account 是私钥 id）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Item {
     Key,
     Passphrase,
@@ -65,8 +66,25 @@ pub trait KeyStore: Send + Sync {
         secret: &[u8],
         synchronized: bool,
     ) -> Result<(), StoreError>;
+    /// 只读指定存储，查询失败必须上抛，不能作为条目不存在。
+    fn get_in(
+        &self,
+        item: Item,
+        id: &str,
+        synchronized: bool,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError>;
     /// 读出，连同它所在的存储（先本机后 iCloud）。
-    fn get(&self, item: Item, id: &str) -> Result<Option<StoredSecret>, StoreError>;
+    fn get(&self, item: Item, id: &str) -> Result<Option<StoredSecret>, StoreError> {
+        if let Some(secret) = self.get_in(item, id, false)? {
+            return Ok(Some((secret, false)));
+        }
+        if self.sync_available() {
+            return self
+                .get_in(item, id, true)
+                .map(|found| found.map(|secret| (secret, true)));
+        }
+        Ok(None)
+    }
     /// 删除；不存在也算成功。
     fn delete(&self, item: Item, id: &str, synchronized: bool) -> Result<(), StoreError>;
     /// 一个存储里这类条目的全部 id。
@@ -166,23 +184,16 @@ impl KeyStore for KeychainKeyStore {
             .map_err(|error| StoreError(error.to_string()))
     }
 
-    fn get(&self, item: Item, id: &str) -> Result<Option<StoredSecret>, StoreError> {
-        match self.entry(item, id, false)?.get_secret() {
-            Ok(secret) => return Ok(Some((Zeroizing::new(secret), false))),
-            Err(keyring_core::Error::NoEntry) => {}
-            Err(error) => return Err(StoreError(error.to_string())),
-        }
-        if self.cloud.is_none() {
-            return Ok(None);
-        }
-        // iCloud 钥匙串读不出来时当作没有，不挡住本机条目。
-        match self.entry(item, id, true)?.get_secret() {
-            Ok(secret) => Ok(Some((Zeroizing::new(secret), true))),
+    fn get_in(
+        &self,
+        item: Item,
+        id: &str,
+        synchronized: bool,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        match self.entry(item, id, synchronized)?.get_secret() {
+            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
             Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(error) => {
-                debug_print!("[keys] iCloud keychain read: {error}");
-                Ok(None)
-            }
+            Err(error) => Err(StoreError(error.to_string())),
         }
     }
 
@@ -194,20 +205,18 @@ impl KeyStore for KeychainKeyStore {
     }
 
     fn list(&self, item: Item, synchronized: bool) -> Result<Vec<String>, StoreError> {
-        let Ok(store) = self.store(synchronized) else {
-            return Ok(Vec::new());
-        };
+        let store = self.store(synchronized)?;
         let spec = std::collections::HashMap::from([("service", item.service())]);
         match store.search(&spec) {
-            Ok(entries) => Ok(entries
+            Ok(entries) => entries
                 .iter()
-                .filter_map(keyring_core::Entry::get_specifiers)
-                .map(|(_, account)| account)
-                .collect()),
-            Err(error) if synchronized => {
-                debug_print!("[keys] iCloud keychain search: {error}");
-                Ok(Vec::new())
-            }
+                .map(|entry| {
+                    entry
+                        .get_specifiers()
+                        .map(|(_, account)| account)
+                        .ok_or_else(|| StoreError("钥匙串搜索条目缺少标识".to_owned()))
+                })
+                .collect(),
             Err(error) => Err(StoreError(error.to_string())),
         }
     }
@@ -223,6 +232,9 @@ pub struct Preferences {
     /// 私钥经 iCloud 钥匙串同步。默认关（PLAN §5 M3a）。
     #[serde(default)]
     pub sync_keys: bool,
+    /// 未完成的钥匙串迁移，只记录方向、阶段与条目 id，不保存私钥或口令。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_migration: Option<SyncMigration>,
     /// 终端下方显示键位条；没设置过时按平台（见 `settings::default_show_key_bar`）。
     #[serde(default)]
     pub show_key_bar: Option<bool>,
@@ -234,9 +246,20 @@ pub struct Preferences {
     pub key_bar_layout_version: u8,
 }
 
+/// 复制完成后，目标偏好与清理标记在同一次偏好写入中提交。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SyncMigration {
+    target: bool,
+    cleanup: bool,
+    /// 固定本次涉及的条目 id，恢复清理时不删除迁移开始之后新增的条目。
+    moving: Vec<(Item, String)>,
+}
+
 pub struct PreferenceFile {
     path: PathBuf,
     value: Mutex<Preferences>,
+    #[cfg(test)]
+    fail_after_writes: Mutex<Option<usize>>,
 }
 
 impl PreferenceFile {
@@ -248,6 +271,8 @@ impl PreferenceFile {
         Self {
             path,
             value: Mutex::new(value),
+            #[cfg(test)]
+            fail_after_writes: Mutex::new(None),
         }
     }
 
@@ -261,13 +286,34 @@ impl PreferenceFile {
     /// 写临时文件再改名，不会留下半截文件。
     pub fn update(&self, change: impl FnOnce(&mut Preferences)) -> Result<(), String> {
         let mut value = self.value.lock().unwrap_or_else(|error| error.into_inner());
+        #[cfg(test)]
+        {
+            let mut failure = self
+                .fail_after_writes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(remaining) = failure.as_mut() {
+                if *remaining == 0 {
+                    *failure = None;
+                    return Err("模拟偏好持久化失败".to_owned());
+                }
+                *remaining -= 1;
+            }
+        }
         let mut preferences = value.clone();
         change(&mut preferences);
         let bytes = serde_json::to_vec_pretty(&preferences).map_err(|error| error.to_string())?;
         let temporary = self.path.with_extension("json.tmp");
-        std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+        let mut file = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
         std::fs::rename(&temporary, &self.path).map_err(|error| error.to_string())?;
         *value = preferences;
+        if let Some(parent) = self.path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 }
@@ -392,6 +438,9 @@ fn load_envelope(store: &dyn KeyStore, id: &str) -> Result<Option<(Envelope, boo
 fn all_ids(store: &dyn KeyStore) -> Result<BTreeMap<String, bool>, KeyError> {
     let mut ids = BTreeMap::new();
     for synchronized in [true, false] {
+        if synchronized && !store.sync_available() {
+            continue;
+        }
         for id in store
             .list(Item::Key, synchronized)
             .map_err(store_error(false))?
@@ -412,6 +461,7 @@ pub fn import(
     let private_key = private_key.trim();
     let passphrase = Some(passphrase).filter(|passphrase| !passphrase.is_empty());
     let (public_key, encrypted) = inspect(private_key, passphrase)?;
+    let _operations = key_operations(context)?;
     reject_duplicate(context, &public_key)?;
 
     let comment = public_key.comment().as_str_lossy().trim().to_owned();
@@ -439,6 +489,7 @@ pub fn import(
 pub fn add_card(context: &AppContext, ident: &str, name: &str) -> Result<String, KeyError> {
     let card = context.cards.scanned(ident).ok_or(KeyError::CardNotFound)?;
     let public_key = card.public_key.ok_or(KeyError::CardUnsupported)?;
+    let _operations = key_operations(context)?;
     reject_duplicate(context, &public_key)?;
     let name = match name.trim() {
         "" if !card.cardholder.is_empty() => card.cardholder.clone(),
@@ -477,6 +528,7 @@ pub fn add_security_key(context: &AppContext, name: &str) -> Result<String, KeyE
         security_key::public_key(&registration, &rp_id).map_err(security_key_error)?;
     // 公钥注释用名字，贴进 authorized_keys 后认得出是哪把。
     public_key.set_comment(name.as_str());
+    let _operations = key_operations(context)?;
     reject_duplicate(context, &public_key)?;
     store_new(
         context,
@@ -574,6 +626,7 @@ fn store_new(context: &AppContext, envelope: &Envelope) -> Result<String, KeyErr
 }
 
 pub fn rename(context: &AppContext, id: &str, name: &str) -> Result<(), KeyError> {
+    let _operations = key_operations(context)?;
     let name = name.trim();
     if name.is_empty() {
         return Err(KeyError::Invalid);
@@ -588,11 +641,16 @@ pub fn rename(context: &AppContext, id: &str, name: &str) -> Result<(), KeyError
 }
 
 /// 删除私钥与它存下的口令。有连接在用时拒绝。
-pub fn delete(context: &AppContext, catalog: &ConnectionCatalog, id: &str) -> Result<(), KeyError> {
+pub fn delete(context: &AppContext, id: &str) -> Result<(), KeyError> {
+    let _operations = key_operations(context)?;
+    let catalog = context
+        .repository
+        .load_catalog()
+        .map_err(|_| KeyError::Keychain)?;
     if load_envelope(context.keys.as_ref(), id)?.is_none() {
         return Err(KeyError::NotFound);
     }
-    if used_by(catalog, id) > 0 {
+    if used_by(&catalog, id) > 0 {
         return Err(KeyError::InUse);
     }
     remove(context.keys.as_ref(), Item::Passphrase, id)?;
@@ -601,6 +659,7 @@ pub fn delete(context: &AppContext, catalog: &ConnectionCatalog, id: &str) -> Re
 
 /// 删掉存下的口令，下次连接时再问。
 pub fn forget_passphrase(context: &AppContext, id: &str) -> Result<(), KeyError> {
+    let _operations = key_operations(context)?;
     if load_envelope(context.keys.as_ref(), id)?.is_none() {
         return Err(KeyError::NotFound);
     }
@@ -621,57 +680,105 @@ fn remove(store: &dyn KeyStore, item: Item, id: &str) -> Result<(), KeyError> {
     Ok(())
 }
 
-/// 开关 iCloud 同步：私钥与口令整体搬到另一个存储——先全部写进目标，
-/// 有一项写不进就撤回已写的，全部成功后才删原处的。
+/// 所有密钥写操作和目录引用提交共用此锁；未完成迁移先恢复，失败时禁止写入旧副本。
+fn key_operations(context: &AppContext) -> Result<std::sync::MutexGuard<'_, ()>, KeyError> {
+    let operations = context
+        .key_operations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    reconcile_sync_locked(context)?;
+    Ok(operations)
+}
+
+fn update_preferences(
+    context: &AppContext,
+    change: impl FnOnce(&mut Preferences),
+) -> Result<(), KeyError> {
+    context
+        .preferences
+        .update(change)
+        .map_err(|_| KeyError::Keychain)
+}
+
+/// 开关 iCloud 同步：先持久化迁移方向，再复制，提交目标偏好，最后清理来源。
+/// 任一步中断都保留可重试标记；不会在唯一副本仍在来源时删除它。
 pub fn set_sync(context: &AppContext, enabled: bool) -> Result<(), KeyError> {
+    let _operations = key_operations(context)?;
     if context.preferences.get().sync_keys == enabled {
         return Ok(());
     }
-    if enabled && !context.keys.sync_available() {
+    if !context.keys.sync_available() {
         return Err(KeyError::SyncUnavailable);
     }
-    let store = context.keys.as_ref();
     let mut moving = Vec::new();
     for item in [Item::Key, Item::Passphrase] {
-        for id in store.list(item, !enabled).map_err(store_error(false))? {
+        for id in context
+            .keys
+            .list(item, !enabled)
+            .map_err(store_error(!enabled))?
+        {
             moving.push((item, id));
         }
     }
-    let mut written: Vec<(Item, String)> = Vec::new();
-    for (item, id) in &moving {
-        let copied = store
-            .get(*item, id)
-            .map_err(store_error(false))
-            .and_then(|found| found.ok_or(KeyError::NotFound))
-            .and_then(|(secret, _)| {
-                store
-                    .put(*item, id, &secret, enabled)
-                    .map_err(store_error(enabled))
-            });
-        if let Err(error) = copied {
-            for (item, id) in &written {
-                let _ = store.delete(*item, id, enabled);
-            }
-            return Err(error);
+    update_preferences(context, |preferences| {
+        preferences.sync_migration = Some(SyncMigration {
+            target: enabled,
+            cleanup: false,
+            moving,
+        });
+    })?;
+    reconcile_sync_locked(context)
+}
+
+/// 启动时恢复中断的迁移；失败保留标记，界面显示待完成并允许重试。
+pub fn reconcile_sync(context: &AppContext) -> Result<(), KeyError> {
+    let _operations = context
+        .key_operations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    reconcile_sync_locked(context)
+}
+
+fn reconcile_sync_locked(context: &AppContext) -> Result<(), KeyError> {
+    let Some(mut migration) = context.preferences.get().sync_migration else {
+        return Ok(());
+    };
+    let store = context.keys.as_ref();
+    if !store.sync_available() {
+        return Err(KeyError::SyncUnavailable);
+    }
+    if !migration.cleanup {
+        for (item, id) in &migration.moving {
+            let secret = store
+                .get_in(*item, id, !migration.target)
+                .map_err(store_error(!migration.target))?
+                .ok_or(KeyError::NotFound)?;
+            store
+                .put(*item, id, &secret, migration.target)
+                .map_err(store_error(migration.target))?;
         }
-        written.push((*item, id.clone()));
+        migration.cleanup = true;
     }
-    for (item, id) in &moving {
+    // 恢复清理时也重新持久化标记，涵盖上次改名成功但目录刷盘失败的情况。
+    update_preferences(context, |preferences| {
+        preferences.sync_keys = migration.target;
+        preferences.sync_migration = Some(migration.clone());
+    })?;
+    // 此时每个来源条目都已有目标副本；清理失败或退出后重复删除仍然安全。
+    for (item, id) in &migration.moving {
         store
-            .delete(*item, id, !enabled)
-            .map_err(store_error(false))?;
+            .delete(*item, id, !migration.target)
+            .map_err(store_error(!migration.target))?;
     }
-    context
-        .preferences
-        .update(|preferences| preferences.sync_keys = enabled)
-        .map_err(|error| {
-            debug_print!("[keys] preferences: {error}");
-            KeyError::Keychain
-        })
+    update_preferences(context, |preferences| preferences.sync_migration = None)
 }
 
 /// 连接用：读出私钥与存下的口令。
 pub fn load(context: &AppContext, id: &str) -> Result<Option<StoredKey>, KeyError> {
+    let _operations = context
+        .key_operations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let Some((envelope, synchronized)) = load_envelope(context.keys.as_ref(), id)? else {
         return Ok(None);
     };
@@ -698,8 +805,11 @@ pub fn save_passphrase(
     context: &AppContext,
     id: &str,
     passphrase: &SecretString,
-    synchronized: bool,
+    _synchronized: bool,
 ) -> Result<(), KeyError> {
+    let _operations = key_operations(context)?;
+    // 连接等待口令期间可能切换了同步，存储位置必须在锁内按当前私钥重新确认。
+    let (_, synchronized) = load_envelope(context.keys.as_ref(), id)?.ok_or(KeyError::NotFound)?;
     context
         .keys
         .put(
@@ -733,6 +843,10 @@ pub fn summaries(
     context: &AppContext,
     catalog: &ConnectionCatalog,
 ) -> Result<Vec<KeySummary>, KeyError> {
+    let _operations = context
+        .key_operations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut keys = Vec::new();
     for id in all_ids(context.keys.as_ref())?.keys() {
         let Some((envelope, synchronized)) = load_envelope(context.keys.as_ref(), id)? else {
@@ -806,8 +920,7 @@ pub async fn run(context: Arc<AppContext>) {
                 let Some(pack) = pack else { break };
                 let request_id = pack.message.request_id;
                 let result = blocking(&context, move |context| {
-                    let catalog = context.repository.load_catalog().map_err(|_| KeyError::Keychain)?;
-                    delete(context, &catalog, &pack.message.id)
+                    delete(context, &pack.message.id)
                 })
                 .await;
                 reply(request_id, result.map(|()| String::new()));
@@ -905,16 +1018,24 @@ async fn publish(context: &Arc<AppContext>) {
         summaries(context, &catalog)
     })
     .await;
-    match listed {
-        Ok(keys) => KeyListState {
-            keys,
-            sync_enabled: context.preferences.get().sync_keys,
-            sync_available: context.keys.sync_available(),
-            security_keys_available: context.security_keys.relying_party().is_some(),
-        }
-        .send_signal_to_dart(),
-        Err(error) => debug_print!("[keys] list: {error:?}"),
+    let preferences = context.preferences.get();
+    let (keys, list_error) = match listed {
+        Ok(keys) => (keys, KeyError::None),
+        Err(error) => (Vec::new(), error),
+    };
+    KeyListState {
+        keys,
+        list_error,
+        sync_enabled: preferences.sync_keys,
+        sync_pending: preferences.sync_migration.is_some(),
+        sync_target_enabled: preferences
+            .sync_migration
+            .as_ref()
+            .map_or(preferences.sync_keys, |migration| migration.target),
+        sync_available: context.keys.sync_available(),
+        security_keys_available: context.security_keys.relying_party().is_some(),
     }
+    .send_signal_to_dart();
 }
 
 /// 测试用的内存存储；`cloud_available = false` 模拟 iCloud 钥匙串不可用。
@@ -955,13 +1076,16 @@ impl KeyStore for MemoryKeyStore {
         Ok(())
     }
 
-    fn get(&self, item: Item, id: &str) -> Result<Option<StoredSecret>, StoreError> {
-        let items = self.items();
-        Ok([false, true].into_iter().find_map(|synchronized| {
-            items
-                .get(&(item, id.to_owned(), synchronized))
-                .map(|secret| (Zeroizing::new(secret.clone()), synchronized))
-        }))
+    fn get_in(
+        &self,
+        item: Item,
+        id: &str,
+        synchronized: bool,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        Ok(self
+            .items()
+            .get(&(item, id.to_owned(), synchronized))
+            .map(|secret| Zeroizing::new(secret.clone())))
     }
 
     fn delete(&self, item: Item, id: &str, synchronized: bool) -> Result<(), StoreError> {
@@ -973,6 +1097,9 @@ impl KeyStore for MemoryKeyStore {
     }
 
     fn list(&self, item: Item, synchronized: bool) -> Result<Vec<String>, StoreError> {
+        if synchronized && !self.cloud_available {
+            return Err(StoreError("missing iCloud entitlement".to_owned()));
+        }
         Ok(self
             .items()
             .keys()
@@ -1029,6 +1156,7 @@ mod tests {
             repository,
             known_hosts: PathBuf::new(),
             keys: Arc::new(MemoryKeyStore::new(cloud_available)),
+            key_operations: std::sync::Mutex::new(()),
             cards: Arc::new(CardContext::new(Arc::new(NoCards))),
             security_keys: Arc::new(crate::security_key::Unavailable),
             preferences: PreferenceFile::open(preferences),
@@ -1172,12 +1300,26 @@ mod tests {
         profile.identity_file = Some(key_ref(&id));
         let mut in_use = catalog();
         in_use
-            .apply(CatalogMutation::Create(profile))
+            .apply(CatalogMutation::Create(profile.clone()))
             .expect("connection");
         assert_eq!(summaries(&context, &in_use).expect("list")[0].used_by, 1);
-        assert_eq!(delete(&context, &in_use, &id), Err(KeyError::InUse));
+        context
+            .credentials
+            .apply_catalog(
+                CatalogMutation::Create(profile.clone()),
+                rshell_m0::rshell_core::SecretUpdate::Unchanged,
+            )
+            .expect("保存目录引用");
+        assert_eq!(delete(&context, &id), Err(KeyError::InUse));
+        context
+            .credentials
+            .apply_catalog(
+                CatalogMutation::Delete(profile.id),
+                rshell_m0::rshell_core::SecretUpdate::Unchanged,
+            )
+            .expect("删除目录引用");
 
-        delete(&context, &catalog(), &id).expect("delete");
+        delete(&context, &id).expect("delete");
         assert!(context.keys.get(Item::Key, &id).expect("get").is_none());
         assert!(
             context
@@ -1186,7 +1328,7 @@ mod tests {
                 .expect("get")
                 .is_none()
         );
-        assert_eq!(delete(&context, &catalog(), &id), Err(KeyError::NotFound));
+        assert_eq!(delete(&context, &id), Err(KeyError::NotFound));
     }
 
     #[test]
@@ -1304,5 +1446,438 @@ mod tests {
         let public_key = PublicKey::from_openssh(&stored.public_key).expect("public key");
         assert_eq!(public_key.algorithm(), Algorithm::SkEcdsaSha2NistP256);
         assert_eq!(public_key.comment().as_str_lossy(), "yubikey");
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FaultOperation {
+        List(bool),
+        Read(bool),
+        Put(bool),
+        Delete(bool),
+    }
+
+    /// 故障只影响指定步骤，不读取系统钥匙串，也不将条目内容写进故障消息。
+    struct FaultStore {
+        inner: MemoryKeyStore,
+        fault: std::sync::Mutex<Option<(FaultOperation, usize)>>,
+    }
+
+    impl FaultStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryKeyStore::new(true),
+                fault: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn fail_after(&self, operation: FaultOperation, successful: usize) {
+            *self.fault.lock().expect("故障锁") = Some((operation, successful));
+        }
+
+        fn check(&self, operation: FaultOperation) -> Result<(), super::StoreError> {
+            let mut fault = self.fault.lock().expect("故障锁");
+            if let Some((expected, remaining)) = fault.as_mut()
+                && *expected == operation
+            {
+                if *remaining == 0 {
+                    *fault = None;
+                    return Err(super::StoreError("模拟钥匙串操作失败".to_owned()));
+                }
+                *remaining -= 1;
+            }
+            Ok(())
+        }
+    }
+
+    impl super::KeyStore for FaultStore {
+        fn put(
+            &self,
+            item: Item,
+            id: &str,
+            secret: &[u8],
+            synchronized: bool,
+        ) -> Result<(), super::StoreError> {
+            self.check(FaultOperation::Put(synchronized))?;
+            self.inner.put(item, id, secret, synchronized)
+        }
+
+        fn get_in(
+            &self,
+            item: Item,
+            id: &str,
+            synchronized: bool,
+        ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, super::StoreError> {
+            self.check(FaultOperation::Read(synchronized))?;
+            self.inner.get_in(item, id, synchronized)
+        }
+
+        fn delete(
+            &self,
+            item: Item,
+            id: &str,
+            synchronized: bool,
+        ) -> Result<(), super::StoreError> {
+            self.check(FaultOperation::Delete(synchronized))?;
+            self.inner.delete(item, id, synchronized)
+        }
+
+        fn list(&self, item: Item, synchronized: bool) -> Result<Vec<String>, super::StoreError> {
+            self.check(FaultOperation::List(synchronized))?;
+            self.inner.list(item, synchronized)
+        }
+
+        fn sync_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn migration_context() -> (AppContext, Arc<FaultStore>, String) {
+        let mut context = context(true);
+        let store = Arc::new(FaultStore::new());
+        context.keys = store.clone();
+        let id = import(&context, "迁移测试", &ed25519(None), "").expect("导入测试私钥");
+        save_passphrase(
+            &context,
+            &id,
+            &SecretString::from("保密口令".to_owned()),
+            false,
+        )
+        .expect("保存测试口令");
+        (context, store, id)
+    }
+
+    fn assert_migrated(context: &AppContext, id: &str, target: bool) {
+        let stored = load(context, id).expect("读取迁移结果").expect("私钥仍在");
+        assert_eq!(stored.synchronized, target);
+        assert_eq!(
+            stored.passphrase.expect("口令仍在").expose_secret(),
+            "保密口令"
+        );
+        assert_eq!(context.preferences.get().sync_keys, target);
+        assert!(context.preferences.get().sync_migration.is_none());
+        for item in [Item::Key, Item::Passphrase] {
+            assert!(
+                context
+                    .keys
+                    .get_in(item, id, !target)
+                    .expect("读取来源")
+                    .is_none()
+            );
+            assert!(
+                context
+                    .keys
+                    .get_in(item, id, target)
+                    .expect("读取目标")
+                    .is_some()
+            );
+        }
+    }
+
+    fn reopen_preferences(context: &mut AppContext) {
+        context.preferences = PreferenceFile::open(context.preferences.path.clone());
+    }
+
+    #[test]
+    fn 关闭同步时查询失败保留原偏好与云端条目() {
+        let (context, store, id) = migration_context();
+        set_sync(&context, true).expect("开启同步");
+        store.fail_after(FaultOperation::List(true), 0);
+        assert_eq!(set_sync(&context, false), Err(KeyError::SyncUnavailable));
+        assert!(context.preferences.get().sync_keys);
+        assert!(context.preferences.get().sync_migration.is_none());
+        assert!(
+            context
+                .keys
+                .get_in(Item::Key, &id, true)
+                .expect("云端条目")
+                .is_some()
+        );
+        assert!(
+            context
+                .keys
+                .get_in(Item::Key, &id, false)
+                .expect("本机条目")
+                .is_none()
+        );
+        set_sync(&context, false).expect("重试查询与迁移");
+        assert_migrated(&context, &id, false);
+    }
+
+    #[test]
+    fn 复制失败保留全部来源并可在重启后继续() {
+        let (mut context, store, id) = migration_context();
+        store.fail_after(FaultOperation::Put(true), 1);
+        assert_eq!(set_sync(&context, true), Err(KeyError::SyncUnavailable));
+        assert!(!context.preferences.get().sync_keys);
+        let migration = context
+            .preferences
+            .get()
+            .sync_migration
+            .expect("保留复制阶段");
+        assert!(!migration.cleanup);
+        for item in [Item::Key, Item::Passphrase] {
+            assert!(
+                context
+                    .keys
+                    .get_in(item, &id, false)
+                    .expect("来源仍完整")
+                    .is_some()
+            );
+        }
+        assert!(
+            context
+                .keys
+                .get_in(Item::Key, &id, true)
+                .expect("首项已复制")
+                .is_some()
+        );
+        assert!(
+            context
+                .keys
+                .get_in(Item::Passphrase, &id, true)
+                .expect("次项未复制")
+                .is_none()
+        );
+        let journal = std::fs::read_to_string(&context.preferences.path).expect("持久化迁移状态");
+        assert!(!journal.contains("保密口令"));
+        assert!(!journal.contains("PRIVATE KEY"));
+        reopen_preferences(&mut context);
+        super::reconcile_sync(&context).expect("启动时恢复复制");
+        assert_migrated(&context, &id, true);
+    }
+
+    #[test]
+    fn 来源读取失败不会删除来源且可恢复() {
+        let (mut context, store, id) = migration_context();
+        store.fail_after(FaultOperation::Read(false), 0);
+        assert_eq!(set_sync(&context, true), Err(KeyError::Keychain));
+        assert!(!context.preferences.get().sync_keys);
+        assert!(
+            context
+                .keys
+                .get_in(Item::Key, &id, false)
+                .expect("保留来源")
+                .is_some()
+        );
+        reopen_preferences(&mut context);
+        super::reconcile_sync(&context).expect("恢复来源读取");
+        assert_migrated(&context, &id, true);
+    }
+
+    #[test]
+    fn 迁移各次偏好写入失败均保留可恢复状态() {
+        for successful in 0..3 {
+            let (mut context, _, id) = migration_context();
+            *context
+                .preferences
+                .fail_after_writes
+                .lock()
+                .expect("偏好故障锁") = Some(successful);
+            assert_eq!(set_sync(&context, true), Err(KeyError::Keychain));
+            if successful == 0 {
+                assert!(!context.preferences.get().sync_keys);
+                assert!(context.preferences.get().sync_migration.is_none());
+                assert!(
+                    context
+                        .keys
+                        .get_in(Item::Key, &id, true)
+                        .expect("尚未复制")
+                        .is_none()
+                );
+            } else if successful == 1 {
+                assert!(!context.preferences.get().sync_keys);
+                assert!(
+                    !context
+                        .preferences
+                        .get()
+                        .sync_migration
+                        .expect("复制标记")
+                        .cleanup
+                );
+                for item in [Item::Key, Item::Passphrase] {
+                    assert!(
+                        context
+                            .keys
+                            .get_in(item, &id, false)
+                            .expect("来源保留")
+                            .is_some()
+                    );
+                    assert!(
+                        context
+                            .keys
+                            .get_in(item, &id, true)
+                            .expect("目标已复制")
+                            .is_some()
+                    );
+                }
+            } else {
+                assert!(context.preferences.get().sync_keys);
+                assert!(
+                    context
+                        .preferences
+                        .get()
+                        .sync_migration
+                        .expect("清理标记")
+                        .cleanup
+                );
+                assert!(
+                    context
+                        .keys
+                        .get_in(Item::Key, &id, false)
+                        .expect("来源已清理")
+                        .is_none()
+                );
+            }
+            reopen_preferences(&mut context);
+            set_sync(&context, true).expect("重试同一目标也必须恢复迁移");
+            assert_migrated(&context, &id, true);
+        }
+    }
+
+    #[test]
+    fn 双向来源清理中断可重启恢复且同目标重试不跳过() {
+        for target in [false, true] {
+            for successful in 0..2 {
+                let (mut context, store, id) = migration_context();
+                if !target {
+                    set_sync(&context, true).expect("准备云端来源");
+                }
+                store.fail_after(FaultOperation::Delete(!target), successful);
+                assert!(set_sync(&context, target).is_err());
+                assert_eq!(context.preferences.get().sync_keys, target);
+                assert!(
+                    context
+                        .preferences
+                        .get()
+                        .sync_migration
+                        .expect("清理待完成")
+                        .cleanup
+                );
+                for item in [Item::Key, Item::Passphrase] {
+                    assert!(
+                        context
+                            .keys
+                            .get_in(item, &id, target)
+                            .expect("目标完整")
+                            .is_some()
+                    );
+                }
+                reopen_preferences(&mut context);
+                set_sync(&context, target).expect("恢复清理来源");
+                assert_migrated(&context, &id, target);
+            }
+        }
+    }
+
+    #[test]
+    fn 恢复迁移只从指定来源复制而不使用另一侧旧副本() {
+        let (context, store, id) = migration_context();
+        set_sync(&context, true).expect("开启同步");
+        super::KeyStore::put(
+            &store.inner,
+            Item::Passphrase,
+            &id,
+            "过时副本".as_bytes(),
+            false,
+        )
+        .expect("模拟旧副本");
+        set_sync(&context, false).expect("按云端来源迁回");
+        assert_migrated(&context, &id, false);
+    }
+
+    #[test]
+    fn 等待口令期间切换同步后按私钥当前位置保存() {
+        let (context, _, id) = migration_context();
+        set_sync(&context, true).expect("开启同步");
+        save_passphrase(
+            &context,
+            &id,
+            &SecretString::from("保密口令".to_owned()),
+            false,
+        )
+        .expect("旧连接提交已验证口令");
+        assert_migrated(&context, &id, true);
+    }
+
+    #[test]
+    fn 云端列表失败向上传递且禁止把列表当空继续导入() {
+        let (context, store, id) = migration_context();
+        store.fail_after(FaultOperation::List(true), 0);
+        assert_eq!(
+            summaries(&context, &catalog()).err(),
+            Some(KeyError::Keychain)
+        );
+        store.fail_after(FaultOperation::List(true), 0);
+        assert_eq!(
+            import(&context, "不能跳过重复检查", &ed25519(None), ""),
+            Err(KeyError::Keychain)
+        );
+        assert_eq!(
+            context.keys.list(Item::Key, false).expect("原本机条目"),
+            vec![id]
+        );
+    }
+
+    #[test]
+    fn 双向迁移在任意复制项写入失败后均保留全部来源() {
+        for target in [false, true] {
+            for successful in 0..2 {
+                let (mut context, store, id) = migration_context();
+                if !target {
+                    set_sync(&context, true).expect("准备云端来源");
+                }
+                store.fail_after(FaultOperation::Put(target), successful);
+                assert!(set_sync(&context, target).is_err());
+                assert_eq!(context.preferences.get().sync_keys, !target);
+                assert!(
+                    !context
+                        .preferences
+                        .get()
+                        .sync_migration
+                        .expect("复制阶段保留")
+                        .cleanup
+                );
+                for item in [Item::Key, Item::Passphrase] {
+                    assert!(
+                        context
+                            .keys
+                            .get_in(item, &id, !target)
+                            .expect("读取来源")
+                            .is_some()
+                    );
+                }
+                reopen_preferences(&mut context);
+                super::reconcile_sync(&context).expect("重启后恢复复制");
+                assert_migrated(&context, &id, target);
+            }
+        }
+    }
+
+    #[test]
+    fn 迁移未完成时写入先恢复迁移以免修改即将被删除的副本() {
+        let (context, store, id) = migration_context();
+        store.fail_after(FaultOperation::Put(true), 0);
+        assert_eq!(set_sync(&context, true), Err(KeyError::SyncUnavailable));
+        store.fail_after(FaultOperation::Put(true), 0);
+        assert_eq!(
+            rename(&context, &id, "新名称"),
+            Err(KeyError::SyncUnavailable)
+        );
+        assert_eq!(
+            load(&context, &id)
+                .expect("可读来源")
+                .expect("私钥仍在")
+                .name,
+            "迁移测试"
+        );
+        rename(&context, &id, "新名称").expect("恢复后只修改目标存储");
+        assert_migrated(&context, &id, true);
+        assert_eq!(
+            load(&context, &id)
+                .expect("可读目标")
+                .expect("私钥仍在")
+                .name,
+            "新名称"
+        );
     }
 }

@@ -110,7 +110,9 @@ pub struct ViewportRequest {
 
 /// 终端输入（M2 输入闭环的边界）。
 ///
-/// 键与文本二选一：`text` 非空 = IME 提交/粘贴的文本（`CommittedText`）；
+/// 键、IME 文本与粘贴共用此通道，保留用户的发送顺序。
+/// `paste = true` 时 `text` 是剪贴板原文，Rust 负责过滤控制字符、规范化换行与 bracketed paste；
+/// 其余输入二选一：`text` 非空 = IME 提交的文本（`CommittedText`）；
 /// 否则 `key` 携带键名——`"character:x"`（单字符）或命名键
 /// （enter/escape/tab/backspace/delete/insert/home/end/page_up/page_down/
 /// arrow_up/arrow_down/arrow_left/arrow_right/`f1`…`f24`）。
@@ -118,6 +120,7 @@ pub struct ViewportRequest {
 #[derive(Deserialize, DartSignal)]
 pub struct InputRequest {
     pub session_id: u32,
+    pub paste: bool,
     pub text: String,
     pub key: String,
     pub shift: bool,
@@ -165,14 +168,6 @@ pub struct SelectionRequest {
 #[derive(Deserialize, DartSignal)]
 pub struct CopyRequest {
     pub session_id: u32,
-}
-
-/// 粘贴一段文本。换行规范化、控制字符过滤、按远端模式包 bracketed paste
-/// 都是 Rust 的事（`session::paste_bytes`），Dart 只转发剪贴板原文。
-#[derive(Deserialize, DartSignal)]
-pub struct PasteRequest {
-    pub session_id: u32,
-    pub text: String,
 }
 
 /// Dart 已处理完 `seq` 这一帧（流控：同一时刻最多一帧在途，Dart 跟不上时
@@ -352,4 +347,35 @@ pub struct ScreenCheck {
     pub cols: u16,
     pub stable_rows: Vec<i64>,
     pub rows: Vec<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::InputRequest;
+    use rinf::DartSignal;
+
+    #[tokio::test]
+    async fn keys_text_and_paste_use_one_fifo_signal_queue() {
+        let receiver = InputRequest::get_dart_signal_receiver();
+        let events = [
+            (false, "echo ", ""),
+            (true, "第一段", ""),
+            (false, "", "enter"),
+            (true, "第二段", ""),
+            (false, "尾部", ""),
+        ];
+        for (paste, text, key) in events {
+            let bytes = rinf::serialize(&(1u32, paste, text, key, false, false, false))
+                .expect("输入信号编码");
+            InputRequest::send_dart_signal(&bytes, &[]);
+        }
+        for (paste, text, key) in events {
+            let message = receiver.recv().await.expect("输入信号").message;
+            assert_eq!(
+                (message.paste, message.text.as_str(), message.key.as_str()),
+                (paste, text, key)
+            );
+        }
+    }
 }

@@ -60,7 +60,7 @@ runs:
       shell: bash
       env:
         RINF_VERSION: ${{ steps.versions.outputs.rinf }}
-      run: cargo install rinf_cli --version "$RINF_VERSION" --locked
+      run: cargo install rinf_cli --version "$RINF_VERSION" --locked --force
     - name: 准备 Flutter 依赖和桥接
       shell: bash
       env:

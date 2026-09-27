@@ -309,6 +309,7 @@ impl PreferenceFile {
         file.sync_all().map_err(|error| error.to_string())?;
         std::fs::rename(&temporary, &self.path).map_err(|error| error.to_string())?;
         *value = preferences;
+        #[cfg(unix)]
         if let Some(parent) = self.path.parent() {
             std::fs::File::open(parent)
                 .and_then(|directory| directory.sync_all())

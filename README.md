@@ -1,6 +1,7 @@
 # GuoSSHell
 
-一个 **纯 SSH 客户端**，iOS / iPadOS（iPad 优先）与 macOS 共用一套代码。业务与终端语义跑在 **Rust**
+一个 **纯 SSH 客户端**，覆盖 iPhone / iPad、macOS、Windows、Linux 与 Android。
+业务与终端语义跑在 **Rust**
 （上游 [rsHell](https://github.com/hugefiver/rsHell) 的内核，直接作为固定提交的 git 依赖），
 只有渲染与交互用 **Flutter** 重写。Dart 不写业务逻辑。
 
@@ -83,6 +84,15 @@ flutter run -d <模拟器id 或 macos> \
 # 同名的进程环境变量也认（没有 --dart-define 时）：XCUITest 的 launchEnvironment、
 # simctl launch 的 SIMCTL_CHILD_GUOSH_* 都走这条。
 ```
+
+## 持续集成与发版
+
+每次分支推送和 PR 自动执行静态检查、单元测试及多平台应用构建，下载产物见 Actions Artifacts。
+推送 `vX.Y.Z` 或 `vX.Y.Z-rc.1` 标签，在完整矩阵通过后发布 GitHub Release。
+平台架构、签名状态、Android Secrets 与发版命令见 [CI 与 GitHub Release](docs/ci-and-release.md)。
+
+Linux 需要 Secret Service；Windows 私钥使用 DPAPI，Android 使用 Keystore。
+新增平台的硬件认证与实体设备验收范围见 [跟进条目](docs/followups/20260927_新增平台的硬件认证与真机验收.md)。
 
 ## 缩放与功能按钮
 

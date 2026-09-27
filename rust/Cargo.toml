@@ -31,6 +31,10 @@ apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
 # protected 存储设为默认（keyring-core 与 keyring 4.1.5 用的是同一个版本）。
 keyring-core = "1.0.0"
 
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "=1.0.0"
+keyring-core = "1.0.0"
+
 [dependencies]
 # 上游内核走 **git 依赖**，精确 pin 到一个 commit，而不是把源码 vendor 进本仓库。
 # 源为官方 hugefiver/rsHell，所需认证、连接控制与终端接口均已包含在上游。

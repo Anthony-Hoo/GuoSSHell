@@ -16,6 +16,6 @@ accepted = [
     "OpenSSL",
     "CDLA-Permissive-2.0",
 ]
-targets = ["aarch64-apple-ios", "aarch64-apple-darwin"]
+targets = ["aarch64-apple-ios", "aarch64-apple-darwin", "aarch64-linux-android", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # 本仓库自己的 crate（hub、rshell-m0）不列；上游 rsHell 的许可单独放在许可页里。
 private = { ignore = true }

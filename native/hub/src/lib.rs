@@ -13,6 +13,8 @@
 //! * `frame_codec`   RenderFrame → run 压缩字节流（自 bench_frame.rs 提升）
 //! * `local_network` 本地网络权限的失败提示
 
+#[cfg(target_os = "android")]
+mod android;
 mod app;
 mod card;
 mod catalog;
@@ -26,6 +28,15 @@ mod security_key;
 mod session;
 mod settings;
 mod signals;
+#[cfg(any(
+    test,
+    target_os = "android",
+    target_os = "linux",
+    target_os = "windows"
+))]
+mod system_keys;
+#[cfg(target_os = "windows")]
+mod windows_keys;
 
 use rinf::{dart_shutdown, write_interface};
 use tokio::spawn;

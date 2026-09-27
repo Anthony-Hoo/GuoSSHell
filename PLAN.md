@@ -9,6 +9,8 @@
   **改上游的原则**：优先复用官方接口；必要的新增能力向上游提交。升级时同步更新 `rev`
   与根锁文件，按 §9.2 第 3 条验证后再使用。
 - 应用名：**GuoSSHell**
+- 当前平台与自动构建：iPhone / iPad、macOS、Windows、Linux、Android；具体架构、
+  凭证后端、签名与发布边界见 `docs/ci-and-release.md`。版本 tag 通过完整 CI 矩阵后发布。
 - 开发环境：macOS（Apple Silicon）· Xcode 16+ · Flutter 3.x
   （**本机的具体版本号、工具绝对路径、真机清单、签名配置等一律不入库**，见 §7）
 - 相关文档：
@@ -510,9 +512,10 @@ RP ID，否则 `ssh:`）。决定见 §6.1「M3d 安全密钥决定」。
   安全密钥不在 release 里
 - 决定见 §6.1「M4 滚回与工作区决定」「M4 生命周期决定」「M4 合规决定」
 
-### M5 — 平台宽度（Android / macOS，**非阻塞，但架构上现在就别堵死**）—— ✅ macOS 已完成（2026-09-26；Android 不做）
+### M5 — 平台宽度（macOS 已完成；多平台构建见 CI 扩展）
 
-**范围**：只做 macOS（2026-09-25 定）。Android 不做，下文关于 Android 的分析留作将来参考。
+**当前范围**：macOS、Windows、Linux 与 Android 均有应用宿主。下文为原 M5 的可行性分析，
+当前构建矩阵与能力边界以 `docs/ci-and-release.md` 为准。
 
 **交付（macOS）**：`macos/` 工程（沙箱，entitlements：网络客户端、智能卡、用户选择的文件只读；
 debug / profile 另有 JIT 与 VM service 需要的两项）；连接、渲染、滚回、标签分屏与 iOS 同一套代码。

@@ -30,6 +30,7 @@ uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 # 私钥原文用完即清零。
 zeroize = "1"
+keyring-core = "1.0.0"
 # OpenPGP 卡（M3b）：APDU 层与它的卡后端 trait；卡签名经上游 ExternalSigner 接入认证。
 openpgp-card = "0.7.0"
 card-backend = "0.2.0"
@@ -54,7 +55,6 @@ rshell-m0 = { path = "../../rust" }
 # 私钥存在 Apple 的 protected data 钥匙串（本机与 iCloud 两个存储，keys.rs）；
 # 版本与 keyring 4.1.5 用的一致（rust/Cargo.toml）。
 [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
-keyring-core = "1.0.0"
 apple-native-keyring-store = { version = "1.0.1", features = ["protected"] }
 # OpenPGP 卡经 CryptoTokenKit 访问（iOS 没有 PC/SC）。
 objc2 = "0.6"
@@ -75,9 +75,20 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 apple-native-keyring-store = { version = "1.0.1", features = ["keychain", "protected"] }
 security-framework = "3"
 
+[target.'cfg(any(target_os = "android", target_os = "linux", target_os = "windows"))'.dependencies]
+keyring = "=4.1.5"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "=1.0.0"
+jni = "0.21.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
 [dev-dependencies]
 # 暂停的时钟（连接时限的测试）。
 tokio = { version = "1.45.0", features = ["test-util"] }
+keyring-core = { version = "1.0.0", features = ["sample"] }
 
 # Uncomment below to target the web.
 # tokio_with_wasm = { version = "0.8.5", features = ["rt", "macros", "time"] }

@@ -51,7 +51,7 @@ fn physical_memory() -> u64 {
 
 /// 键位条默认显示与否：触屏设备（iOS / iPadOS）默认显示，桌面（有实体键盘）默认不显示。
 pub fn default_show_key_bar() -> bool {
-    cfg!(target_os = "ios")
+    cfg!(any(target_os = "ios", target_os = "android"))
 }
 
 /// 设置里的滚回行数收窄到本机上界。

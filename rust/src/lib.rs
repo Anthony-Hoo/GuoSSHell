@@ -28,12 +28,19 @@ pub use russh;
 /// 把平台的钥匙串设为 keyring 的默认存储（`SystemCredentialVault` 经它读写）。
 ///
 /// keyring v1 在 macOS / Windows / Linux 上会自己注册，iOS 上什么都不做——
-/// 这里补上 iOS 的 protected data store（不随 iCloud 同步）。其他平台是空操作。
+/// 这里补上 iOS 的 protected data store 与 Android 的 Keystore 加密存储。
+/// Android 宿主必须先初始化应用上下文；其他平台由 keyring 选择系统后端。
 pub fn register_credential_store() -> Result<(), String> {
     #[cfg(target_os = "ios")]
     {
         let store = apple_native_keyring_store::protected::Store::new()
             .map_err(|error| format!("keychain store: {error}"))?;
+        keyring_core::set_default_store(store);
+    }
+    #[cfg(target_os = "android")]
+    {
+        let store = android_native_keyring_store::Store::new()
+            .map_err(|error| format!("Android credential store: {error}"))?;
         keyring_core::set_default_store(store);
     }
     Ok(())

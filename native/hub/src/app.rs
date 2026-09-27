@@ -62,7 +62,7 @@ impl AppContext {
             repository,
             credentials,
             known_hosts: support_dir.join(KNOWN_HOSTS_FILE),
-            keys: platform_key_store()?,
+            keys: platform_key_store(support_dir)?,
             key_operations: Mutex::new(()),
             cards: Arc::new(CardContext::new(card::platform_reader())),
             security_keys: security_key::platform_authenticator(),
@@ -78,13 +78,19 @@ impl AppContext {
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
-fn platform_key_store() -> Result<Arc<dyn KeyStore>, String> {
+fn platform_key_store(_support_dir: &Path) -> Result<Arc<dyn KeyStore>, String> {
     Ok(Arc::new(keys::KeychainKeyStore::new()?))
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
-fn platform_key_store() -> Result<Arc<dyn KeyStore>, String> {
-    Err("private keys need the Apple keychain".to_owned())
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn platform_key_store(_support_dir: &Path) -> Result<Arc<dyn KeyStore>, String> {
+    crate::system_keys::SystemKeyStore::new().map(|store| Arc::new(store) as Arc<dyn KeyStore>)
+}
+
+#[cfg(target_os = "windows")]
+fn platform_key_store(support_dir: &Path) -> Result<Arc<dyn KeyStore>, String> {
+    crate::windows_keys::WindowsKeyStore::new(support_dir.join("protected-keys"))
+        .map(|store| Arc::new(store) as Arc<dyn KeyStore>)
 }
 
 /// debug 构建的自动连接目标（见 [`AppReady`]）；release 构建与没设环境变量时为空。

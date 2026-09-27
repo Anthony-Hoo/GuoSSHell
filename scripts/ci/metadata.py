@@ -3,16 +3,14 @@
 
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[2]
+from policy import ROOT, build_allowed, verify_checkout, version_tag
+
 CONFIG = json.loads((ROOT / "scripts/ci/config.json").read_text())
-VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-TAG = re.compile(r"v" + VERSION + r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\Z")
 
 
 def metadata(ref, sha, pubspec, now=None):
@@ -22,12 +20,8 @@ def metadata(ref, sha, pubspec, now=None):
     prerelease = False
     if release:
         tag = ref.removeprefix("refs/tags/")
-        matched = TAG.fullmatch(tag)
-        if not matched:
-            raise ValueError("版本标签必须为 vX.Y.Z 或 vX.Y.Z-预发布标识")
+        matched = version_tag(tag)
         suffix = matched.group(4)
-        if suffix and any(part.isdigit() and len(part) > 1 and part[0] == "0" for part in suffix.split(".")):
-            raise ValueError("预发布数字标识不能包含前导零")
         build_name = ".".join(matched.groups()[:3])
         version = tag[1:]
         prerelease = bool(suffix)
@@ -48,7 +42,8 @@ def metadata(ref, sha, pubspec, now=None):
         "release": str(release).lower(),
         "prerelease": str(prerelease).lower(),
         "commit": sha,
-        "matrix": json.dumps({"include": CONFIG["targets"]}, separators=(",", ":")),
+        "matrix": json.dumps({"include": [row for row in CONFIG["targets"] if row["platform"] != "android"]}, separators=(",", ":")),
+        "android_matrix": json.dumps({"include": [row for row in CONFIG["targets"] if row["platform"] == "android"]}, separators=(",", ":")),
     }
 
 
@@ -66,4 +61,12 @@ if __name__ == "__main__":
         emit({key: value for key, value in CONFIG.items() if key != "targets"})
     else:
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        emit(metadata(os.getenv("GITHUB_REF", "refs/heads/local"), commit, (ROOT / "pubspec.yaml").read_text()))
+        if os.environ.get("GITHUB_SHA"):
+            verify_checkout(os.environ["GITHUB_SHA"])
+        event = os.getenv("GITHUB_EVENT_NAME", "local")
+        ref = os.getenv("GITHUB_REF", "refs/heads/local")
+        allowed = build_allowed(event, ref, commit)
+        values = metadata(ref, commit, (ROOT / "pubspec.yaml").read_text())
+        values["build_allowed"] = str(allowed).lower()
+        values["release"] = str(allowed and event == "push" and ref.startswith("refs/tags/")).lower()
+        emit(values)

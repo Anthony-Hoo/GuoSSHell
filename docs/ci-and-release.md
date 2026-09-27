@@ -5,21 +5,27 @@
 
 ## 触发与门禁
 
-- 分支推送、PR 和手动运行：静态检查、单元测试、SSH 环回验证及完整应用构建。
-- 日常构建产物保存为 Actions Artifacts，保留 14 天；同分支新推送会取消过时的运行。
-- `vX.Y.Z` tag：全部检查与所有架构构建成功后发布正式 GitHub Release。
+- PR 和普通分支推送、普通分支手动运行：只做静态检查，不运行单元测试、不打包、不签名、不上传应用产物。
+- `main`、`dev` 分支推送或在这两条分支手动运行：静态检查、单元测试、SSH 环回验证及完整应用构建。
+- 受信日常构建产物保存为 Actions Artifacts，保留 14 天；同分支新推送会取消过时的运行。
+- `vX.Y.Z` tag：提交必须已包含在当前仓库的 `main` 或 `dev` 历史中，全部检查与所有架构构建成功后发布正式 GitHub Release。
 - `vX.Y.Z-rc.1` 等 SemVer 预发布 tag：发布标记为 prerelease 的 GitHub Release。
-- tag 不符合版本格式、缺少目标、文件校验失败或产物来自不同提交时，发版失败。
+- tag 来源不可信、版本格式不合法、缺少目标、文件校验失败或产物来自不同提交时，发版失败。
 - 发布先创建草稿、上传全部资产，再公开；重试可接续草稿，不覆盖已经公开的版本。
 
 分支保护可以把稳定名称 `CI 全部通过` 设为必需检查。正式发布仅由 tag push 触发，
 手动运行和 PR 不会发布，也不会把 PR 代码交给带发布写权限的任务执行。
+判断使用 `github.event_name` 与完整 `github.ref`；fork PR 的来源分支即使叫 `main` 或 `dev`，
+也不能打包。工作流不使用 `pull_request_target`。构建、签名及发布入口会核对实际检出提交与
+GitHub 事件 SHA；版本标签另外核对受信分支历史。`CI 全部通过` 对静态检查流程要求打包与
+签名任务均跳过，对受信构建流程要求全部目标成功。
 
 ## 检查范围
 
-macOS、Linux、Windows 三类 runner 执行 Rust 格式检查、Clippy、Rust 单元测试、
-Flutter analyze、Flutter 单元测试和生产 SSH 环回示例。工作流语法由固定版本且校验
-SHA-256 的 actionlint 检查；版本解析和发布门禁有独立 Python 回归。
+macOS、Linux、Windows 三类 runner 执行 Rust 格式检查、Clippy 和 Flutter analyze。
+工作流语法由固定版本且校验 SHA-256 的 actionlint 检查，同时检查 Python 语法。
+只有受信构建执行 Rust 与 Flutter 单元测试、生产 SSH 环回示例，以及版本解析、来源策略和
+发布门禁的 Python 回归。Clippy 需要编译分析依赖，但不生成可分发应用包。
 
 Flutter 与 rinf 绑定在干净环境生成，依赖必须满足已提交的锁文件。Actions 自身固定到
 完整提交 SHA，普通任务只有仓库读取权限，只有最后的发布任务获得 `contents: write`。
@@ -47,7 +53,12 @@ GitHub Release 中的 iOS 与 macOS 产物不等于 App Store / TestFlight 发�
 
 ## Android 签名
 
-仓库需要配置以下四项 **Actions Secrets**，不能使用公开 Variables 保存口令：
+仓库需要创建 `android-signing` **Environment**，启用 **Selected branches and tags**，
+分别添加 `main`、`dev` 两条 Branch 规则和 `v*` 一条 Tag 规则。版本标签还必须通过工作流的
+提交归属校验；环境规则本身不检查 Git 历史。分支与版本标签的写入权限仅授予受信维护者。
+
+以下四项必须配置为该 Environment 的 **Secrets**，不能保留同名仓库级或组织级 Secrets，
+也不能使用公开 Variables 保存口令：
 
 | 名称 | 内容 |
 |---|---|
@@ -60,15 +71,15 @@ GitHub Release 中的 iOS 与 macOS 产物不等于 App Store / TestFlight 发�
 随意替换，否则既有用户无法直接升级。应独立备份 keystore 和口令；GitHub Secrets 不提供
 读回备份的能力。
 
-PR 不读取发布 Secrets，Android PR 产物标记为 development。可信分支推送使用已配置的
-发布密钥；缺少密钥时只生成开发签名包。版本 tag 必须有发布密钥，禁止将开发签名 APK
-放入 GitHub Release。临时 keystore 放在构建目录，任务结束后清理，产物清单也拒绝混入
-任何未登记文件。
+Android 签名在独立任务中声明该 Environment，其余平台的构建不引用签名 Secrets。
+PR 和普通分支不启动此任务；环境的 ref 限制同时阻止这些来源访问发布密钥。
+受信构建缺少发布密钥时直接失败，禁止回退为开发签名 APK。临时 keystore 放在构建目录，
+任务结束后清理，产物清单也拒绝混入任何未登记文件。
 
 ## 版本命令
 
 ```sh
-# 在确认要发布的提交上创建版本标签，再推送到计划发布的仓库。
+# 在发布仓库的 main 或 dev 已包含的提交上创建版本标签，再推送标签。
 git tag -s v1.0.0 -m "发布 1.0.0"
 git push origin v1.0.0
 

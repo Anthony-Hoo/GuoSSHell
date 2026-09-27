@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 from metadata import CONFIG
+from policy import require_release_source
 
 
 def validate(directory, version, commit):
@@ -61,6 +62,7 @@ def verify_tag(repository, tag, commit):
 
 
 def main():
+    require_release_source()
     directory = Path(sys.argv[1]).resolve()
     version = os.environ["GUOSH_CI_VERSION"]
     commit = os.environ["GUOSH_CI_COMMIT"]
@@ -95,6 +97,7 @@ def main():
     assets = [str(path) for path in sorted(directory.iterdir())]
     gh("release", "upload", tag, *assets, "--repo", repository, "--clobber")
     prerelease = os.environ.get("GUOSH_CI_PRERELEASE") == "true"
+    require_release_source()
     verify_tag(repository, tag, commit)
     gh("release", "edit", tag, "--repo", repository, "--draft=false",
        f"--prerelease={str(prerelease).lower()}", "--notes-file", str(notes))

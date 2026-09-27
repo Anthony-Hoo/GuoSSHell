@@ -92,9 +92,9 @@ flutter run -d <模拟器id 或 macos> \
 
 ## 持续集成与发版
 
-每次分支推送和 PR 自动执行静态检查、单元测试及多平台应用构建，下载产物见 Actions Artifacts。
-推送 `vX.Y.Z` 或 `vX.Y.Z-rc.1` 标签，在完整矩阵通过后发布 GitHub Release。
-平台架构、签名状态、Android Secrets 与发版命令见 [CI 与 GitHub Release](docs/ci-and-release.md)。
+PR 与普通分支只做静态检查；`main`、`dev` 执行单元测试及多平台应用构建，下载产物见 Actions Artifacts。
+推送 `vX.Y.Z` 或 `vX.Y.Z-rc.1` 标签，提交已包含在发布仓库的 `main` 或 `dev` 且完整矩阵通过后发布 GitHub Release。
+Android 发布密钥仅存放于受分支与标签规则限制的 Environment；平台架构、签名状态和发版命令见 [CI 与 GitHub Release](docs/ci-and-release.md)。
 
 Linux 需要 Secret Service；Windows 私钥使用 DPAPI，Android 使用 Keystore。
 新增平台的硬件认证与实体设备验收范围见 [跟进条目](docs/followups/20260927_新增平台的硬件认证与真机验收.md)。

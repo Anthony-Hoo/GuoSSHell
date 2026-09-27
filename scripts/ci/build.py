@@ -14,6 +14,7 @@ import tarfile
 import zipfile
 
 from metadata import CONFIG, ROOT
+from policy import require_build_source
 
 
 def run(*args, **kwargs):
@@ -81,6 +82,7 @@ def package_deb(bundle, output, version, arch):
 
 def main():
     os.chdir(ROOT)
+    require_build_source()
     target = next(row for row in CONFIG["targets"] if row["id"] == os.environ["GUOSH_CI_TARGET"])
     platform, arch = target["platform"], target["arch"]
     version = os.environ["GUOSH_CI_VERSION"]
@@ -143,8 +145,8 @@ def main():
             archive.add(bundle, arcname="GuoSSHell")
         package_deb(bundle, dist / f"{prefix}.deb", version, arch)
     elif platform == "android":
-        if os.environ.get("GUOSH_CI_RELEASE") == "true" and not os.environ.get("ANDROID_KEYSTORE_PATH"):
-            raise RuntimeError("版本发版不能使用 Android 调试签名")
+        if not os.environ.get("ANDROID_KEYSTORE_PATH"):
+            raise RuntimeError("CI 的 Android 构建必须使用发布签名")
         ndk = CONFIG["android_ndk"]
         sdk_root = Path(os.environ["ANDROID_HOME"])
         sdkmanager = sdk_root / "cmdline-tools/latest/bin/sdkmanager"

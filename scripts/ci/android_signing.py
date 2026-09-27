@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import sys
 
+from policy import require_build_source
+
 KEYSTORE = Path("build/ci/android-release.p12").resolve()
 
 
@@ -13,12 +15,10 @@ def main():
     if sys.argv[1:] == ["clean"]:
         KEYSTORE.unlink(missing_ok=True)
         return
+    require_build_source()
     value = os.environ.get("ANDROID_KEYSTORE_BASE64", "")
     if not value:
-        if os.environ.get("GUOSH_CI_RELEASE") == "true":
-            raise RuntimeError("版本发版必须配置 Android 发布签名 Secrets")
-        print("未配置 Android 发布签名，本次仅生成开发签名包")
-        return
+        raise RuntimeError("受信构建必须在 android-signing Environment 配置 Android 发布签名 Secrets")
     for key in ["ANDROID_KEY_ALIAS", "ANDROID_STORE_PASSWORD", "ANDROID_KEY_PASSWORD"]:
         if not os.environ.get(key):
             raise RuntimeError(f"缺少 {key}")

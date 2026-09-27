@@ -23,6 +23,9 @@ SHA-256 的 actionlint 检查；版本解析和发布门禁有独立 Python 回�
 
 Flutter 与 rinf 绑定在干净环境生成，依赖必须满足已提交的锁文件。Actions 自身固定到
 完整提交 SHA，普通任务只有仓库读取权限，只有最后的发布任务获得 `contents: write`。
+Linux / Windows arm64 使用固定 Flutter 源码和原生 Dart SDK，拒绝静默退回 x64 工具链。
+Android 使用兼容 rinf 的 Gradle 8 工具链，升级边界见
+`docs/followups/20260927_rinf的Gradle9接口兼容.md`。
 
 ## 构建与下载
 

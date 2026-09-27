@@ -1,5 +1,6 @@
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.android")
     // Flutter 插件在 Android 插件之后应用。
     id("dev.flutter.flutter-gradle-plugin")
 }
